@@ -1,0 +1,14 @@
+<resources>
+    <string name="app_name">BLE Debug Tool</string>
+    <string name="ble_uuid">CDB7950D-73F1-4D4D-8E47-C090502DBD63</string>
+    <string name="provide_perm_message">Please provide the missing permissions</string>
+    <integer-array name="progress_colors">
+        <item>@color/red</item>
+        <item>@color/green</item>
+        <item>@color/blue</item>
+    </integer-array>
+    <color name="red">#DC143C</color>
+    <color name="green">#00FF00</color>
+    <color name="verygreen">#008000</color>
+    <color name="blue">#4169E1</color>
+</resources>
