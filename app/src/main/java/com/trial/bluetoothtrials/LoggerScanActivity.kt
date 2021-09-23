@@ -19,7 +19,7 @@ import androidx.core.content.ContextCompat
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
 import com.trial.bluetoothtrials.Utility.PermissionManager
-import kotlinx.android.synthetic.main.activity_main.*
+import kotlinx.android.synthetic.main.activity_logger_scan.*
 import java.text.SimpleDateFormat
 import java.util.*
 import kotlin.collections.ArrayList
@@ -41,6 +41,7 @@ class LoggerScanActivity : AppCompatActivity(),ItemClick {
     private val permissions = arrayOf(
         Manifest.permission.ACCESS_COARSE_LOCATION
     )
+    private var doubleBackToExitPressedOnce = false
     var addressVal:String="N/A"
     var nameVal:String="N/A"
     var rawVal:String="N/A"
@@ -332,5 +333,17 @@ class LoggerScanActivity : AppCompatActivity(),ItemClick {
 
     }
 
+    override fun onBackPressed() {
+        finish()
 
+//        if (doubleBackToExitPressedOnce) {
+//            System.exit(0)
+//            return
+//        }
+//
+//        this.doubleBackToExitPressedOnce = true
+//        Toast.makeText(this, "Please click BACK again to exit", Toast.LENGTH_SHORT).show()
+//
+//        Handler().postDelayed(Runnable { doubleBackToExitPressedOnce = false }, 3000)
+    }
 }

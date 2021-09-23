@@ -16,9 +16,7 @@ import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
 import com.trial.bluetoothtrials.BuildConfig
 
-/**
- * Created by yadhukrishnan.e@oneteam.us
- */
+
 object PermissionManager {
     const val REQUEST_FOR_PERMISSION = 1001
 

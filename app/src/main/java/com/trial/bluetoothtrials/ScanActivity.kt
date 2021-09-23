@@ -297,8 +297,8 @@ class ScanActivity : AppCompatActivity(),ItemClick {
         }
         scanner?.startScan(null, settings, callback)
         scanning=true
-        scanTimer = Runnable { stopDeviceScan() }
-        scanTimer?.let { handler!!.postDelayed(it, 30000) }
+//        scanTimer = Runnable { stopDeviceScan() }
+//        scanTimer?.let { handler!!.postDelayed(it, 30000) }
 //        if(adapter.itemCount==0)
 //        {
 //            device_not_found.visibility=View.VISIBLE
@@ -311,7 +311,7 @@ class ScanActivity : AppCompatActivity(),ItemClick {
 
     //Stops the ble scan
     private fun stopDeviceScan() {
-        handler!!.removeCallbacks(scanTimer!!)
+//        handler!!.removeCallbacks(scanTimer!!)
         if (scanner != null && mBluetoothAdapter!!.isEnabled) scanner!!.stopScan(callback)
         scanning=false
         progress_horizontal.visibility=View.GONE

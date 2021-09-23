@@ -1,18 +1,10 @@
 package com.trial.bluetoothtrials.Utility;
 
-import android.app.Activity;
 import android.app.AlertDialog;
-import android.app.ProgressDialog;
 import android.content.Context;
 import android.content.DialogInterface;
-import android.content.Intent;
 import android.content.pm.PackageInfo;
 import android.content.pm.PackageManager;
-import android.net.Uri;
-import android.net.wifi.ScanResult;
-import android.net.wifi.WifiConfiguration;
-import android.net.wifi.WifiManager;
-import android.util.Log;
 import android.view.Gravity;
 import android.widget.Toast;
 
@@ -21,23 +13,12 @@ import android.widget.Toast;
 import java.io.IOException;
 import java.text.DateFormat;
 import java.text.SimpleDateFormat;
-import java.util.ArrayList;
-import java.util.Calendar;
 import java.util.Date;
-import java.util.List;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
 
-import static android.content.Context.WIFI_SERVICE;
 
-/**
- * Created by yadhukrishnan.e@oneteamus.com
- */
+
 //Util class is a collection of some commonly used functions.
 public class Util {
-
-
-
 
     public static void showToastAtCenter(Context ctx, String message) {
         Toast toast = Toast.makeText(ctx,message, Toast.LENGTH_LONG);
@@ -65,34 +46,6 @@ public class Util {
         }
         return null;
     }
-
-
-
-    //Progress dialog handling functions.
-
-//    public static  boolean isMyAppLauncherDefault(Context context) {
-//        Intent intent = new Intent(Intent.ACTION_MAIN);
-//        intent.addCategory(Intent.CATEGORY_HOME);
-//        ResolveInfo resolveInfo = null;
-//        try {
-//            resolveInfo = context.getPackageManager().resolveActivity(intent, PackageManager.COMPONENT_ENABLED_STATE_DEFAULT); //can return null!
-//            if(resolveInfo!=null) {
-//                Log.d("DEFAULT LAUNCHER","com.atcolauncher_prod.app");
-//                if (resolveInfo.activityInfo.packageName.equalsIgnoreCase("com.atcolauncher_prod.app")||resolveInfo.activityInfo.packageName.equalsIgnoreCase("com.atcolauncher_dev.app")) {
-//                    return true;
-//                } else {
-//                    return false;
-//                }
-//            }else{
-//                return false;
-//            }
-//        }catch(RuntimeException e){
-//            return false;
-//        }
-//    }
-
-
-
 
     //Gets package name.
     public static String getPackageName(String appName){

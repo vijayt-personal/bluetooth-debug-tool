@@ -113,6 +113,13 @@ class DeviceDetailActivity : AppCompatActivity() {
                                 selectedCharacteristic=characteristic
                                 Log.d("Read", characteristic.uuid.toString())
                             }
+//                            else if(characteristic.uuid.toString().equals("e6e6e6e6-e6e6-e6e6-e6e6-e6e6e6e6e6e6")){
+//                                selectedCharacteristic=characteristic
+//                                gatt.setCharacteristicNotification(selectedCharacteristic,true)
+//                                val descriptor:BluetoothGattDescriptor=selectedCharacteristic.getDescriptor(
+//                                    selectedCharacteristic.descriptors.get(0).uuid)
+//                                gatt.writeDescriptor(descriptor)
+//                            }
                             if(characteristic.uuid.toString().equals("e2e2e2e2-e2e2-e2e2-e2e2-e2e2e2e2e2e2")){
                                 otaUpdateFlag=characteristic
                                 Log.d("Read1", characteristic.uuid.toString())
@@ -128,8 +135,10 @@ class DeviceDetailActivity : AppCompatActivity() {
                         }
                     }
                 }
-                gatt.readCharacteristic(readCharacteristics.get(count))
-                count++
+                if(readCharacteristics.size>0) {
+                    gatt.readCharacteristic(readCharacteristics.get(count))
+                    count++
+                }
             } else {
 
             }
@@ -153,20 +162,35 @@ class DeviceDetailActivity : AppCompatActivity() {
                         0, byteArrayToString(
                         characteristic.value
                 ).length - 2)
-                if(characteristic.uuid.toString().equals("d4d4d4d4-d4d4-d4d4-d4d4-d4d4d4d4d4d4")){
-                    software_version.text=value.substring(0,2)+"."+value.substring(2,4)+"."+value.substring(4,6)
-                }else if(characteristic.uuid.toString().equals("d5d5d5d5-d5d5-d5d5-d5d5-d5d5d5d5d5d5")){
-                    software_date.text=value.substring(0,2)+"."+value.substring(2,4)+"."+value.substring(4,6)
-                }else if(characteristic.uuid.toString().equals("d6d6d6d6-d6d6-d6d6-d6d6-d6d6d6d6d6d6")){
-                    device_version.text=value.substring(0,2)+"."+value.substring(2,4)+"."+value.substring(4,6)
+                runOnUiThread {
+                    if (characteristic.uuid.toString() == "d4d4d4d4-d4d4-d4d4-d4d4-d4d4d4d4d4d4"
+                    ) {
+                        software_version.text = value.substring(0, 2) + "." + value.substring(
+                            2,
+                            4
+                        ) + "." + value.substring(4, 6)
+                    } else if (characteristic.uuid.toString() == "d5d5d5d5-d5d5-d5d5-d5d5-d5d5d5d5d5d5"
+                    ) {
+                        software_date.text = value.substring(0, 2) + "." + value.substring(
+                            2,
+                            4
+                        ) + "." + value.substring(4, 6)
+                    } else if (characteristic.uuid.toString() == "d6d6d6d6-d6d6-d6d6-d6d6-d6d6d6d6d6d6"
+                    ) {
+                        device_version.text = value.substring(0, 2) + "." + value.substring(
+                            2,
+                            4
+                        ) + "." + value.substring(4, 6)
+                    }
                 }
-                if(count<readCharacteristics.size) {
-                    gatt.readCharacteristic(readCharacteristics.get(count))
-                    count++
-                }else{
-                    LoadingUtils.hideDialog()
+                    if(count<readCharacteristics.size) {
+                        gatt.readCharacteristic(readCharacteristics.get(count))
+                        count++
+                    }else{
+                        LoadingUtils.hideDialog()
+                    }
                 }
-            }
+
         }
 
         override fun onCharacteristicChanged(
@@ -174,6 +198,8 @@ class DeviceDetailActivity : AppCompatActivity() {
                 characteristic: BluetoothGattCharacteristic
         ) {
             Log.w("TAG", "Characteristic Changed")
+//            if(!otaDoneFlag)
+//                sendBlock()
         }
 
         override fun onCharacteristicWrite(
@@ -189,6 +215,7 @@ class DeviceDetailActivity : AppCompatActivity() {
 
         }
     }
+
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -209,6 +236,7 @@ class DeviceDetailActivity : AppCompatActivity() {
                     BluetoothDevice.TRANSPORT_LE
             )
         }
+
         button.setOnClickListener(View.OnClickListener {
 //            input= "4507b6f3169ae7937d3d4b8a3170498f".decodeHex().toCharArray()
 
@@ -245,6 +273,7 @@ class DeviceDetailActivity : AppCompatActivity() {
             file= path?.let { File.getByFileName(it) }!!
             file?.setFileBlockSize(3, 240)
 //            rc5Setup(input)
+            Log.d("KEY", PreferenceController.instance?.getKeyString(this,"Key"))
             PreferenceController.instance?.getKeyString(this, "Key")?.let { rc5Setup(it.decodeHex()) }
             progress_layout.visibility=View.VISIBLE
             button.visibility=View.GONE
@@ -356,6 +385,7 @@ class DeviceDetailActivity : AppCompatActivity() {
                 characteristic.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
                 val r: Boolean = gatt.writeCharacteristic(characteristic)
                 otaDoneFlag = true
+                Log.d("OTA UPDATE","DONE")
             }
         }
         return progress
