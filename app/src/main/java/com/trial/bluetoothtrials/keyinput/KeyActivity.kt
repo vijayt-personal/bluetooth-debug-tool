@@ -39,6 +39,7 @@ class KeyActivity : AppCompatActivity() {
                 "4507b6f3169ae7937d3d4b8a3170498f"
             )
         }
+        currentkey.text="Current Key: "+PreferenceController.instance?.getKeyString(this,"Key")
         checkPermissions()
         submit.setOnClickListener(View.OnClickListener {
             if (PermissionManager.checkCoarseLocationPermission(this) && PermissionManager.checkReadExtenalStoragePermission(

@@ -30,7 +30,7 @@ class SplashActivity : AppCompatActivity() {
         window.statusBarColor = ContextCompat.getColor(this, R.color.black)
 
 
-        doSomething()
+      checkLocationPermission()
 
     }
     private fun intentCall(){
@@ -41,7 +41,7 @@ class SplashActivity : AppCompatActivity() {
         }
     }
 
-    private fun doSomething() {
+    private fun checkLocationPermission() {
         if (PermissionManager.checkCoarseLocationPermission(this)) {
             if(locationEnabled()) {
                 intentCall()
@@ -76,8 +76,6 @@ class SplashActivity : AppCompatActivity() {
                     }
                 } else {
                     Log.d("Else","PERM")
-//                Toast.makeText(this, "Some permissions denied", Toast.LENGTH_LONG)
-//                    .show()
                     PermissionManager.showAlertForPermission(
                             this@SplashActivity,
                             R.string.provide_perm_message
@@ -86,10 +84,6 @@ class SplashActivity : AppCompatActivity() {
                 }
             }catch (e: java.lang.Exception){
                 Log.d("Exception", e.toString())
-//                PermissionManager.showAlertForPermission(
-//                        this@SplashActivity,
-//                        R.string.provide_perm_message
-//                )
             }
         }
     }
@@ -137,6 +131,6 @@ class SplashActivity : AppCompatActivity() {
     override fun onResume() {
         super.onResume()
         dialog?.dismiss()
-        doSomething()
+        checkLocationPermission()
     }
 }

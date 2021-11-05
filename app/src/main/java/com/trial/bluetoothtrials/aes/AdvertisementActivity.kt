@@ -40,7 +40,6 @@ class AdvertisementActivity : AppCompatActivity() {
         val data = AdvertiseData.Builder()
             .setIncludeDeviceName(false)
             .addManufacturerData(0x197.toInt(), byteArrayOf(0x01,0x02))
-//            .addServiceData(pUuid, a)
             .build()
 
         val advertisingCallback: AdvertiseCallback = object : AdvertiseCallback() {
@@ -53,12 +52,7 @@ class AdvertisementActivity : AppCompatActivity() {
                 super.onStartFailure(errorCode)
             }
         }
-
         advertiser.startAdvertising(settings, data, advertisingCallback)
-//        val d= a?.toByteArray(Charset.defaultCharset())
-//        Log.d("Encrypted value", d.toString())
-//        val e=key?.let { AesEncryption.shared?.decrypt(a, it) }
-//        Log.d("decrypt",e.toString())
     }
 
 

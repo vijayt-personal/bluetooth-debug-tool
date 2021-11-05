@@ -92,9 +92,11 @@ object FileChooser {
                 val column_index = cursor.getColumnIndexOrThrow(column)
                 return cursor.getString(column_index)
             }
-        } finally {
-            cursor?.close()
         }
+        finally {
+                cursor?.close()
+            }
+
         return null
     }
 

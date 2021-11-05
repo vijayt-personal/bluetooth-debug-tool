@@ -3,7 +3,6 @@ package com.trial.bluetoothtrials
 import android.Manifest
 import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothDevice
-import android.bluetooth.BluetoothManager
 import android.bluetooth.le.BluetoothLeScanner
 import android.bluetooth.le.ScanCallback
 import android.bluetooth.le.ScanResult
@@ -33,9 +32,6 @@ class ScanActivity : AppCompatActivity(),ItemClick {
     private var scanning: Boolean = false
     var scannedDevice=arrayListOf<Device>()
     var scannedHex=arrayListOf<String>()
-    var scanTimer: Runnable? = null
-    var handler: Handler? = Handler()
-    lateinit var mBluetoothManager:BluetoothManager
     lateinit var mBluetoothAdapter: BluetoothAdapter
     private lateinit var linearLayoutManager: LinearLayoutManager
     private lateinit var adapter:CustomAdapter
@@ -45,8 +41,6 @@ class ScanActivity : AppCompatActivity(),ItemClick {
     var addressVal:String="N/A"
     var nameVal:String="N/A"
     var rawVal:String="N/A"
-
-
     private fun isMacAlreadyScanned(device: BluetoothDevice): Boolean {
     for( scandevice in scannedDevice){
         if(scandevice.address.equals(device.address)){
@@ -66,7 +60,6 @@ class ScanActivity : AppCompatActivity(),ItemClick {
         adapter = CustomAdapter(scannedDevice, this)
         device_list.adapter = adapter
         // Initialize Bluetooth adapter
-//        mBluetoothManager=applicationContext.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
         mBluetoothAdapter=  BluetoothAdapter.getDefaultAdapter()
 
         floatingActionButton.setOnClickListener(View.OnClickListener {
@@ -115,10 +108,8 @@ class ScanActivity : AppCompatActivity(),ItemClick {
             override fun onChanged() {
                 if (adapter.itemCount == 0) {
                     device_not_found.visibility = View.VISIBLE
-//                    device_list.visibility=View.GONE
                 } else {
                     device_not_found.visibility = View.GONE
-//                    device_list.visibility=View.VISIBLE
                 }
             }
         })
@@ -230,9 +221,6 @@ class ScanActivity : AppCompatActivity(),ItemClick {
             callback = object : ScanCallback() {
                 override fun onScanResult(callbackType: Int, result: ScanResult) {
                     Log.d("ScanRecords", bytesToHex(result.scanRecord.bytes))
-
-//                Log.d("ScanRecords", bytesToHex(result.scanRecord.bytes))
-//                if (!scannedHex.contains(bytesToHex(scanRecord))) {
                         val device=result.device
                         val scanRecord=result.scanRecord.bytes
                         val rssi=result.rssi
@@ -256,18 +244,15 @@ class ScanActivity : AppCompatActivity(),ItemClick {
                             )
                             scannedHex.add(bytesToHex(scanRecord))
                             scannedDevice.add(scanHexRecord)
-//                        Log.d("Added", "new record"+rssi)
                             adapter.notifyDataSetChanged()
                         } else {
                             var position: Int = -1
                             for (i in 0..scannedDevice.size) {
-//                                if(i<scannedDevice.size)
                                 if (scannedDevice.get(i).address.equals(device.address)) {
                                     position = i
                                     break
                                 }
                             }
-
                             var name: String? = ""
                             if (device.name != null)
                                 name = device.name
@@ -282,46 +267,26 @@ class ScanActivity : AppCompatActivity(),ItemClick {
                             )
                             scannedHex.set(position, bytesToHex(scanRecord))
                             scannedDevice.set(position, scanHexRecord)
-//                        Log.d("Added", "new record"+rssi)
                             adapter.notifyItemChanged(position)
 
                         }
-
-//                }
-
-
                 }
-
-
             }
         }
         scanner?.startScan(null, settings, callback)
         scanning=true
-//        scanTimer = Runnable { stopDeviceScan() }
-//        scanTimer?.let { handler!!.postDelayed(it, 30000) }
-//        if(adapter.itemCount==0)
-//        {
-//            device_not_found.visibility=View.VISIBLE
-//            device_list.visibility=View.GONE
-//        }else{
-//            device_not_found.visibility=View.GONE
-//            device_list.visibility=View.VISIBLE
-//        }
     }
 
     //Stops the ble scan
     private fun stopDeviceScan() {
-//        handler!!.removeCallbacks(scanTimer!!)
         if (scanner != null && mBluetoothAdapter!!.isEnabled) scanner!!.stopScan(callback)
         scanning=false
         progress_horizontal.visibility=View.GONE
         if(adapter.itemCount==0)
         {
             device_not_found.visibility=View.VISIBLE
-//            device_list.visibility=View.GONE
         }else{
             device_not_found.visibility=View.GONE
-//            device_list.visibility=View.VISIBLE
         }
 
     }
@@ -364,7 +329,6 @@ class ScanActivity : AppCompatActivity(),ItemClick {
             mBluetoothAdapter.enable()
             Toast.makeText(applicationContext,"Enabling Bluetooth....",Toast.LENGTH_SHORT).show()
             Handler().postDelayed({
-                //doSomethingHere()
                 progress_horizontal.visibility = View.VISIBLE
                 checkPermissionsandStartScan()
             }, 3000)
@@ -374,7 +338,6 @@ class ScanActivity : AppCompatActivity(),ItemClick {
         }
 
     }
-
     override fun onItemClick(device: Device) {
         Log.d("On", "Item Click")
         val intent=Intent(this, DeviceDetailActivity::class.java)
@@ -382,6 +345,4 @@ class ScanActivity : AppCompatActivity(),ItemClick {
         startActivity(intent)
 
     }
-
-
 }

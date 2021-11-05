@@ -101,8 +101,6 @@ class DashBoardActivity : AppCompatActivity() {
             if(grantResults[0]==PackageManager.PERMISSION_GRANTED){
                 locationEnabled()
             }else{
-//                Toast.makeText(this, "Some permissions denied", Toast.LENGTH_LONG)
-//                    .show()
                 PermissionManager.showAlertForPermission(
                     this@DashBoardActivity,
                     R.string.provide_perm_message

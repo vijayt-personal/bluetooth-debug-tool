@@ -32,8 +32,6 @@ class LoggerScanActivity : AppCompatActivity(),ItemClick {
     private var scanning: Boolean = false
     var scannedDevice=arrayListOf<Device>()
     var scannedHex=arrayListOf<String>()
-    var scanTimer: Runnable? = null
-    var handler: Handler? = Handler()
     lateinit var mBluetoothManager:BluetoothManager
     lateinit var mBluetoothAdapter: BluetoothAdapter
     private lateinit var linearLayoutManager: LinearLayoutManager
@@ -41,10 +39,6 @@ class LoggerScanActivity : AppCompatActivity(),ItemClick {
     private val permissions = arrayOf(
         Manifest.permission.ACCESS_COARSE_LOCATION
     )
-    private var doubleBackToExitPressedOnce = false
-    var addressVal:String="N/A"
-    var nameVal:String="N/A"
-    var rawVal:String="N/A"
     var loggerList: MutableMap<String, ArrayList<LogRecord>> = mutableMapOf()
 
     private fun isMacAlreadyScanned(tagId: String): Boolean {
@@ -66,17 +60,12 @@ class LoggerScanActivity : AppCompatActivity(),ItemClick {
         adapter = LoggerScanAdapter(scannedDevice, this)
         device_list.adapter = adapter
         // Initialize Bluetooth adapter
-//        mBluetoothManager=applicationContext.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
         mBluetoothAdapter=  BluetoothAdapter.getDefaultAdapter()
 
         floatingActionButton.setOnClickListener(View.OnClickListener {
             if (!scanning) {
-//                if(mBluetoothAdapter.isEnabled) {
                     progress_horizontal.visibility = View.VISIBLE
                     checkPermissionsandStartScan()
-//                }else{
-//                    Toast.makeText(applicationContext,"Please enable bluetooth to start scanning for devices",Toast.LENGTH_SHORT).show()
-//                }
             } else {
                 progress_horizontal.visibility = View.GONE
                 stopDeviceScan()
@@ -88,11 +77,8 @@ class LoggerScanActivity : AppCompatActivity(),ItemClick {
             override fun onChanged() {
                 if (adapter.itemCount == 0) {
                     device_not_found.visibility = View.VISIBLE
-//                    device_list.visibility=View.GONE
                 } else {
                     device_not_found.visibility = View.GONE
-//                    adapter.filter.filter("970152")
-//                    device_list.visibility=View.VISIBLE
                 }
             }
         })
@@ -113,10 +99,8 @@ class LoggerScanActivity : AppCompatActivity(),ItemClick {
         stopDeviceScan()
     }
 
-    //starts ble scan
+    //Starts ble scan
     private fun startDeviceScan(){
-//        scannedHex.clear()
-//        scannedDevice.clear()
         adapter.notifyDataSetChanged()
         if (scanner == null) {
             scanner = mBluetoothAdapter.bluetoothLeScanner
@@ -126,9 +110,6 @@ class LoggerScanActivity : AppCompatActivity(),ItemClick {
             callback = object : ScanCallback() {
                 override fun onScanResult(callbackType: Int, result: ScanResult) {
                     Log.d("ScanRecords", bytesToHex(result.scanRecord.bytes))
-
-//                Log.d("ScanRecords", bytesToHex(result.scanRecord.bytes))
-//                if (!scannedHex.contains(bytesToHex(scanRecord))) {
                     val device=result.device
                     val scanRecord=result.scanRecord.bytes
                     val tagid=bytesToHex(scanRecord).subSequence(18, 26).toString()
@@ -148,8 +129,6 @@ class LoggerScanActivity : AppCompatActivity(),ItemClick {
                         val date = Date(System.currentTimeMillis())
 
                         val formatter = SimpleDateFormat("HH:mm:ss.SSS")
-//                        formatter.setTimeZone(TimeZone.getTimeZone("UTC"))
-
                         val formatted: String = formatter.format(date)
                         val record:LogRecord= LogRecord(bytesToHex(scanRecord),formatted,
                             rssi.toString()
@@ -160,7 +139,6 @@ class LoggerScanActivity : AppCompatActivity(),ItemClick {
                             results.add(record)
                         }
                         loggerList[tagid]=results
-//                        loggerList.plus(device.address to results)
                         var name: String? = ""
                         if (device.name != null)
                             name = device.name
@@ -175,15 +153,11 @@ class LoggerScanActivity : AppCompatActivity(),ItemClick {
                         )
                         scannedHex.add(bytesToHex(scanRecord))
                         scannedDevice.add(scanHexRecord)
-//                        Log.d("Added", "new record"+rssi)
                         adapter.notifyDataSetChanged()
                     } else {
                         var results:ArrayList<LogRecord> = arrayListOf()
                         val date = Date(System.currentTimeMillis())
-
                         val formatter = SimpleDateFormat("HH:mm:ss.SSS")
-//                        formatter.setTimeZone(TimeZone.getTimeZone("UTC"))
-
                         val formatted: String = formatter.format(date)
                         val record:LogRecord= LogRecord(bytesToHex(scanRecord),formatted,
                             rssi.toString()
@@ -205,9 +179,6 @@ class LoggerScanActivity : AppCompatActivity(),ItemClick {
                                     Log.d("pos", position.toString())
                                     break
                                 }
-//                            }else{
-//                                break
-//                            }
                         }
 
                         var name: String? = ""
@@ -226,47 +197,26 @@ class LoggerScanActivity : AppCompatActivity(),ItemClick {
                             Log.d("Update", bytesToHex(scanRecord))
                             scannedHex.set(position, bytesToHex(scanRecord))
                             scannedDevice.set(position, scanHexRecord)
-//                        Log.d("Added", "new record"+rssi)
                             adapter.notifyItemChanged(position)
                         }
-
                     }
-
-//                }
-
-
                 }
-
-
             }
         }
         scanner?.startScan(null, settings, callback)
         scanning=true
-//        scanTimer = Runnable { stopDeviceScan() }
-//        scanTimer?.let { handler!!.postDelayed(it, 30000) }
-//        if(adapter.itemCount==0)
-//        {
-//            device_not_found.visibility=View.VISIBLE
-//            device_list.visibility=View.GONE
-//        }else{
-//            device_not_found.visibility=View.GONE
-//            device_list.visibility=View.VISIBLE
-//        }
     }
 
     //Stops the ble scan
     private fun stopDeviceScan() {
-//        handler!!.removeCallbacks(scanTimer!!)
         if (scanner != null && mBluetoothAdapter!!.isEnabled) scanner!!.stopScan(callback)
         scanning=false
         progress_horizontal.visibility=View.GONE
         if(adapter.itemCount==0)
         {
             device_not_found.visibility=View.VISIBLE
-//            device_list.visibility=View.GONE
         }else{
             device_not_found.visibility=View.GONE
-//            device_list.visibility=View.VISIBLE
         }
         Log.d("Map", loggerList.size.toString())
     }
@@ -324,7 +274,6 @@ class LoggerScanActivity : AppCompatActivity(),ItemClick {
     override fun onItemClick(device: Device) {
         Log.d("On", "Item Click")
         val intent=Intent(this, LoggerActivity::class.java)
-//        intent.putExtra("device", device.address)
         intent.putParcelableArrayListExtra(
             "logList",
             loggerList[device.scanHex.subSequence(18, 26)]
@@ -335,15 +284,5 @@ class LoggerScanActivity : AppCompatActivity(),ItemClick {
 
     override fun onBackPressed() {
         finish()
-
-//        if (doubleBackToExitPressedOnce) {
-//            System.exit(0)
-//            return
-//        }
-//
-//        this.doubleBackToExitPressedOnce = true
-//        Toast.makeText(this, "Please click BACK again to exit", Toast.LENGTH_SHORT).show()
-//
-//        Handler().postDelayed(Runnable { doubleBackToExitPressedOnce = false }, 3000)
     }
 }

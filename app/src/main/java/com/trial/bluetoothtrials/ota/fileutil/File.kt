@@ -1,14 +1,10 @@
 package com.trial.bluetoothtrials.Utility
 
-import android.content.Context
-import android.os.Environment
-import android.util.Log
 import java.io.FileInputStream
 import java.io.IOException
 import java.io.InputStream
 import java.util.*
-import kotlin.experimental.and
-import kotlin.experimental.xor
+
 
 class File private constructor(inputStream: InputStream) {
     private val DEFAULT_FILE_CHUNK_SIZE: Int=20
@@ -20,8 +16,6 @@ class File private constructor(inputStream: InputStream) {
     private var fileChunkSize: Int = DEFAULT_FILE_CHUNK_SIZE
     private val bytesAvailable: Int
     var numberOfBlocks = -1
-        private set
-    var chunksPerBlockCount = 0
         private set
     var totalChunkCount = 0
         private set
@@ -35,13 +29,11 @@ class File private constructor(inputStream: InputStream) {
             this.fileBlockSize = bytes.size
             if (this.fileChunkSize > this.fileBlockSize) this.fileChunkSize = this.fileBlockSize
         }
-        chunksPerBlockCount = this.fileBlockSize / this.fileChunkSize + if (this.fileBlockSize % this.fileChunkSize != 0) 1 else 0
         numberOfBlocks = bytes.size / this.fileBlockSize + if (bytes.size % this.fileBlockSize != 0) 1 else 0
         initBlocks()
     }
 
-    private fun initBlocksSpota() {
-
+    private fun initBlocksOta() {
         numberOfBlocks = 1
         fileBlockSize = bytes.size
         totalChunkCount = bytes.size / fileChunkSize + if (bytes.size % fileChunkSize != 0) 1 else 0
@@ -60,7 +52,7 @@ class File private constructor(inputStream: InputStream) {
 
     // Create the array of blocks using the given block size.
     private fun initBlocks() {
-            initBlocksSpota()
+            initBlocksOta()
     }
 
     fun getBlock(index: Int): Array<ByteArray?>? {
@@ -78,7 +70,6 @@ class File private constructor(inputStream: InputStream) {
     }
 
     companion object {
-        private val filesDir = Environment.getExternalStorageDirectory().absolutePath + "/Suota"
         @Throws(IOException::class)
         fun getByFileName(filename: String): File {
             // Get the file and store it in fileStream

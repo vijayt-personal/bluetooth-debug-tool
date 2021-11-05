@@ -1,6 +1,5 @@
 package com.trial.bluetoothtrials
 
-import android.bluetooth.le.ScanResult
 import android.content.Context
 import android.view.LayoutInflater
 import android.view.View
@@ -102,10 +101,6 @@ class LoggerAdapter(val context:Context, private val dataSet: java.util.ArrayLis
         }
         viewHolder.zoneStatus.text = zone
         if(!zoneStatus.equals("06")){
-//            viewHolder.locator_b_part.visibility=View.VISIBLE
-//            viewHolder.distance_b_part.visibility=View.VISIBLE
-//            viewHolder.locator_c_part.visibility=View.VISIBLE
-//            viewHolder.distance_c_part.visibility=View.VISIBLE
             viewHolder.locator_b_part.visibility=View.VISIBLE
             viewHolder.locator_c_part.visibility=View.VISIBLE
             viewHolder.distance_b_part.visibility=View.VISIBLE
@@ -126,10 +121,6 @@ class LoggerAdapter(val context:Context, private val dataSet: java.util.ArrayLis
             viewHolder.distanceA.text =rawString.subSequence(28,30)
 
         }
-//        viewHolder.card.setOnClickListener(View.OnClickListener {
-//
-//            itemClick.onItemClick(dataSet[position])
-//        })
     }
     init {
         dataFilterSet = dataSet
@@ -137,13 +128,5 @@ class LoggerAdapter(val context:Context, private val dataSet: java.util.ArrayLis
     // Return the size of your dataset (invoked by the layout manager)
     override fun getItemCount(): Int {
         return dataFilterSet.size
-    }
-    fun bytesToHex(bytes: ByteArray): String {
-        var hexString:String=""
-        for (b in bytes) {
-            val hexElement = String.format("%02X", b)
-            hexString+=hexElement
-        }
-        return hexString
     }
 }
