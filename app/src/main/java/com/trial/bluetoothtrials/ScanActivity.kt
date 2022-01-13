@@ -280,8 +280,8 @@ class ScanActivity : AppCompatActivity(),ItemClick {
                                     rssi,
                                     isConnectable
                             )
-                            scannedHex.set(position, bytesToHex(scanRecord))
-                            scannedDevice.set(position, scanHexRecord)
+                            scannedHex[position] = bytesToHex(scanRecord)
+                            scannedDevice[position] = scanHexRecord
 //                        Log.d("Added", "new record"+rssi)
                             adapter.notifyItemChanged(position)
 
