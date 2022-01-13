@@ -41,7 +41,9 @@ public class Util {
 
     public static void showToastAtCenter(Context ctx, String message) {
         Toast toast = Toast.makeText(ctx,message, Toast.LENGTH_LONG);
-        toast.setGravity(Gravity.CENTER, 0, 1);
+
+//        toast.setGravity(Gravity.CENTER, 0, 0);
+
         toast.show();
     }
 
