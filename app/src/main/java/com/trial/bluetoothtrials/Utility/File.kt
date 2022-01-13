@@ -48,7 +48,7 @@ class File private constructor(inputStream: InputStream) {
 
     fun setFileBlockSize(fileBlockSize: Int, fileChunkSize: Int) {
         bytes = ByteArray(bytesAvailable)
-        inputStream!!.read(bytes)
+//        inputStream!!.read(bytes)
         this.fileBlockSize = Math.max(fileBlockSize, fileChunkSize)
         this.fileChunkSize = fileChunkSize
         if (this.fileBlockSize > bytes.size) {
