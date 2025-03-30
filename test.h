@@ -7,7 +7,7 @@
 #include <mutex>
 #include <atomic>
 #include <cstdint>
-#include <memory> // For potential future PIMPL use, though not strictly needed now
+#include <memory>
 
 // NO ESP-IDF specific headers or types here. Platform Agnostic.
 
@@ -24,30 +24,21 @@ constexpr size_t kMaxCertLen = 2048;
 
 struct MqttConfig {
     // Endpoint/IDs remain strings for convenience during setup.
-    // Allocation happens once when the config object is populated.
     std::string aws_endpoint;
     std::string client_id;
     std::string thing_name;
     uint16_t    port = 8883;
 
-    // --- Certificate Buffers ---
-    // WARNING: These arrays store the full certificate data and reside
-    //          within the MqttConfig object (Stack/Global). Total = 3 * kMaxCertLen bytes!
-    //          Ensure this size (kMaxCertLen) is adequate for your certs.
-    //          You MUST copy your certificate data into these buffers
-    //          before calling Initialize(). Ensure null-termination.
-    char root_ca_pem[kMaxCertLen] = {0}; // Zero-initialize
+    // Certificate Buffers (Require manual copy into these before Initialize)
+    char root_ca_pem[kMaxCertLen] = {0};
     char device_cert_pem[kMaxCertLen] = {0};
     char private_key_pem[kMaxCertLen] = {0};
-    // --- End Certificate Buffers ---
 
     // MQTT RX/TX Buffer sizes used by underlying esp-mqtt
     int         rx_buffer_size = 2048;
     int         tx_buffer_size = 2048;
 
-    // Reconnect Timing
-    uint32_t    base_reconnect_ms = 1000;
-    uint32_t    max_reconnect_ms = 60000;
+    // Reconnect timing is now managed by the application, removed from here.
 };
 
 // --- Callbacks ---
@@ -58,7 +49,7 @@ using ShadowUpdateCallback = std::function<void(const std::string& update_type, 
 
 // --- Main Class ---
 class AwsIotMqttClient {
-public:
+public: // Public Interface
     AwsIotMqttClient();
     ~AwsIotMqttClient();
 
@@ -69,28 +60,27 @@ public:
     AwsIotMqttClient& operator=(AwsIotMqttClient&&) = delete;
 
     /**
-     * @brief Initializes the MQTT client with the given configuration.
-     * Certificate data must be copied into the config struct's arrays
-     * *before* calling this function.
-     * @param config Configuration structure containing connection details and cert data.
+     * @brief Initializes the MQTT client. Cert data must be pre-copied into config.
+     * @param config Configuration structure.
      * @return True on success, false otherwise.
      */
     bool Initialize(const MqttConfig& config);
 
     /**
-     * @brief Connects to the MQTT broker asynchronously.
-     * Handles auto-reconnect internally using exponential backoff.
+     * @brief Attempts to connect to the MQTT broker.
+     * NOTE: This version does NOT automatically reconnect. Reconnection attempts
+     * must be managed by the application by calling Connect() again after a delay.
      * @return True if connection attempt initiated, false on immediate error.
      */
     bool Connect();
 
     /**
-     * @brief Disconnects from the MQTT broker and stops reconnect attempts.
+     * @brief Disconnects from the MQTT broker.
      */
     void Disconnect();
 
     /**
-     * @brief Checks if the client is currently connected to the broker.
+     * @brief Checks if the client is currently connected.
      * @return True if connected, false otherwise. Thread-safe.
      */
     bool IsConnected() const;
@@ -98,32 +88,10 @@ public:
     // --- Publish Overloads ---
     bool Publish(const std::string& topic, const std::string& payload, int qos = 0, bool retain = false);
     bool Publish(const std::string& topic, std::string_view payload, int qos = 0, bool retain = false);
-    /**
-     * @brief Publishes raw binary data to a specific topic.
-     * @param topic The topic to publish to. Must not exceed kMaxTopicLen.
-     * @param payload Pointer to the byte buffer.
-     * @param len Length of the byte buffer.
-     * @param qos Quality of Service level (0, 1, or 2).
-     * @param retain Retain flag.
-     * @return True if the publish request was successfully queued, false otherwise. Thread-safe.
-     */
     bool Publish(const std::string& topic, const uint8_t* payload, size_t len, int qos = 0, bool retain = false);
-    // --- End Publish Overloads ---
 
-    /**
-     * @brief Subscribes to a topic filter.
-     * @param topic_filter The topic filter (e.g., "my/topic", "my/topic/#"). Must not exceed kMaxTopicLen.
-     * @param qos Quality of Service level (0, 1, or 2).
-     * @param callback Function to call when a message matching the filter arrives.
-     * @return True if subscription stored/queued, false if max subscriptions reached. Thread-safe.
-     */
+    // --- Subscribe / Unsubscribe ---
     bool Subscribe(const std::string& topic_filter, int qos, MqttMessageCallback callback);
-
-    /**
-     * @brief Unsubscribes from a topic filter.
-     * @param topic_filter The exact topic filter previously subscribed to.
-     * @return True if unsubscribe queued or subscription removed locally, false if not found. Thread-safe.
-     */
     bool Unsubscribe(const std::string& topic_filter);
 
     // --- AWS IoT Specific Helpers ---
@@ -140,9 +108,18 @@ public:
     void SetOnConnectedCallback(StatusCallback cb);
     void SetOnDisconnectedCallback(StatusCallback cb);
 
-private:
-    // --- Private Implementation Details ---
-    struct Subscription { // Internal struct, definition okay here
+    // --- Public Event Handler Method ---
+    /**
+     * @brief Public Event Handler (Called internally via static C callback).
+     * Processes MQTT events. Made public to allow calling from static C handler.
+     * NOTE: Not intended for direct call by user application code.
+     * @param event_data_void Pointer to the esp_mqtt_event_handle_t structure.
+     */
+    void HandleMqttEvent(void* event_data_void);
+
+private: // Private Implementation Details
+    // --- Private Data Members ---
+    struct Subscription {
         char topic[kMaxTopicLen] = {0};
         int qos = 0;
         MqttMessageCallback callback;
@@ -154,9 +131,9 @@ private:
     MqttConfig                  config_; // Internal copy, includes large cert arrays
     std::atomic<bool>           initialized_{false};
     std::atomic<bool>           connected_{false};
-    std::atomic<bool>           connecting_{false};
-    std::atomic<bool>           disconnect_requested_{false};
-    void* client_handle_opaque_{nullptr}; // OPAQUE HANDLE to hide esp_mqtt_client_handle_t
+    std::atomic<bool>           connecting_{false}; // Prevent rapid Connect() calls
+    std::atomic<bool>           disconnect_requested_{false}; // Manual disconnect requested by user
+    void* client_handle_opaque_{nullptr}; // OPAQUE HANDLE
     Subscription                subscriptions_[kMaxSubs];
     size_t                      active_subscription_count_ = 0;
     StatusCallback              on_connected_cb_ = nullptr;
@@ -164,26 +141,23 @@ private:
     JobNotificationCallback     job_notify_cb_ = nullptr;
     ShadowUpdateCallback        shadow_update_cb_ = nullptr;
     ShadowUpdateCallback        shadow_get_cb_ = nullptr;
-    uint32_t                    current_reconnect_delay_ms_ = 0;
-    void* reconnect_timer_handle_{nullptr}; // OPAQUE FreeRTOS Timer Handle
+    // --- Reconnect members REMOVED ---
 
-    // --- Private Methods --- (Declarations not needed in header)
+    // --- Private Methods ---
     bool InitializeMqttClient();
     void CleanupMqttClient();
     bool SubscribeInternal(const char* topic_filter, int qos);
     bool UnsubscribeInternal(const char* topic_filter);
-    void HandleMqttEvent(void* event_data); // event_data is esp_mqtt_event_handle_t passed as void*
+    // HandleMqttEvent moved to public
     void HandleConnect();
-    void HandleDisconnect();
+    void HandleDisconnect(); // Modified - no longer schedules reconnect
     void HandleData(const char* topic, int topic_len, const char* data, int data_len);
     void ResubscribePending();
-    void StartReconnectTimer();
-    void StopReconnectTimer();
-    void ScheduleReconnect();
+    // --- Timer/Schedule methods REMOVED ---
     bool GetShadowTopic(const std::string& operation, char* buffer, size_t buffer_size);
     bool GetJobsTopic(const std::string& operation, const std::string& job_id, char* buffer, size_t buffer_size);
 
-    // NOTE: Static callbacks are implementation details defined only in the .cpp file.
+    // NOTE: Static MQTT handler callback is an implementation detail defined only in the .cpp file.
 
 }; // class AwsIotMqttClient
 
