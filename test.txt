@@ -1,0 +1,46 @@
+# components/aws_iot/CMakeLists.txt
+
+# 1. Register THIS component (the C++ abstraction layer)
+idf_component_register(
+    SRCS            "aws_iot_client.cpp"
+    INCLUDE_DIRS    "." # Allows local include of aws_iot_interface.hpp
+    # List dependencies needed *directly* by aws_iot_client.cpp,
+    # EXCLUDING esp-aws-iot itself (we handle that via add_subdirectory).
+    REQUIRES        log freertos # FreeRTOS still needed for tasks/delays
+    # List any private dependencies if necessary
+    # PRIV_REQUIRES   mbedtls # No, let esp-aws-iot require its dependencies
+)
+
+# 2. Add the esp-aws-iot submodule as a subdirectory for CMake processing.
+add_subdirectory(esp-aws-iot)
+
+# 3. Link our C++ component library (${COMPONENT_LIB}) against the submodule's library.
+# Link privately. Adjust SUBMODULE_TARGET if build fails (check target name).
+set(SUBMODULE_TARGET "espressif__esp-aws-iot") # Common target name in recent IDF
+target_link_libraries(${COMPONENT_LIB} PRIVATE ${SUBMODULE_TARGET})
+
+# 4. Add the submodule's include directories to our component's private include path.
+idf_component_get_property(submodule_include_dirs ${SUBMODULE_TARGET} INCLUDE_DIRS)
+if(NOT submodule_include_dirs)
+    message(FATAL_ERROR "Could not get INCLUDE_DIRS property from submodule target '${SUBMODULE_TARGET}'. Check target name and submodule build.")
+endif()
+target_include_directories(${COMPONENT_LIB} PRIVATE ${submodule_include_dirs})
+message(STATUS "AWS IoT C++: Added include dirs from submodule target ${SUBMODULE_TARGET}")
+
+# --- C++ Standard ---
+# Ensure C++17 for std::string_view, etc.
+target_compile_features(${COMPONENT_LIB} PUBLIC cxx_std_17)
+
+# --- Multithreading Configuration Removed ---
+# Internal task and std::mutex are now always used. No Kconfig needed for this.
+
+# --- Export Include Directory ---
+# Make aws_iot_interface.hpp available to other components that list 'aws_iot' in REQUIRES.
+set(COMPONENT_ADD_INCLUDEDIRS ".")
+set(COMPONENT_EXPORT_INCLUDEDIRS ".")
+
+# --- SDKCONFIG Notes ---
+# The build process invoked by add_subdirectory(esp-aws-iot) should automatically
+# use the main project's sdkconfig file, providing necessary configurations
+# to the C SDK submodule build.
+# Ensure necessary `esp-aws-iot` options are enabled via `idf.py menuconfig`.
