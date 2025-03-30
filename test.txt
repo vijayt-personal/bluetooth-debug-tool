@@ -1,46 +1,158 @@
-# components/aws_iot/CMakeLists.txt
+#include "aws_iot_mqtt_client.hpp"
+#include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include <string> // Include necessary C++ standard library headers
 
-# 1. Register THIS component (the C++ abstraction layer)
-idf_component_register(
-    SRCS            "aws_iot_client.cpp"
-    INCLUDE_DIRS    "." # Allows local include of aws_iot_interface.hpp
-    # List dependencies needed *directly* by aws_iot_client.cpp,
-    # EXCLUDING esp-aws-iot itself (we handle that via add_subdirectory).
-    REQUIRES        log freertos # FreeRTOS still needed for tasks/delays
-    # List any private dependencies if necessary
-    # PRIV_REQUIRES   mbedtls # No, let esp-aws-iot require its dependencies
-)
+// --- Embed Certificates ---
+// Use ESP-IDF component manager or CMake embedding:
+// Add the following to component.mk or CMakeLists.txt:
+//COMPONENT_EMBED_TXTFILES := certs/aws-root-ca.pem certs/device.crt certs/device.key
 
-# 2. Add the esp-aws-iot submodule as a subdirectory for CMake processing.
-add_subdirectory(esp-aws-iot)
+// Make them accessible in code:
+extern const uint8_t aws_root_ca_pem_start[] asm("_binary_aws_root_ca_pem_start");
+extern const uint8_t aws_root_ca_pem_end[]   asm("_binary_aws_root_ca_pem_end");
+extern const uint8_t device_crt_start[] asm("_binary_device_crt_start");
+extern const uint8_t device_crt_end[]   asm("_binary_device_crt_end");
+extern const uint8_t device_key_start[] asm("_binary_device_key_start");
+extern const uint8_t device_key_end[]   asm("_binary_device_key_end");
 
-# 3. Link our C++ component library (${COMPONENT_LIB}) against the submodule's library.
-# Link privately. Adjust SUBMODULE_TARGET if build fails (check target name).
-set(SUBMODULE_TARGET "espressif__esp-aws-iot") # Common target name in recent IDF
-target_link_libraries(${COMPONENT_LIB} PRIVATE ${SUBMODULE_TARGET})
+static const char* TAG_MAIN = "MyApp";
 
-# 4. Add the submodule's include directories to our component's private include path.
-idf_component_get_property(submodule_include_dirs ${SUBMODULE_TARGET} INCLUDE_DIRS)
-if(NOT submodule_include_dirs)
-    message(FATAL_ERROR "Could not get INCLUDE_DIRS property from submodule target '${SUBMODULE_TARGET}'. Check target name and submodule build.")
-endif()
-target_include_directories(${COMPONENT_LIB} PRIVATE ${submodule_include_dirs})
-message(STATUS "AWS IoT C++: Added include dirs from submodule target ${SUBMODULE_TARGET}")
+// Instance of the client (global or part of another class)
+AwsIot::AwsIotMqttClient mqtt_client;
 
-# --- C++ Standard ---
-# Ensure C++17 for std::string_view, etc.
-target_compile_features(${COMPONENT_LIB} PUBLIC cxx_std_17)
+// --- Callback Implementations ---
+void on_mqtt_connected() {
+    ESP_LOGI(TAG_MAIN, "MQTT Client Connected!");
+    // Now safe to publish/subscribe
 
-# --- Multithreading Configuration Removed ---
-# Internal task and std::mutex are now always used. No Kconfig needed for this.
+    // Example: Get shadow on connect
+    if (!mqtt_client.GetShadow("my_init_token")) {
+         ESP_LOGE(TAG_MAIN, "Failed to queue GetShadow request.");
+    }
 
-# --- Export Include Directory ---
-# Make aws_iot_interface.hpp available to other components that list 'aws_iot' in REQUIRES.
-set(COMPONENT_ADD_INCLUDEDIRS ".")
-set(COMPONENT_EXPORT_INCLUDEDIRS ".")
+    // Example: Subscribe to a custom topic
+     if (!mqtt_client.Subscribe("my/custom/topic/in", 1,
+        [](const std::string& topic, std::string_view payload) {
+            ESP_LOGI(TAG_MAIN, "Received custom message on topic '%s': %.*s",
+                     topic.c_str(), (int)payload.length(), payload.data());
+            // Process payload...
+        }))
+    {
+         ESP_LOGE(TAG_MAIN, "Failed to subscribe to custom topic.");
+    }
+}
 
-# --- SDKCONFIG Notes ---
-# The build process invoked by add_subdirectory(esp-aws-iot) should automatically
-# use the main project's sdkconfig file, providing necessary configurations
-# to the C SDK submodule build.
-# Ensure necessary `esp-aws-iot` options are enabled via `idf.py menuconfig`.
+void on_mqtt_disconnected() {
+    ESP_LOGW(TAG_MAIN, "MQTT Client Disconnected!");
+    // Client will attempt to reconnect automatically based on config
+}
+
+void on_shadow_update(const std::string& update_type, std::string_view payload) {
+     ESP_LOGI(TAG_MAIN, "Received Shadow Update '%s': %.*s",
+              update_type.c_str(), (int)payload.length(), payload.data());
+     // Parse payload (likely JSON) and act accordingly
+     // e.g., handle "delta" to update device state
+}
+void on_shadow_get_response(const std::string& response_type, std::string_view payload) {
+     ESP_LOGI(TAG_MAIN, "Received Shadow Get Response '%s': %.*s",
+              response_type.c_str(), (int)payload.length(), payload.data());
+     // Parse payload (likely JSON) containing the shadow document or error
+}
+
+
+void on_job_received(const std::string& job_id, const std::string& status, const std::string& document) {
+     ESP_LOGI(TAG_MAIN, "Received Job Notification. ID: '%s', Status: '%s'", job_id.c_str(), status.c_str());
+     ESP_LOGI(TAG_MAIN, "Job Document: %s", document.c_str());
+
+     // Example: Immediately mark as IN_PROGRESS and then SUCCEEDED after a delay
+     if (status == "QUEUED" || status == "notify-next") { // Handle initial job notification
+          // Parse the document (JSON) to understand the job
+          ESP_LOGI(TAG_MAIN, "Processing job %s...", job_id.c_str());
+
+          // Update status to IN_PROGRESS
+          mqtt_client.UpdateJobStatus(job_id, "IN_PROGRESS", "{\"step\":\"starting\"}");
+
+          // Simulate doing work...
+          vTaskDelay(pdMS_TO_TICKS(5000)); // Delay 5 seconds
+
+          // Update status to SUCCEEDED
+           ESP_LOGI(TAG_MAIN, "Job %s finished.", job_id.c_str());
+          mqtt_client.UpdateJobStatus(job_id, "SUCCEEDED", "{\"result\":\"ok\"}");
+     }
+}
+
+
+// --- Main Application Logic ---
+extern "C" void app_main(void) {
+    // Initialize NVS, WiFi, etc. (Standard ESP-IDF setup)
+    // ... (Ensure WiFi is connected before starting MQTT) ...
+
+    ESP_LOGI(TAG_MAIN, "Setting up MQTT Client...");
+
+    AwsIot::MqttConfig config = {};
+    config.aws_endpoint = "YOUR_AWS_IOT_ENDPOINT"; // Replace with your endpoint
+    config.client_id = "YOUR_THING_NAME";         // Replace with your Thing Name/Client ID
+    config.thing_name = "YOUR_THING_NAME";        // Replace with your Thing Name
+
+    // Assign embedded certificates
+    config.root_ca_pem = reinterpret_cast<const char*>(aws_root_ca_pem_start);
+    config.device_cert_pem = reinterpret_cast<const char*>(device_crt_start);
+    config.private_key_pem = reinterpret_cast<const char*>(device_key_start);
+
+    // Set base reconnect delay (optional, defaults are reasonable)
+    // config.base_reconnect_ms = 2000;
+    // config.max_reconnect_ms = 120000; // 2 minutes
+
+    // Initialize the client
+    if (!mqtt_client.Initialize(config)) {
+        ESP_LOGE(TAG_MAIN, "Failed to initialize MQTT Client. Halting.");
+        return;
+    }
+
+    // Set callbacks BEFORE connecting
+    mqtt_client.SetOnConnectedCallback(on_mqtt_connected);
+    mqtt_client.SetOnDisconnectedCallback(on_mqtt_disconnected);
+    mqtt_client.SubscribeToShadowUpdates(on_shadow_update);
+    mqtt_client.SubscribeToShadowGetResponses(on_shadow_get_response);
+    mqtt_client.SubscribeToJobs(on_job_received); // Simplified job handling
+
+
+    // Connect (asynchronous)
+    ESP_LOGI(TAG_MAIN, "Connecting MQTT Client...");
+    if (!mqtt_client.Connect()) {
+         ESP_LOGE(TAG_MAIN, "Failed to start MQTT connection process.");
+         // Note: Even if Connect returns true, connection happens asynchronously.
+         // Check IsConnected() later or wait for on_connected callback.
+    }
+
+
+    // --- Main loop ---
+    int i = 0;
+    while (1) {
+        vTaskDelay(pdMS_TO_TICKS(10000)); // Delay 10 seconds
+
+        // Example: Periodically publish sensor data if connected
+        if (mqtt_client.IsConnected()) {
+            std::string topic = "my/custom/topic/out";
+            std::string payload = "{\"sensor_reading\":" + std::to_string(i++) + "}";
+            ESP_LOGI(TAG_MAIN, "Publishing: %s", payload.c_str());
+            if (!mqtt_client.Publish(topic, payload, 1)) { // Publish with QoS 1
+                 ESP_LOGW(TAG_MAIN, "Failed to publish message.");
+            }
+
+             // Example: Update reported shadow state periodically
+             std::string shadow_payload = "{\"state\":{\"reported\":{\"iteration\":" + std::to_string(i) + "}}}";
+             if(!mqtt_client.UpdateShadow(shadow_payload)) {
+                 ESP_LOGW(TAG_MAIN, "Failed to publish shadow update.");
+             }
+
+        } else {
+             ESP_LOGI(TAG_MAIN, "Waiting for MQTT connection... (will reconnect automatically)");
+        }
+    }
+
+    // Cleanup (optional, as app_main usually doesn't exit)
+    // mqtt_client.Disconnect();
+}
