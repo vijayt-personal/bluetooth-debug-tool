@@ -1,309 +1,562 @@
-// --- FileManager.h ---
-#pragma once
-#include <iostream> // For basic output, replace with actual logging/debug
+// my_app/common/app_context.cpp
+#include "my_app/common/app_context.h"
 
-class FileManager {
-public:
-    FileManager() = default;
-    bool init() {
-        std::cout << "FileManager Initializing..." << std::endl;
-        // Initialize file system, mount partitions, etc.
-        return true; // Return false on failure
-    }
-    // Add file operation methods here...
-    void readFile(const char* path) { /* ... */ }
-    void writeFile(const char* path, const char* data) { /* ... */ }
-};
+#include <iostream> // For demonstration logging
 
-// --- EventManager.h ---
-#pragma once
-#include <iostream>
+namespace my_app {
 
-class EventManager {
-public:
-    EventManager() = default;
-    bool init() {
-        std::cout << "EventManager Initializing..." << std::endl;
-        // Initialize event queues, topics, etc.
-        return true;
-    }
-    // Add event posting/subscribing methods here...
-    void postEvent(int eventId, void* data) { /* ... */ }
-};
+bool AppContext::Init() {
+  std::cout << "AppContext Initializing..." << std::endl;
 
-// --- ConfigStore.h ---
-#pragma once
-#include <iostream>
+  // Initialize components in a sensible order (e.g., config first)
+  if (!config_store_.Init()) {
+    std::cerr << "ERROR: AppContext failed to init ConfigStore!" << std::endl;
+    return false;
+  }
+  if (!file_manager_.Init()) {
+    std::cerr << "ERROR: AppContext failed to init FileManager!" << std::endl;
+    return false;
+  }
+  if (!event_manager_.Init()) {
+    std::cerr << "ERROR: AppContext failed to init EventManager!" << std::endl;
+    return false;
+  }
 
-class ConfigStore {
-public:
-    ConfigStore() = default;
-    bool init() {
-        std::cout << "ConfigStore Initializing..." << std::endl;
-        // Load configuration from NVM/flash
-        return true;
-    }
-    // Add config get/set methods here...
-    int getConfigValue(const char* key) { return 0; /* ... */ }
-};
+  std::cout << "AppContext Initialized Successfully." << std::endl;
+  return true;
+}
 
-// --- AppContext.h ---
-#pragma once
-#include "FileManager.h"
-#include "EventManager.h"
-#include "ConfigStore.h"
+} // namespace my_app
 
-class AppContext {
-public:
-    AppContext() = default; // Members initialized by their own defaults
 
-    // Public access to shared components
-    FileManager& getFileManager() { return fileManager_; }
-    EventManager& getEventManager() { return eventManager_; }
-    ConfigStore& getConfigStore() { return configStore_; }
+----------------------------------------------------------------------------------------
 
-    bool init() {
-        std::cout << "AppContext Initializing..." << std::endl;
-        if (!configStore_.init()) return false;
-        if (!fileManager_.init()) return false;
-        if (!eventManager_.init()) return false;
-        std::cout << "AppContext Initialized Successfully." << std::endl;
-        return true;
-    }
+    // my_app/device/device_manager.h
+#ifndef MY_APP_DEVICE_DEVICE_MANAGER_H_
+#define MY_APP_DEVICE_DEVICE_MANAGER_H_
 
-private:
-    // Owns the shared components
-    FileManager fileManager_;
-    EventManager eventManager_;
-    ConfigStore configStore_;
-
-    // Disable copy/move semantics if this context is unique
-    AppContext(const AppContext&) = delete;
-    AppContext& operator=(const AppContext&) = delete;
-    AppContext(AppContext&&) = delete;
-    AppContext& operator=(AppContext&&) = delete;
-};
-
----------------------------------------------------------------------------------------------------------
-
-  // --- DeviceManager.h ---
-#pragma once
-#include "AppContext.h"
-#include "FreeRTOS.h" // Use correct FreeRTOS header paths
+// FreeRTOS headers (use correct paths for your build system)
+#include "FreeRTOS.h"
 #include "task.h"
-#include <iostream>
 
+namespace my_app {
+
+// Forward declare dependencies
+class AppContext;
+
+/**
+ * @class DeviceManager
+ * @brief Manages hardware devices and peripherals (sensors, actuators).
+ */
 class DeviceManager {
-public:
-    // Constructor receives the shared AppContext
-    DeviceManager(AppContext& context) : appContext_(context), taskHandle_(nullptr) {}
+ public:
+  /**
+   * @brief Constructor requiring application context. Marked explicit.
+   * @param context Reference to the shared AppContext.
+   */
+  explicit DeviceManager(AppContext& context);
 
-    bool init() {
-        std::cout << "DeviceManager Initializing..." << std::endl;
-        // Initialize hardware devices, peripherals, etc.
-        // Example: Use appContext_.getConfigStore().getConfigValue("sensor_i2c_addr");
+  /**
+   * @brief Initializes the device manager, peripherals, and its FreeRTOS task.
+   * @return true if initialization is successful, false otherwise.
+   */
+  bool Init();
 
-        // Create the FreeRTOS task for this manager
-        BaseType_t status = xTaskCreate(
-            taskFunction,        // Static function as task entry point
-            "DeviceMgrTask",     // Task name
-            configMINIMAL_STACK_SIZE * 2, // Stack size (adjust as needed)
-            this,                // Pass pointer to this instance as parameter
-            tskIDLE_PRIORITY + 2,// Task priority (adjust as needed)
-            &taskHandle_         // Store task handle
-        );
+  /**
+   * @brief The main operational loop for the device manager task. Public for
+   * potential testing access, but normally only called by TaskFunction.
+   * @warning Contains an infinite loop. Should only be run by FreeRTOS.
+   */
+  void RunTask();
 
-        if (status != pdPASS) {
-            std::cerr << "ERROR: Failed to create DeviceManager task!" << std::endl;
-            return false;
-        }
-        std::cout << "DeviceManager Initialized and Task Created." << std::endl;
-        return true;
-    }
+  // Disallow copy and move operations.
+  DeviceManager(const DeviceManager&) = delete;
+  DeviceManager& operator=(const DeviceManager&) = delete;
 
-    // This is the method run *by* the FreeRTOS task
-    void runTask() {
-        std::cout << "DeviceManager Task Started." << std::endl;
-        // Use appContext_ components here, e.g.:
-        // appContext_.getEventManager().postEvent(...);
-        // appContext_.getFileManager().readFile(...);
+ private:
+  /**
+   * @brief Static entry function for the FreeRTOS task.
+   * @param parameter Pointer to the DeviceManager instance.
+   */
+  static void TaskFunction(void* parameter);
 
-        while (true) {
-            // Main task loop logic: read sensors, manage peripherals, etc.
-            std::cout << "[DeviceManager Task] Running..." << std::endl;
-            readSensors();
-            manageActuators();
+  /** @brief Helper method to perform sensor reading logic. */
+  void ReadSensors();
 
-            // Block for a period
-            vTaskDelay(pdMS_TO_TICKS(1000)); // Delay 1 second
-        }
-    }
+  /** @brief Helper method to manage actuator control logic. */
+  void ManageActuators();
 
-private:
-    AppContext& appContext_; // Reference to the shared context
-    TaskHandle_t taskHandle_; // Handle for the FreeRTOS task
-
-    // Static function required by FreeRTOS xTaskCreate
-    static void taskFunction(void* parameter) {
-        // Cast the parameter back to a DeviceManager instance pointer
-        DeviceManager* instance = static_cast<DeviceManager*>(parameter);
-        // Call the instance's run method
-        if (instance) {
-            instance->runTask();
-        }
-        // Task should not return, but if it does, delete it
-        vTaskDelete(NULL);
-    }
-
-    // Private helper methods
-    void readSensors() { /* ... read sensor data ... */ }
-    void manageActuators() { /* ... control actuators ... */ }
-
-    // Disable copy/move
-    DeviceManager(const DeviceManager&) = delete;
-    DeviceManager& operator=(const DeviceManager&) = delete;
+  // Member variable names use lower_snake_case_
+  AppContext& app_context_; // Non-owning reference to shared context
+  TaskHandle_t task_handle_ = nullptr; // FreeRTOS task handle
 };
 
+} // namespace my_app
 
-// --- ConnectivityManager.h ---
-#pragma once
-#include "AppContext.h"
+#endif // MY_APP_DEVICE_DEVICE_MANAGER_H_
+
+-----------------------------------------------------------------------------
+
+    // my_app/device/device_manager.cpp
+#include "my_app/device/device_manager.h"
+
+#include <iomanip>  // For std::hex/std::dec
+#include <iostream> // For demonstration logging
+
+// Include full definitions needed for implementation
+#include "my_app/common/app_context.h"
+#include "my_app/common/config_store.h" // For GetConfigValue example
+#include "my_app/common/event_manager.h" // For PostEvent example
+
+namespace my_app {
+
+// Define task parameters using Google Style constants
+constexpr configSTACK_DEPTH_TYPE kDeviceManagerTaskStackSize = configMINIMAL_STACK_SIZE * 2;
+constexpr UBaseType_t kDeviceManagerTaskPriority = tskIDLE_PRIORITY + 2;
+constexpr TickType_t kDeviceManagerTaskDelayTicks = pdMS_TO_TICKS(1000);
+
+// Define event IDs (consider a shared header/enum class)
+constexpr int kEventIdDeviceReady = 100;
+
+DeviceManager::DeviceManager(AppContext& context)
+    : app_context_(context), task_handle_(nullptr) {
+  std::cout << "DeviceManager Created." << std::endl;
+}
+
+bool DeviceManager::Init() {
+  std::cout << "DeviceManager Initializing..." << std::endl;
+
+  // Example: Access config store via context during initialization
+  int sensor_addr = app_context_.config_store().GetConfigValue("sensor_i2c_addr");
+  std::cout << "DeviceManager: Using sensor address: 0x" << std::hex
+            << sensor_addr << std::dec << std::endl;
+
+  // TODO(user): Initialize actual hardware peripherals here
+
+  std::cout << "DeviceManager: Creating FreeRTOS task..." << std::endl;
+  BaseType_t status = xTaskCreate(
+      DeviceManager::TaskFunction, // Static task function
+      "DeviceMgr",                 // Task name (shorter is often better)
+      kDeviceManagerTaskStackSize, // Stack size
+      this,                        // Pass instance pointer as parameter
+      kDeviceManagerTaskPriority,  // Task priority
+      &task_handle_                // Store task handle
+  );
+
+  if (status != pdPASS) {
+    task_handle_ = nullptr; // Ensure handle is null on failure
+    std::cerr << "ERROR: Failed to create DeviceManager task! Status: " << status
+              << std::endl;
+    // Consider using app_context_.event_manager().PostEvent(...) to signal failure
+    return false;
+  }
+
+  std::cout << "DeviceManager Initialized and Task Created Successfully." << std::endl;
+  return true;
+}
+
+void DeviceManager::RunTask() {
+  std::cout << "DeviceManager Task Started. Entering main loop." << std::endl;
+
+  // Example: Use EventManager from context within the task
+  app_context_.event_manager().PostEvent(kEventIdDeviceReady, this);
+
+  while (true) {
+    // Perform periodic device management tasks
+    std::cout << "[DeviceManager Task] Running cycle..." << std::endl;
+    ReadSensors();
+    ManageActuators();
+
+    // Block the task for the specified delay
+    vTaskDelay(kDeviceManagerTaskDelayTicks);
+  }
+  // This part should ideally not be reached.
+}
+
+// Static Task Wrapper - Implementation
+void DeviceManager::TaskFunction(void* parameter) {
+  std::cout << "DeviceManager static TaskFunction starting..." << std::endl;
+  // Cast the parameter back to the DeviceManager instance
+  DeviceManager* instance = static_cast<DeviceManager*>(parameter);
+
+  if (instance != nullptr) {
+    // Call the instance's run method, which contains the main loop
+    instance->RunTask();
+  } else {
+    std::cerr << "ERROR: DeviceManager TaskFunction received nullptr parameter!"
+              << std::endl;
+  }
+
+  // If RunTask somehow returns (it shouldn't), delete the task
+  std::cerr << "ERROR: DeviceManager RunTask exited! Deleting task." << std::endl;
+  vTaskDelete(nullptr); // nullptr means delete the calling task
+}
+
+void DeviceManager::ReadSensors() {
+  // TODO(user): Implement sensor reading logic (I2C, SPI, ADC etc.)
+  // std::cout << "[DeviceManager Task] Reading sensors..." << std::endl;
+}
+
+void DeviceManager::ManageActuators() {
+  // TODO(user): Implement actuator control logic (GPIO, PWM etc.)
+  // std::cout << "[DeviceManager Task] Managing actuators..." << std::endl;
+}
+
+} // namespace my_app
+
+-------------------------------------------------------------------------------------------
+
+    // my_app/network/connectivity_manager.h
+#ifndef MY_APP_NETWORK_CONNECTIVITY_MANAGER_H_
+#define MY_APP_NETWORK_CONNECTIVITY_MANAGER_H_
+
+#include "my_app/network/network_protocol_handler.h" // Owns by value
+
+// FreeRTOS headers
 #include "FreeRTOS.h"
 #include "task.h"
-#include <iostream>
 
+namespace my_app {
+
+// Forward declarations
+class AppContext;
+class EventManager; // Needed for protocol handler constructor injection
+
+/**
+ * @class ConnectivityManager
+ * @brief Manages network connectivity and uses a NetworkProtocolHandler.
+ */
 class ConnectivityManager {
-public:
-    ConnectivityManager(AppContext& context) : appContext_(context), taskHandle_(nullptr) {}
+ public:
+  /**
+   * @brief Constructor requiring application context. Marked explicit.
+   * @param context Reference to the shared AppContext.
+   */
+  explicit ConnectivityManager(AppContext& context);
 
-    bool init() {
-        std::cout << "ConnectivityManager Initializing..." << std::endl;
-        // Initialize network stack (WiFi, Ethernet, BLE, etc.)
-        // Use appContext_ here if needed for config (e.g., WiFi credentials)
-        // appContext_.getConfigStore().getConfigValue("wifi_ssid");
+  /**
+   * @brief Initializes the connectivity stack, protocol handler, and task.
+   * @return true if initialization is successful, false otherwise.
+   */
+  bool Init();
 
-        BaseType_t status = xTaskCreate(
-            taskFunction,
-            "ConnMgrTask",
-            configMINIMAL_STACK_SIZE * 4, // Needs more stack? Adjust.
-            this,
-            tskIDLE_PRIORITY + 1, // Lower priority than DeviceManager? Adjust.
-            &taskHandle_
-        );
+  /**
+   * @brief Main operational loop for the connectivity manager task.
+   * @warning Contains an infinite loop. Should only be run by FreeRTOS.
+   */
+  void RunTask();
 
-        if (status != pdPASS) {
-            std::cerr << "ERROR: Failed to create ConnectivityManager task!" << std::endl;
-            return false;
-        }
-        std::cout << "ConnectivityManager Initialized and Task Created." << std::endl;
-        return true;
-    }
+  // Disallow copy and move operations.
+  ConnectivityManager(const ConnectivityManager&) = delete;
+  ConnectivityManager& operator=(const ConnectivityManager&) = delete;
 
-    void runTask() {
-        std::cout << "ConnectivityManager Task Started." << std::endl;
-        // Use appContext_ here, e.g., to report events:
-        // appContext_.getEventManager().postEvent(NETWORK_CONNECTED, nullptr);
+ private:
+  /**
+   * @brief Static entry function for the FreeRTOS task.
+   * @param parameter Pointer to the ConnectivityManager instance.
+   */
+  static void TaskFunction(void* parameter);
 
-        while (true) {
-            // Main task loop: manage connections, send/receive data (MQTT, HTTP), etc.
-            std::cout << "[ConnectivityManager Task] Running..." << std::endl;
-            maintainConnection();
-            processNetworkData();
+  /** @brief Helper method to maintain the network connection state. */
+  void MaintainConnection();
 
-            vTaskDelay(pdMS_TO_TICKS(500)); // Delay 0.5 seconds
-        }
-    }
+  /** @brief Helper method to process network data via the protocol handler. */
+  void ProcessNetworkData();
 
-private:
-    AppContext& appContext_;
-    TaskHandle_t taskHandle_;
-
-    static void taskFunction(void* parameter) {
-        ConnectivityManager* instance = static_cast<ConnectivityManager*>(parameter);
-        if (instance) {
-            instance->runTask();
-        }
-        vTaskDelete(NULL);
-    }
-
-    void maintainConnection() { /* ... check WiFi/network status, reconnect if needed ... */ }
-    void processNetworkData() { /* ... handle MQTT messages, HTTP responses, etc. ... */ }
-
-    // Disable copy/move
-    ConnectivityManager(const ConnectivityManager&) = delete;
-    ConnectivityManager& operator=(const ConnectivityManager&) = delete;
+  AppContext& app_context_;          // Non-owning reference
+  TaskHandle_t task_handle_ = nullptr;
+  NetworkProtocolHandler protocol_handler_; // Owns the protocol handler instance
 };
 
+} // namespace my_app
 
+#endif // MY_APP_NETWORK_CONNECTIVITY_MANAGER_H_
 
---------------------------------------------------------------------------------------------------------------
+------------------------------------------------------------------------------------------
 
+    // my_app/network/connectivity_manager.cpp
+#include "my_app/network/connectivity_manager.h"
 
-  // --- Application.h ---
-#pragma once
-#include "AppContext.h"
-#include "DeviceManager.h"
-#include "ConnectivityManager.h"
+#include <iostream> // For demonstration logging
+
+// Include full definitions needed
+#include "my_app/common/app_context.h"
+#include "my_app/common/event_manager.h" // Needed for protocol handler injection source
+
+namespace my_app {
+
+// Define task parameters
+constexpr configSTACK_DEPTH_TYPE kConnManagerTaskStackSize = configMINIMAL_STACK_SIZE * 4;
+constexpr UBaseType_t kConnManagerTaskPriority = tskIDLE_PRIORITY + 1;
+constexpr TickType_t kConnManagerTaskDelayTicks = pdMS_TO_TICKS(500);
+
+// Define event IDs
+constexpr int kEventIdNetworkInitDone = 200;
+constexpr int kEventIdNetworkDisconnected = 202;
+
+// Constructor initializes members in initializer list (Google style prefers this)
+ConnectivityManager::ConnectivityManager(AppContext& context)
+    : app_context_(context),
+      task_handle_(nullptr),
+      // Inject only the EventManager from AppContext into the handler
+      protocol_handler_(context.event_manager()) {
+  std::cout << "ConnectivityManager Created." << std::endl;
+}
+
+bool ConnectivityManager::Init() {
+  std::cout << "ConnectivityManager Initializing..." << std::endl;
+
+  // TODO(user): Get config (e.g., WiFi creds) from app_context_.config_store()
+  // TODO(user): Initialize network hardware/stack (e.g., WiFi.begin())
+
+  // Initialize the protocol handler (if necessary after network stack init)
+  protocol_handler_.InitializeConnection();
+
+  std::cout << "ConnectivityManager: Creating FreeRTOS task..." << std::endl;
+  BaseType_t status = xTaskCreate(
+      ConnectivityManager::TaskFunction, // Static task function
+      "ConnMgr",                         // Task name
+      kConnManagerTaskStackSize,         // Stack size
+      this,                              // Pass instance pointer
+      kConnManagerTaskPriority,          // Task priority
+      &task_handle_                      // Store task handle
+  );
+
+  if (status != pdPASS) {
+    task_handle_ = nullptr;
+    std::cerr << "ERROR: Failed to create ConnectivityManager task! Status: "
+              << status << std::endl;
+    return false;
+  }
+
+  std::cout << "ConnectivityManager Initialized and Task Created Successfully."
+            << std::endl;
+  return true;
+}
+
+void ConnectivityManager::RunTask() {
+  std::cout << "ConnectivityManager Task Started. Entering main loop." << std::endl;
+
+  // Example: Signal network readiness (or attempt)
+  app_context_.event_manager().PostEvent(kEventIdNetworkInitDone, this);
+
+  while (true) {
+    std::cout << "[ConnectivityManager Task] Running cycle..." << std::endl;
+
+    // Perform periodic connectivity tasks
+    MaintainConnection();
+    ProcessNetworkData();
+
+    // Block the task
+    vTaskDelay(kConnManagerTaskDelayTicks);
+  }
+  // Should not be reached.
+}
+
+// Static Task Wrapper - Implementation
+void ConnectivityManager::TaskFunction(void* parameter) {
+  std::cout << "ConnectivityManager static TaskFunction starting..." << std::endl;
+  ConnectivityManager* instance = static_cast<ConnectivityManager*>(parameter);
+  if (instance != nullptr) {
+    instance->RunTask();
+  } else {
+    std::cerr << "ERROR: ConnectivityManager TaskFunction received nullptr parameter!"
+              << std::endl;
+  }
+
+  // If RunTask returns, clean up the task
+  std::cerr << "ERROR: ConnectivityManager RunTask exited! Deleting task." << std::endl;
+  vTaskDelete(nullptr);
+}
+
+void ConnectivityManager::MaintainConnection() {
+  // TODO(user): Implement connection management (check status, reconnect etc.)
+  // std::cout << "[ConnectivityManager Task] Maintaining connection..." << std::endl;
+  // bool is_connected = CheckNetworkStatus(); // Placeholder
+  // if (!is_connected) {
+  //   app_context_.event_manager().PostEvent(kEventIdNetworkDisconnected, nullptr);
+  //   AttemptReconnect(); // Placeholder
+  // }
+}
+
+void ConnectivityManager::ProcessNetworkData() {
+  // TODO(user): Implement data sending/receiving logic (sockets, MQTT loop etc.)
+  std::cout << "[ConnectivityManager Task] Processing network data..." << std::endl;
+
+  // Example: Simulate receiving data and passing it to the handler
+  // char* incoming_buffer = ReadFromSocket(); // Placeholder
+  const char* incoming_buffer = "Simulated:Sensor=Value"; // Placeholder
+  if (incoming_buffer != nullptr /* && data_available */) {
+    protocol_handler_.HandleIncomingPacket(incoming_buffer);
+  }
+
+  // Example: Send queued outgoing data
+  // SendOutgoingPackets(); // Placeholder
+}
+
+} // namespace my_app
+
+--------------------------------------------------------------------------------------------------
+
+    // my_app/app/application.h
+#ifndef MY_APP_APP_APPLICATION_H_
+#define MY_APP_APP_APPLICATION_H_
+
+#include "my_app/common/app_context.h"
+#include "my_app/device/device_manager.h"
+#include "my_app/network/connectivity_manager.h"
+
+// FreeRTOS headers only needed for vTaskStartScheduler declaration
 #include "FreeRTOS.h"
 #include "task.h"
-#include <iostream>
 
+namespace my_app {
+
+/**
+ * @class Application
+ * @brief Main application class owning and orchestrating major components.
+ */
 class Application {
-public:
-    // Constructor initializes members in the correct order
-    // AppContext must be constructed before managers that depend on it
-    Application() :
-        appContext_(), // Default construct AppContext first
-        deviceManager_(appContext_), // Pass context to DeviceManager
-        connectivityManager_(appContext_) // Pass context to ConnectivityManager
-    {}
+ public:
+  /**
+   * @brief Constructor. Initializes application components.
+   */
+  Application();
 
-    // Initialize all components
-    bool init() {
-        std::cout << "Application Initializing..." << std::endl;
+  /**
+   * @brief Initializes all core components of the application.
+   * @return true if all initializations are successful, false otherwise.
+   */
+  bool Init();
 
-        // 1. Initialize the shared context and its components
-        if (!appContext_.init()) {
-            std::cerr << "ERROR: Failed to initialize AppContext!" << std::endl;
-            return false;
-        }
+  /**
+   * @brief Starts the application's main execution by starting FreeRTOS.
+   * @note This function typically does not return.
+   */
+  void Run(); // Or StartScheduler() might be a clearer name
 
-        // 2. Initialize Device Manager (this will also create its task)
-        if (!deviceManager_.init()) {
-             std::cerr << "ERROR: Failed to initialize DeviceManager!" << std::endl;
-            return false;
-        }
+  // Disallow copy and move operations.
+  Application(const Application&) = delete;
+  Application& operator=(const Application&) = delete;
 
-        // 3. Initialize Connectivity Manager (this will also create its task)
-        if (!connectivityManager_.init()) {
-             std::cerr << "ERROR: Failed to initialize ConnectivityManager!" << std::endl;
-            return false;
-        }
-
-        std::cout << "Application Initialized Successfully." << std::endl;
-        return true;
-    }
-
-    // Start the application execution (typically starts the scheduler)
-    void run() {
-        std::cout << "Application Running. Starting FreeRTOS Scheduler..." << std::endl;
-        // After init(), all tasks are created. Start the scheduler.
-        // Control will not return from this call unless there's an error
-        // or scheduler is explicitly stopped.
-        vTaskStartScheduler();
-
-        // Code here will generally not be reached if scheduler starts successfully
-         std::cerr << "ERROR: Scheduler exited unexpectedly!" << std::endl;
-         // Handle error state - perhaps loop forever or reset
-         while(1);
-    }
-
-private:
-    AppContext appContext_; // Owns the shared context
-    DeviceManager deviceManager_; // Owns the device manager
-    ConnectivityManager connectivityManager_; // Owns the connectivity manager
-
-    // Disable copy/move
-    Application(const Application&) = delete;
-    Application& operator=(const Application&) = delete;
+ private:
+  // Owns the core components
+  AppContext app_context_;
+  DeviceManager device_manager_;
+  ConnectivityManager connectivity_manager_;
 };
+
+} // namespace my_app
+
+#endif // MY_APP_APP_APPLICATION_H_
+
+-------------------------------------------------------------------------------------------
+
+    // my_app/app/application.cpp
+#include "my_app/app/application.h"
+
+#include <iostream> // For demonstration logging
+
+namespace my_app {
+
+// Constructor initializes members in the initializer list
+Application::Application()
+    : app_context_(),                       // Default construct first
+      device_manager_(app_context_),      // Pass context reference
+      connectivity_manager_(app_context_) { // Pass context reference
+  std::cout << "Application Object Created." << std::endl;
+}
+
+bool Application::Init() {
+  std::cout << "Application Initializing..." << std::endl;
+
+  // 1. Initialize shared context
+  if (!app_context_.Init()) {
+    std::cerr << "FATAL ERROR: Failed to initialize AppContext!" << std::endl;
+    return false; // Critical failure
+  }
+
+  // 2. Initialize Device Manager (creates its task)
+  if (!device_manager_.Init()) {
+    std::cerr << "FATAL ERROR: Failed to initialize DeviceManager!" << std::endl;
+    return false;
+  }
+
+  // 3. Initialize Connectivity Manager (creates its task)
+  if (!connectivity_manager_.Init()) {
+    std::cerr << "FATAL ERROR: Failed to initialize ConnectivityManager!" << std::endl;
+    return false;
+  }
+
+  std::cout << "Application Initialized Successfully." << std::endl;
+  return true;
+}
+
+void Application::Run() {
+  std::cout << "Application Running. Starting FreeRTOS Scheduler..." << std::endl;
+  std::cout << "--------------------------------------------------" << std::endl;
+
+  // The scheduler takes control from here.
+  vTaskStartScheduler();
+
+  // --- Code below should not execute if scheduler starts ---
+  std::cerr << "--------------------------------------------------" << std::endl;
+  std::cerr << "FATAL ERROR: vTaskStartScheduler returned!" << std::endl;
+  std::cerr << "Insufficient FreeRTOS heap likely cause." << std::endl;
+  std::cerr << "System Halted." << std::endl;
+  std::cout << "--------------------------------------------------" << std::endl;
+
+  // Halt the system
+  volatile int i = 0; // Prevent optimization
+  while (true) {
+    i++;
+    // TODO(user): Add proper halt mechanism (e.g., error LED, reset)
+  }
+}
+
+} // namespace my_app
+
+----------------------------------------------------------------------------------------------
+
+    // my_app/main.cpp
+#include <iostream> // For boot messages
+
+#include "my_app/app/application.h" // Include the main application header
+
+// Global application instance (common pattern for embedded systems)
+// Ensure proper initialization order if static initializers have dependencies.
+// Here, Application's constructor handles internal dependencies correctly.
+my_app::Application g_application; // Use namespace
+
+/**
+ * @brief Main function - the application's entry point.
+ */
+int main() {
+  // --- Early Boot Sequence (usually handled by BSP/startup code) ---
+  std::cout << "--------------------------------------------------" << std::endl;
+  std::cout << "System Booting - main() entered." << std::endl;
+  // Note: Using __DATE__/__TIME__ might not be ideal for reproducible builds
+  std::cout << "Build Time (approx): " << __DATE__ << " " << __TIME__ << std::endl;
+  std::cout << "--------------------------------------------------" << std::endl;
+
+  // --- Application Initialization ---
+  if (g_application.Init()) {
+    // --- Start Application Execution ---
+    g_application.Run(); // Starts the scheduler, should not return
+  } else {
+    // --- Initialization Failed ---
+    std::cerr << "--------------------------------------------------" << std::endl;
+    std::cerr << "FATAL: Application initialization failed in main()!" << std::endl;
+    std::cerr << "System Halted." << std::endl;
+    std::cout << "--------------------------------------------------" << std::endl;
+  }
+
+  // --- Halt on Failure or if Run() returns ---
+  volatile int i = 0;
+  while (true) {
+    i++;
+     // TODO(user): Implement proper halt state (error LED, reset etc.)
+  }
+
+  return 1; // Should be unreachable
+}
