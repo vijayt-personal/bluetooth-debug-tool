@@ -1,3 +1,40 @@
+/ --- AppContext.h ---
+#pragma once
+#include "FileManager.h"
+#include "EventManager.h"
+#include "ConfigStore.h"
+
+class AppContext {
+public:
+    AppContext() = default; // Members initialized by their own defaults
+
+    // Public access to shared components
+    FileManager& getFileManager() { return fileManager_; }
+    EventManager& getEventManager() { return eventManager_; }
+    ConfigStore& getConfigStore() { return configStore_; }
+
+    bool init() {
+        std::cout << "AppContext Initializing..." << std::endl;
+        if (!configStore_.init()) return false;
+        if (!fileManager_.init()) return false;
+        if (!eventManager_.init()) return false;
+        std::cout << "AppContext Initialized Successfully." << std::endl;
+        return true;
+    }
+
+private:
+    // Owns the shared components
+    FileManager fileManager_;
+    EventManager eventManager_;
+    ConfigStore configStore_;
+
+    // Disable copy/move semantics if this context is unique
+    AppContext(const AppContext&) = delete;
+    AppContext& operator=(const AppContext&) = delete;
+    AppContext(AppContext&&) = delete;
+    AppContext& operator=(AppContext&&) = delete;
+};
+
 // my_app/common/app_context.cpp
 #include "my_app/common/app_context.h"
 
