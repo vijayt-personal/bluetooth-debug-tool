@@ -459,7 +459,7 @@ void ConnectivityManager::ProcessNetworkData() {
 
 --------------------------------------------------------------------------------------------------
 
-    // my_app/app/application.h
+// my_app/app/application.h
 #ifndef MY_APP_APP_APPLICATION_H_
 #define MY_APP_APP_APPLICATION_H_
 
@@ -513,7 +513,7 @@ class Application {
 
 -------------------------------------------------------------------------------------------
 
-    // my_app/app/application.cpp
+ // my_app/app/application.cpp
 #include "my_app/app/application.h"
 
 #include <iostream> // For demonstration logging
