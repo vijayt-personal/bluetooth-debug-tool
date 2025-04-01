@@ -1,0 +1,410 @@
+/**
+ * @file json_wrapper.hpp
+ * @brief Defines C++ classes for parsing, creating, and interacting with JSON
+ * data using the cJSON library as the backend. Provides RAII for
+ * document lifetime and a variant-like interface for nodes.
+ *
+ * This wrapper is platform-agnostic and uses standard heap allocation via cJSON.
+ */
+#ifndef JSON_WRAPPER_HPP
+#define JSON_WRAPPER_HPP
+
+#include <cmath>     // For std::llround, std::lround
+#include <cstddef>   // For size_t
+#include <cstdint>   // For int64_t
+#include <limits>    // For std::numeric_limits
+#include <string>
+#include <utility>   // For std::move (needed in cpp)
+#include <vector>
+// Include cJSON header from your project's include path or library location
+#include "cJSON.h"
+
+// Forward declarations
+class JsonDocument;
+class JsonVariant;
+
+// --- JsonVariant Class ---
+
+/**
+ * @brief Represents a non-owning view into a specific node within a JsonDocument.
+ *
+ * Provides methods for type checking, value retrieval, and navigating the
+ * JSON structure (objects and arrays). Follows Google C++ Style guidelines.
+ *
+ * @warning A JsonVariant is only valid as long as the JsonDocument it references
+ * exists and has not been modified in a way that invalidates the node
+ * it points to. It does not own the underlying cJSON node.
+ */
+class JsonVariant {
+  friend class JsonDocument;  // Allow JsonDocument to create variants
+
+ public:
+  /**
+   * @brief Default constructor creating an invalid variant.
+   */
+  JsonVariant() = default;
+
+  // --- Validity and Type Checking ---
+
+  /**
+   * @brief Checks if the variant points to a valid cJSON node.
+   * @return True if the variant is valid (not null), false otherwise.
+   */
+  bool IsValid() const { return node_ != nullptr; }
+
+  /**
+   * @brief Checks validity, allowing `if (variant)` style checks.
+   * @return True if the variant is valid, false otherwise.
+   */
+  explicit operator bool() const { return IsValid(); }
+
+  /** @brief Checks if the underlying node is a JSON null. */
+  bool IsNull() const { return IsValid() && cJSON_IsNull(node_); }
+  /** @brief Checks if the underlying node is a JSON boolean (true or false). */
+  bool IsBool() const { return IsValid() && cJSON_IsBool(node_); }
+  /** @brief Checks if the underlying node is a JSON number. */
+  bool IsNumber() const { return IsValid() && cJSON_IsNumber(node_); }
+  /** @brief Checks if the underlying node is a JSON string. */
+  bool IsString() const { return IsValid() && cJSON_IsString(node_); }
+  /** @brief Checks if the underlying node is a JSON array. */
+  bool IsArray() const { return IsValid() && cJSON_IsArray(node_); }
+  /** @brief Checks if the underlying node is a JSON object. */
+  bool IsObject() const { return IsValid() && cJSON_IsObject(node_); }
+
+  // --- Value Accessors (Read-Only) ---
+
+  /**
+   * @brief Gets the value as a boolean.
+   * @param default_val Value to return if invalid or not bool/number.
+   * Numbers are converted (0 -> false, non-zero -> true).
+   * @return The boolean value or the default value.
+   */
+  bool AsBool(bool default_val = false) const;
+
+  /**
+   * @brief Gets the value as a double-precision floating-point number.
+   * @param default_val Value to return if invalid or not number/bool.
+   * Booleans are converted (true -> 1.0, false -> 0.0).
+   * @return The double value or the default value.
+   */
+  double AsDouble(double default_val = 0.0) const;
+
+  /**
+   * @brief Gets the value as an integer. Rounds the underlying double value.
+   * @param default_val Value to return if invalid or not number/bool.
+   * @return The integer value or the default value.
+   * @warning Potential loss of precision and overflow.
+   */
+  int AsInt(int default_val = 0) const;
+
+  /**
+   * @brief Gets the value as a 64-bit integer. Rounds the underlying double.
+   * @param default_val Value to return if invalid or not number/bool.
+   * @return The 64-bit integer value or the default value.
+   * @warning Potential loss of precision and overflow.
+   */
+  int64_t AsInt64(int64_t default_val = 0LL) const;
+
+  /**
+   * @brief Gets the value as a standard string. Creates a copy.
+   * @param default_val Value to return if invalid or not a string.
+   * @return The string value or the default value.
+   */
+  std::string AsString(const std::string& default_val = "") const;
+
+  // --- Navigation (Object) ---
+
+  /**
+   * @brief Checks if an object variant contains a specific member key.
+   * @param key The member key (case-sensitive).
+   * @return True if the variant is a valid object and contains the key.
+   */
+  bool HasMember(const char* key) const;
+
+  /**
+   * @brief Accesses an object member by key (read-only).
+   * @param key The member key (case-sensitive).
+   * @return A JsonVariant view. Returns an invalid variant if not an object
+   * or key doesn't exist.
+   */
+  JsonVariant operator[](const char* key) const;
+
+  /**
+   * @brief Accesses an object member by key (read-only). String overload.
+   * @param key The member key (case-sensitive).
+   * @return A JsonVariant view. Returns an invalid variant if not an object
+   * or key doesn't exist.
+   */
+  JsonVariant operator[](const std::string& key) const {
+    return (*this)[key.c_str()];
+  }
+
+  // --- Navigation (Array) ---
+
+  /**
+   * @brief Gets the number of elements in an array variant.
+   * @return The array size if the variant is a valid array, 0 otherwise.
+   */
+  int GetSize() const;
+
+  /**
+   * @brief Accesses an array element by index (read-only).
+   * @param index The zero-based index of the element.
+   * @return A JsonVariant view. Returns an invalid variant if not an array
+   * or index is out of bounds.
+   */
+  JsonVariant operator[](int index) const;
+
+  // --- Modification ---
+  // Note: These modify the underlying document directly. Use with care.
+
+  /**
+   * @brief Sets the value of the node if it's already a boolean.
+   * @param value The new boolean value.
+   * @return True on success, false if variant invalid or not a boolean.
+   */
+  bool SetBool(bool value);
+
+  /**
+   * @brief Sets the value of the node if it's already a number.
+   * @param value The new double value.
+   * @return True on success, false if variant invalid or not a number.
+   */
+  bool SetDouble(double value);
+
+  /**
+   * @brief Sets the value of the node if it's already a string. Allocates memory.
+   * @param value The new C-string value (will be copied).
+   * @return True on success, false if invalid, not string, or alloc fails.
+   */
+  bool SetString(const char* value);
+
+  /**
+   * @brief Sets the value of the node if it's already a string. Allocates memory.
+   * @param value The new string value (will be copied).
+   * @return True on success, false if invalid, not string, or alloc fails.
+   */
+  bool SetString(const std::string& value) { return SetString(value.c_str()); }
+
+  /** @brief Convenience: Sets the value if the node is a number. */
+  bool SetInt(int value) { return SetDouble(static_cast<double>(value)); }
+  /** @brief Convenience: Sets the value if the node is a number. */
+  bool SetInt64(int64_t value) { return SetDouble(static_cast<double>(value)); }
+
+  /**
+   * @brief Adds a copy of another variant as an item to this array variant.
+   * @param item Valid variant to add (content duplicated).
+   * @return Variant pointing to added item, or invalid variant on failure.
+   */
+  JsonVariant AddItem(const JsonVariant& item);
+  /** @brief Adds a boolean value to this array variant. */
+  JsonVariant AddItem(bool value);
+  /** @brief Adds a double value to this array variant. */
+  JsonVariant AddItem(double value);
+  /** @brief Adds a string value (copied) to this array variant. */
+  JsonVariant AddItem(const char* value);
+  /** @brief Adds a string value (copied) to this array variant. */
+  JsonVariant AddItem(const std::string& value) { return AddItem(value.c_str()); }
+  /** @brief Adds an integer value to this array variant. */
+  JsonVariant AddItem(int value) { return AddItem(static_cast<double>(value)); }
+  /** @brief Adds a 64-bit integer value to this array variant. */
+  JsonVariant AddItem(int64_t value) {
+    return AddItem(static_cast<double>(value));
+  }
+
+  /**
+   * @brief Adds/replaces member in object with a copy of another variant.
+   * @param key The member key (case-sensitive).
+   * @param item Valid variant value (content duplicated).
+   * @return Variant pointing to added/set member, or invalid variant on failure.
+   */
+  JsonVariant AddMember(const char* key, const JsonVariant& item);
+  /** @brief Adds/sets a boolean member in this object variant. */
+  JsonVariant AddMember(const char* key, bool value);
+  /** @brief Adds/sets a double member in this object variant. */
+  JsonVariant AddMember(const char* key, double value);
+  /** @brief Adds/sets a string member (copied) in this object variant. */
+  JsonVariant AddMember(const char* key, const char* value);
+  /** @brief Adds/sets a variant member (copied) in this object variant. */
+  JsonVariant AddMember(const std::string& key, const JsonVariant& item) {
+    return AddMember(key.c_str(), item);
+  }
+  /** @brief Adds/sets a boolean member in this object variant. */
+  JsonVariant AddMember(const std::string& key, bool value) {
+    return AddMember(key.c_str(), value);
+  }
+  /** @brief Adds/sets a double member in this object variant. */
+  JsonVariant AddMember(const std::string& key, double value) {
+    return AddMember(key.c_str(), value);
+  }
+  /** @brief Adds/sets a string member (copied) in this object variant. */
+  JsonVariant AddMember(const std::string& key, const char* value) {
+    return AddMember(key.c_str(), value);
+  }
+  /** @brief Adds/sets a string member (copied) in this object variant. */
+  JsonVariant AddMember(const std::string& key, const std::string& value) {
+    return AddMember(key.c_str(), value.c_str());
+  }
+  /** @brief Adds/sets an integer member in this object variant. */
+  JsonVariant AddMember(const char* key, int value) {
+    return AddMember(key, static_cast<double>(value));
+  }
+  /** @brief Adds/sets a 64-bit integer member in this object variant. */
+  JsonVariant AddMember(const char* key, int64_t value) {
+    return AddMember(key, static_cast<double>(value));
+  }
+  /** @brief Adds/sets an integer member in this object variant. */
+  JsonVariant AddMember(const std::string& key, int value) {
+    return AddMember(key.c_str(), static_cast<double>(value));
+  }
+  /** @brief Adds/sets a 64-bit integer member in this object variant. */
+  JsonVariant AddMember(const std::string& key, int64_t value) {
+    return AddMember(key.c_str(), static_cast<double>(value));
+  }
+
+  /**
+   * @brief Gets the internal cJSON node pointer.
+   * @return Raw cJSON pointer, or nullptr if invalid.
+   * @warning Use with caution. Direct manipulation bypasses wrapper logic.
+   * Lifetime managed by parent JsonDocument.
+   */
+  cJSON* GetInternalPtr() const { return node_; }
+
+ private:
+  cJSON* node_ = nullptr;  // Pointer to the cJSON node (non-owning).
+};
+
+// --- JsonDocument Class ---
+
+/**
+ * @brief Represents an owning JSON document structure based on cJSON.
+ *
+ * Manages the lifetime of the root cJSON object using RAII.
+ * Provides methods for parsing (deserializing), serializing, and creating
+ * JSON documents. Follows Google C++ Style guidelines.
+ */
+class JsonDocument {
+ public:
+  // --- Constructors ---
+
+  /**
+   * @brief Default constructor. Creates an empty document (root is null).
+   */
+  JsonDocument() = default;
+
+  /**
+   * @brief Parsing constructor. Parses (deserializes) the given JSON string.
+   * @param json_string The JSON string to parse.
+   * @note Document will be invalid if parsing fails. Check with `IsValid()`.
+   */
+  explicit JsonDocument(const std::string& json_string);
+
+  /**
+   * @brief Parsing constructor. Parses (deserializes) the given JSON C-string.
+   * @param json_string The null-terminated JSON C-string to parse.
+   * @note Document will be invalid if parsing fails. Check with `IsValid()`.
+   */
+  explicit JsonDocument(const char* json_string);
+
+  /**
+   * @brief Move constructor. Transfers ownership of the cJSON root.
+   * @param other Document to move from. `other` becomes invalid.
+   */
+  JsonDocument(JsonDocument&& other) noexcept;
+
+  /**
+   * @brief Move assignment operator. Transfers ownership of the cJSON root.
+   * @param other Document to move from. `other` becomes invalid.
+   * @return Reference to this document.
+   */
+  JsonDocument& operator=(JsonDocument&& other) noexcept;
+
+  // Deleted copy semantics (prevent accidental expensive deep copies)
+  JsonDocument(const JsonDocument&) = delete;
+  JsonDocument& operator=(const JsonDocument&) = delete;
+
+  /**
+   * @brief Destructor. Frees the entire cJSON tree using `cJSON_Delete`. (RAII)
+   */
+  ~JsonDocument();
+
+  // --- Parsing (Deserialization) ---
+
+  /**
+   * @brief Parses (deserializes) a JSON string, replacing current content.
+   * @param json_string The JSON string to parse.
+   * @return True on success, false otherwise. Document may be invalid on failure.
+   */
+  bool Parse(const std::string& json_string);
+
+  /**
+   * @brief Parses (deserializes) a JSON C-string, replacing current content.
+   * @param json_string Null-terminated JSON C-string to parse.
+   * @return True on success, false otherwise. Document may be invalid on failure.
+   */
+  bool Parse(const char* json_string);
+
+  // --- Serialization ---
+
+  /**
+   * @brief Serializes the JSON document to a string.
+   * @param pretty If true, format output with indentation/newlines (pretty).
+   * If false, generate compact output.
+   * @return JSON string. Empty string or "null" on failure or if empty doc.
+   */
+  std::string Serialize(bool pretty = false) const;
+
+  // --- Document State ---
+
+  /**
+   * @brief Checks if the document holds a valid (non-null) root node.
+   * @return True if valid, false otherwise (e.g., after failed parse).
+   */
+  bool IsValid() const { return root_ != nullptr; }
+
+  /**
+   * @brief Checks validity, allowing `if (doc)` style checks.
+   * @return True if the document is valid, false otherwise.
+   */
+  explicit operator bool() const { return IsValid(); }
+
+  // --- Root Access ---
+
+  /**
+   * @brief Gets a non-owning view of the root element of the document.
+   * @return A JsonVariant pointing to the root. Invalid if document is empty.
+   */
+  JsonVariant GetRoot() const;
+
+  // --- Document Creation ---
+
+  /**
+   * @brief Clears content and creates a new empty JSON object as the root.
+   * @return True if successful, false if memory allocation fails.
+   */
+  bool CreateObject();
+
+  /**
+   * @brief Clears content and creates a new empty JSON array as the root.
+   * @return True if successful, false if memory allocation fails.
+   */
+  bool CreateArray();
+
+  /**
+   * @brief Gets the internal owning cJSON root pointer.
+   * @return Raw owning cJSON pointer, or nullptr if empty/invalid.
+   * @warning Use with extreme caution. Modifying this pointer directly
+   * can break RAII and lead to memory leaks or crashes.
+   */
+  cJSON* GetInternalPtr() const { return root_; }
+
+ private:
+  /**
+   * @brief Helper function to safely delete the current root node.
+   */
+  void Clear();
+
+  cJSON* root_ = nullptr;  // Owning pointer to the root cJSON object.
+};
+
+#endif  // JSON_WRAPPER_HPP
