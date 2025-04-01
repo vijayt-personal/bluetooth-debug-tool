@@ -1,39 +1,63 @@
-/ --- AppContext.h ---
-#pragma once
-#include "FileManager.h"
-#include "EventManager.h"
-#include "ConfigStore.h"
+// my_app/common/app_context.h
+#ifndef MY_APP_COMMON_APP_CONTEXT_H_
+#define MY_APP_COMMON_APP_CONTEXT_H_
 
+#include "my_app/common/config_store.h" // Include full types needed by value members
+#include "my_app/common/event_manager.h"
+#include "my_app/common/file_manager.h"
+
+namespace my_app {
+
+// Forward declarations are generally preferred in headers if only pointers/references are used,
+// but since these are value members, full includes are necessary here.
+
+/**
+ * @class AppContext
+ * @brief Container for shared application-wide resources and services.
+ */
 class AppContext {
-public:
-    AppContext() = default; // Members initialized by their own defaults
+ public:
+  AppContext() = default;
 
-    // Public access to shared components
-    FileManager& getFileManager() { return fileManager_; }
-    EventManager& getEventManager() { return eventManager_; }
-    ConfigStore& getConfigStore() { return configStore_; }
+  /**
+   * @brief Initializes the context and all its owned components.
+   * @return true if all components initialize successfully, false otherwise.
+   */
+  bool Init();
 
-    bool init() {
-        std::cout << "AppContext Initializing..." << std::endl;
-        if (!configStore_.init()) return false;
-        if (!fileManager_.init()) return false;
-        if (!eventManager_.init()) return false;
-        std::cout << "AppContext Initialized Successfully." << std::endl;
-        return true;
-    }
+  // Provide const and non-const accessors as appropriate.
+  // If the components themselves might be modified via the reference,
+  // return non-const references. If access is read-only, return const references.
 
-private:
-    // Owns the shared components
-    FileManager fileManager_;
-    EventManager eventManager_;
-    ConfigStore configStore_;
+  /** @brief Provides access to the FileManager instance. */
+  FileManager& file_manager() { return file_manager_; }
+  /** @brief Provides const access to the FileManager instance. */
+  const FileManager& file_manager() const { return file_manager_; }
 
-    // Disable copy/move semantics if this context is unique
-    AppContext(const AppContext&) = delete;
-    AppContext& operator=(const AppContext&) = delete;
-    AppContext(AppContext&&) = delete;
-    AppContext& operator=(AppContext&&) = delete;
+  /** @brief Provides access to the EventManager instance. */
+  EventManager& event_manager() { return event_manager_; }
+  /** @brief Provides const access to the EventManager instance. */
+  const EventManager& event_manager() const { return event_manager_; }
+
+  /** @brief Provides access to the ConfigStore instance. */
+  ConfigStore& config_store() { return config_store_; }
+  /** @brief Provides const access to the ConfigStore instance. */
+  const ConfigStore& config_store() const { return config_store_; }
+
+  // Disallow copy and move operations.
+  AppContext(const AppContext&) = delete;
+  AppContext& operator=(const AppContext&) = delete;
+
+ private:
+  // Member variable names use lower_snake_case_
+  FileManager file_manager_;
+  EventManager event_manager_;
+  ConfigStore config_store_;
 };
+
+} // namespace my_app
+
+#endif // MY_APP_COMMON_APP_CONTEXT_H_
 
 // my_app/common/app_context.cpp
 #include "my_app/common/app_context.h"
