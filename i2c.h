@@ -5,16 +5,11 @@
  * following Google C++ style guidelines. Designed for use with
  * ESP-IDF i2c_master driver without dynamic allocation.
  */
-#ifndef I2C_H // Standard include guard convention (use _H suffix)
+#ifndef I2C_H
 #define I2C_H
 
 #include <cstddef> // For size_t
 #include <cstdint> // For standard integer types
-
-// Forward declaration for the internal handle type if needed,
-// or just use void* if implementation details are hidden.
-// Using void* here to keep the header independent of specific driver includes.
-// struct i2c_master_bus_handle_t; // Example if using specific type
 
 namespace io {
 
@@ -31,9 +26,9 @@ public:
   enum class Result {
     kSuccess = 0,      ///< Operation completed successfully
     kBusError,         ///< Bus error occurred (hardware, SDA/SCL line issues)
-    kArbitrationLost,  ///< Arbitration lost (not typically reported by ESP-IDF master) - Kept for API compatibility if needed
+    kArbitrationLost,  ///< Arbitration lost (less common in ESP-IDF master reports)
     kNackAddr,         ///< Address was not acknowledged by the slave device
-    kNackData,         ///< Data byte was not acknowledged by the slave device
+    kNackData,         ///< Data byte was not acknowledged by the slave device (less common in ESP-IDF master reports)
     kTimeOut,          ///< Operation timed out waiting for ACK, clock stretching, or bus access
     kBusy,             ///< Driver/Bus is busy or already initialized with this instance
     kInvalidArgs,      ///< Invalid arguments provided to a method
@@ -63,9 +58,9 @@ public:
   // Prevent copying and assignment to manage resource ownership correctly
   I2c(const I2c&) = delete;
   I2c& operator=(const I2c&) = delete;
-  // Allow moving if desired (though implementation needs care)
-  I2c(I2c&&) = default; // Or implement custom move if needed
-  I2c& operator=(I2c&&) = default; // Or implement custom move if needed
+  // Allow moving if desired
+  I2c(I2c&&) = default;
+  I2c& operator=(I2c&&) = default;
 
 
   /**
@@ -141,8 +136,14 @@ public:
                      size_t* found_count);
 
 private:
+  /**
+   * @brief Maximum size of the temporary buffer used for WriteReg transactions (reg addr + data).
+   * Adjust based on expected maximum payload size for register writes.
+   */
+  static constexpr size_t kMaxWriteRegBufferSize = 128;
+
   Config config_;        ///< Stores the configuration used during initialization.
-  void* bus_handle_;     ///< Opaque handle to the underlying driver's bus instance. (e.g., i2c_master_bus_handle_t)
+  void* bus_handle_;     ///< Opaque handle to the underlying driver's bus instance. Needs casting in .cpp file.
   bool initialized_;     ///< Flag indicating if Initialize() has been successfully called.
 };
 
