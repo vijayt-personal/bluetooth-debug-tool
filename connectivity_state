@@ -1,0 +1,29 @@
+// Defines the connectivity status of a device.
+syntax = "proto3";
+package commissioning.v1;
+option optimize_for = CODE_SIZE;
+// Add other standard options like java_package etc. if needed for other teams
+
+enum ConnectivityStatus {
+  CONNECTIVITY_STATUS_WIFI_CONNECTED_NO_CLOUD_CONNECTIVITY = 0;
+  CONNECTIVITY_STATUS_WIFI_CONNECTED_CLOUD_CONNECTED = 1;
+  CONNECTIVITY_STATUS_WIFI_CONNECTED_NO_CLOUD_CONNECTIVITY_WAIT = 2;
+  CONNECTIVITY_STATUS_WIFI_CONNECTED_CLOUD_CONNECTED_WAIT_SAVE = 3;
+}
+
+message ConnectivityState {
+  ConnectivityStatus connectivity_status = 1;
+}
+
+-------------------------------------------------------------------------------------
+
+  # Nanopb options for connectivity_state.proto
+
+# Apply max_size to the whole encoded message for buffer safety/allocation
+ConnectivityState           max_size:8
+
+# Suggest using an 8-bit type for the connectivity_status field
+# in the generated C struct (requires Nanopb v0.4.0 or later)
+ConnectivityState.connectivity_status int_size:IS_8
+
+  ----------------------------------------------------------------------------------
