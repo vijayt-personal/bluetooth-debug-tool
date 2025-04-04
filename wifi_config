@@ -1,0 +1,123 @@
+// Defines messages and enums for Wi-Fi configuration requests and responses.
+// Compatible with standard protobuf generators and Nanopb (with .options file).
+
+syntax = "proto3";
+
+// Consistent package name for commissioning/provisioning protos.
+package commissioning.v1;
+
+// Standard option, good for embedded.
+option optimize_for = CODE_SIZE;
+
+// Add other standard options if needed (e.g., java_package)
+// option java_package = "com.yourcompany.commissioning.v1";
+// option java_multiple_files = true;
+
+// --- Enum Definitions ---
+
+// Defines the types of Wi-Fi configuration actions requested.
+// Renamed from wifi_request to WifiRequestType (CamelCase).
+enum WifiRequestType {
+  // Note: The zero value is typically *_UNSPECIFIED. Preserving original
+  // numbering for compatibility, where 0 represents a specific action.
+  WIFI_REQUEST_TYPE_CREDENTIALS_SET = 0; // Save new config to file
+  WIFI_REQUEST_TYPE_CREDENTIALS_UPDATE = 1; // update existing with newer values
+  WIFI_REQUEST_TYPE_CREDENTIALS_DELETE = 2; // Delete existing configs
+  WIFI_REQUEST_TYPE_START_WIFI = 3; // Start Wi-Fi
+  WIFI_REQUEST_TYPE_STOP_WIFI = 4; // Stop Wi-Fi
+  WIFI_REQUEST_TYPE_GET_SSID = 5; // Get the SSID, if Wi-Fi Exists
+}
+
+// Defines the possible outcomes or types of responses to configuration actions.
+// Renamed from wifi_resp_type to WifiResponseType (CamelCase).
+enum WifiResponseType {
+  // Note: The zero value is typically *_UNSPECIFIED. Preserving original
+  // numbering for compatibility, where 0 represents a specific state.
+  WIFI_RESPONSE_TYPE_CONNECTION_FAILED = 0;
+  WIFI_RESPONSE_TYPE_CONNECTION_SUCCESS = 1;
+  WIFI_RESPONSE_TYPE_DISCONNECTION_FAILED = 2;
+  WIFI_RESPONSE_TYPE_DISCONNECTION_SUCCESS = 3;
+  WIFI_RESPONSE_TYPE_SAVING_FAILED = 4;
+  WIFI_RESPONSE_TYPE_SAVING_SUCCESS = 5;
+  WIFI_RESPONSE_TYPE_UPDATE_FAILED = 6;
+  WIFI_RESPONSE_TYPE_UPDATE_SUCCESS = 7;
+  WIFI_RESPONSE_TYPE_SAVED_SSID = 8; // Response likely includes the SSID
+  WIFI_RESPONSE_TYPE_DECODE_FAILED = 9; // Error decoding the request message
+  WIFI_RESPONSE_TYPE_CODE_TYPE_ERROR = 10; // Unknown request type
+  WIFI_RESPONSE_TYPE_DELETE_SUCCESS = 11;
+  WIFI_RESPONSE_TYPE_DELETE_FAILED = 12;
+  WIFI_RESPONSE_TYPE_SSID_LEN_ERROR = 13; // Provided SSID potentially too long/short
+  WIFI_RESPONSE_TYPE_PASS_LEN_ERROR = 14; // Provided Password potentially too long/short
+}
+
+
+// --- Message Definitions ---
+
+// Carries Wi-Fi credentials for configuration actions.
+// Renamed from wifi_configuration_request to WifiConfigurationRequest.
+message WifiConfigurationRequest {
+  // SSID of the target network.
+  string ssid = 1; // Nanopb: max_size must be set in .options
+
+  // [DEPRECATED] Redundant field as string length is implicit in Protobuf encoding.
+  // Kept for compatibility, but should not be used in new code.
+  uint32 ssid_len = 2 [deprecated = true];
+
+  // Password for the target network.
+  string password = 3; // Nanopb: max_size must be set in .options
+
+  // [DEPRECATED] Redundant field as string length is implicit in Protobuf encoding.
+  // Kept for compatibility, but should not be used in new code.
+  uint32 password_len = 4 [deprecated = true];
+}
+
+// Provides the result of a Wi-Fi configuration request.
+// Renamed from wifi_msg_response to WifiConfigurationResponse.
+message WifiConfigurationResponse {
+  // The outcome type of the configuration operation. Type renamed.
+  WifiResponseType resp_type = 1; // Nanopb: Consider int_size:IS_8
+
+  // The SSID relevant to the response (e.g., when type is SAVED_SSID).
+  string resp_ssid = 2; // Nanopb: max_size must be set in .options
+
+  // [DEPRECATED] Redundant field as string length is implicit in Protobuf encoding.
+  // Kept for compatibility, but should not be used in new code.
+  uint32 resp_ssid_len = 3 [deprecated = true];
+}
+
+------------------------------------------------------------------------------------------
+# Nanopb options for wifi_config.proto
+
+# --- Enum Options ---
+# Suggest 8-bit C types if enum values allow (max value is 14, fits IS_8)
+WifiRequestType  int_size:IS_8
+WifiResponseType int_size:IS_8
+
+# --- WifiConfigurationRequest Message Options ---
+
+# Set max encoded size for the request message.
+# Estimate: ssid(k:1+l:1+c:32=34) + ssid_len(k:1+v:5=6) +
+#           password(k:1+l:1+c:64=66) + password_len(k:1+v:5=6) = ~112 bytes.
+# Using buffer -> 128. Adjust based on actual limits.
+WifiConfigurationRequest max_size:128
+
+# Set max content size for SSID string (excluding C null terminator). Standard max is 32.
+WifiConfigurationRequest.ssid max_size:32
+
+# Set max content size for Password string. WPA2 standard allows 8-63 ASCII chars.
+# Using 64 allows for potential null term in C buffer handling. Review this limit.
+WifiConfigurationRequest.password max_size:64
+
+
+# --- WifiConfigurationResponse Message Options ---
+
+# Set max encoded size for the response message.
+# Estimate: resp_type(k:1+v:1=2, if IS_8) + resp_ssid(k:1+l:1+c:32=34) +
+#           resp_ssid_len(k:1+v:5=6) = ~42 bytes.
+# Using buffer -> 64.
+WifiConfigurationResponse max_size:64
+
+# Set max content size for the response SSID string. Should match request SSID max size.
+WifiConfigurationResponse.resp_ssid max_size:32
+
+# Field type for resp_type enum is already set by 'WifiResponseType int_size:IS_8' above
