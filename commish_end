@@ -1,0 +1,77 @@
+// Defines messages and enums for signalling the end of the commissioning process.
+// Compatible with standard protobuf generators and Nanopb (with .options file).
+
+syntax = "proto3";
+
+// Consistent package name for commissioning/provisioning protos.
+package commissioning.v1;
+
+// Standard option, good for embedded.
+option optimize_for = CODE_SIZE;
+
+// Add other standard options if needed (e.g., java_package)
+// option java_package = "com.yourcompany.commissioning.v1";
+// option java_multiple_files = true;
+
+// --- Enum Definitions ---
+
+// Defines the type/status included in the commissioning end request.
+// Renamed from commissioning_end_request_type to CommissioningEndRequestType.
+enum CommissioningEndRequestType {
+  // Note: The zero value is typically *_UNSPECIFIED. Preserving original
+  // numbering for compatibility, where 0 represents a specific state (Failure).
+  COMMISSIONING_END_REQUEST_TYPE_FAILURE = 0;
+  COMMISSIONING_END_REQUEST_TYPE_SUCCESS = 1;
+}
+
+// Defines the type/status included in the commissioning end response (e.g., ACK/Error).
+// Renamed from commissioning_end_type to CommissioningEndResponseType.
+enum CommissioningEndResponseType {
+  // Note: The zero value is typically *_UNSPECIFIED. Preserving original
+  // numbering for compatibility, where 0 represents a specific state (Error).
+  COMMISSIONING_END_RESPONSE_TYPE_ERROR = 0;
+  COMMISSIONING_END_RESPONSE_TYPE_ACK = 1;
+}
+
+
+// --- Message Definitions ---
+
+// Message sent to signal the end of the commissioning process from the initiating side.
+// Renamed from commissioning_end_request to CommissioningEndRequest.
+message CommissioningEndRequest {
+  // The status being reported (Success/Failure). Type renamed.
+  CommissioningEndRequestType request = 1; // Nanopb: Consider int_size:IS_8
+}
+
+// Response acknowledging the commissioning end signal.
+// Renamed from commissioning_end_response to CommissioningEndResponse.
+message CommissioningEndResponse {
+  // The type of response (Ack/Error). Type renamed.
+  CommissioningEndResponseType resp_type = 1; // Nanopb: Consider int_size:IS_8
+}
+--------------------------------------------------------------------------------------------\
+  # Nanopb options for commissioning_end.proto
+
+# --- Enum Options ---
+# Suggest 8-bit C types as max value is 1 (fits IS_8)
+CommissioningEndRequestType   int_size:IS_8
+CommissioningEndResponseType  int_size:IS_8
+
+# --- CommissioningEndRequest Message Options ---
+
+# Set max encoded size for the request message.
+# Estimate: request(k:1 + v:1) = 2 bytes.
+# Using buffer -> 8.
+CommissioningEndRequest max_size:8
+
+# Field type for request enum is already set by 'CommissioningEndRequestType int_size:IS_8' above
+
+
+# --- CommissioningEndResponse Message Options ---
+
+# Set max encoded size for the response message.
+# Estimate: resp_type(k:1 + v:1) = 2 bytes.
+# Using buffer -> 8.
+CommissioningEndResponse max_size:8
+
+# Field type for resp_type enum is already set by 'CommissioningEndResponseType int_size:IS_8' above
