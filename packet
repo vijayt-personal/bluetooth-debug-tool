@@ -1,0 +1,550 @@
+#ifndef PACKET_PROCESSOR_HPP
+#define PACKET_PROCESSOR_HPP
+
+#include <cstdint>
+#include <cstddef> // For size_t
+#include <functional> // For std::function (see note below)
+
+// --- Nanopb & Generated C Header Includes ---
+extern "C" {
+  #include "pb_encode.h"
+  #include "pb_decode.h"
+  #include "pb_common.h"
+  #include "commissioning_v1/connectivity_state.pb.h"
+  #include "commissioning_v1/wifi_scan.pb.h"
+  #include "commissioning_v1/wifi_config.pb.h"
+  #include "commissioning_v1/commissioning_end.pb.h"
+}
+
+// --- Configuration Defines (USER MUST SET THESE ACCURATELY!) ---
+// Set based on the largest 'max_size' from your nanopb .options files
+#define MAX_PROTO_PAYLOAD_SIZE 1400 // Example: From WifiScanningResponse
+// Total packet size = overhead + max payload size
+#define MAX_PACKET_BUFFER_SIZE (PacketProcessor::PACKET_OVERHEAD + MAX_PROTO_PAYLOAD_SIZE)
+
+// --- Packet Format Constants ---
+constexpr uint8_t PACKET_START_BYTE = 0xFE;
+constexpr uint8_t PACKET_END_BYTE   = 0xEF;
+constexpr size_t PACKET_HEADER_SIZE = 1 + 1 + 4; // START + MSG_TYPE + LEN (uint32_t BE)
+constexpr size_t PACKET_FOOTER_SIZE = 1 + 1;     // CHECKSUM + END
+constexpr size_t PACKET_OVERHEAD = PACKET_HEADER_SIZE + PACKET_FOOTER_SIZE;
+constexpr size_t MIN_PACKET_SIZE = PACKET_OVERHEAD;
+
+// --- Message Type Enum ---
+enum class MessageType : uint8_t {
+    UNKNOWN = 0,
+    WIFI_CONFIGURATION_REQUEST = 1,
+    WIFI_CONFIGURATION_RESPONSE = 2,
+    WIFI_SCANNING_REQUEST = 3, // Placeholder
+    WIFI_SCANNING_RESPONSE = 4,
+    CONNECTIVITY_STATE_REQUEST = 5, // Placeholder
+    CONNECTIVITY_STATE = 6,
+    COMMISSIONING_END_REQUEST = 7,
+    COMMISSIONING_END_RESPONSE = 8,
+    MSG_TYPE_MAX // Placeholder
+};
+
+// --- Packet Processor Class ---
+class PacketProcessor {
+public:
+    // --- Type aliases for callback functions ---
+    using SendFunction = std::function<void(const uint8_t* data, size_t length)>;
+    // *** Note on std::function and dynamic allocation: ***
+    // If dynamic allocation is strictly forbidden, ensure callables assigned
+    // to std::function (lambdas, functors) do not capture state in a way
+    // that requires heap allocation. Using plain function pointers is safest.
+    // Example plain function pointer type:
+    // using SendFunctionPtr = void (*)(const uint8_t* data, size_t length);
+
+    // Logic Handlers (Request -> Response)
+    using LogicWifiConfig = std::function<
+        commissioning_v1_WifiConfigurationResponse(const commissioning_v1_WifiConfigurationRequest& req)>;
+    using LogicCommEnd = std::function<
+        commissioning_v1_CommissioningEndResponse(const commissioning_v1_CommissioningEndRequest& req)>;
+    // ... add other logic handlers
+
+    // Response/Info Handlers
+    using HandlerWifiConfigResp = std::function<void(const commissioning_v1_WifiConfigurationResponse& msg)>;
+    using HandlerWifiScanResp = std::function<void(const commissioning_v1_WifiScanningResponse& msg)>;
+    using HandlerConnState = std::function<void(const commissioning_v1_ConnectivityState& msg)>;
+    using HandlerCommEndResp = std::function<void(const commissioning_v1_CommissioningEndResponse& msg)>;
+    // ... add other response/info handlers
+
+    /**
+     * @brief Constructor
+     * @param sendFunc Function/lambda/ptr to call for sending the final framed packet bytes.
+     */
+    explicit PacketProcessor(SendFunction sendFunc);
+
+    // --- Setter methods for LOGIC handlers ---
+    void setLogicHandler(LogicWifiConfig handler);
+    void setLogicHandler(LogicCommEnd handler);
+    // ... add setters for other logic handlers
+
+    // --- Setter methods for RESPONSE/INFO handlers ---
+    void setResponseHandler(HandlerWifiConfigResp handler);
+    void setResponseHandler(HandlerWifiScanResp handler);
+    void setResponseHandler(HandlerConnState handler);
+    void setResponseHandler(HandlerCommEndResp handler);
+    // ... add setters for other response handlers
+
+    /**
+     * @brief Processes a received byte buffer, attempting to parse a packet.
+     * @param received_data Pointer to the raw data buffer received.
+     * @param data_len The length of the data in the buffer.
+     * @return True if a valid packet was found and processed successfully, false otherwise.
+     */
+    bool handleReceivedData(const uint8_t* received_data, size_t data_len);
+
+    // --- Public methods to SEND specific messages ---
+    // NOTE: These now require the CALLER to provide temporary buffers.
+    bool sendWifiConfigurationRequest(
+        const commissioning_v1_WifiConfigurationRequest& request,
+        uint8_t* temp_payload_buf, size_t payload_buf_cap,
+        uint8_t* temp_packet_buf, size_t packet_buf_cap);
+
+    bool sendWifiConfigurationResponse(
+        const commissioning_v1_WifiConfigurationResponse& response,
+        uint8_t* temp_payload_buf, size_t payload_buf_cap,
+        uint8_t* temp_packet_buf, size_t packet_buf_cap);
+
+    bool sendWifiScanningResponse(
+        const commissioning_v1_WifiScanningResponse& response,
+        uint8_t* temp_payload_buf, size_t payload_buf_cap,
+        uint8_t* temp_packet_buf, size_t packet_buf_cap);
+
+    bool sendConnectivityState(
+        const commissioning_v1_ConnectivityState& state,
+        uint8_t* temp_payload_buf, size_t payload_buf_cap,
+        uint8_t* temp_packet_buf, size_t packet_buf_cap);
+
+    bool sendCommissioningEndRequest(
+        const commissioning_v1_CommissioningEndRequest& request,
+        uint8_t* temp_payload_buf, size_t payload_buf_cap,
+        uint8_t* temp_packet_buf, size_t packet_buf_cap);
+
+    bool sendCommissioningEndResponse(
+        const commissioning_v1_CommissioningEndResponse& response,
+        uint8_t* temp_payload_buf, size_t payload_buf_cap,
+        uint8_t* temp_packet_buf, size_t packet_buf_cap);
+    // ... add other send methods
+
+
+    // --- Static Helper Functions ---
+    static bool createPacket(MessageType message_type,
+                             const uint8_t* payload, uint32_t payload_len,
+                             uint8_t* out_packet_buffer, size_t out_buffer_capacity,
+                             size_t* out_packet_len);
+
+    static uint8_t calculateChecksum(const uint8_t *data, size_t length);
+
+
+private:
+    SendFunction m_sendFunction; // Function to call to send the final packet bytes
+
+    // Registered Logic handlers (Request -> Response)
+    LogicWifiConfig m_logicWifiConfig;
+    LogicCommEnd m_logicCommEnd;
+    // ... other logic handlers
+
+    // Registered Response/Info handlers
+    HandlerWifiConfigResp m_handlerWifiConfigResp;
+    HandlerWifiScanResp m_handlerWifiScanResp;
+    HandlerConnState m_handlerConnState;
+    HandlerCommEndResp m_handlerCommEndResp;
+    // ... other response/info handlers
+
+    // --- Internal WORK BUFFERS (used by processXxxRequest methods) ---
+    // Sized based on max possible payload and packet size. Ensure defines are correct!
+    uint8_t m_work_payload_buffer[MAX_PROTO_PAYLOAD_SIZE];
+    uint8_t m_work_packet_buffer[MAX_PACKET_BUFFER_SIZE];
+
+
+    // --- Internal Processing Methods for Requests ---
+    void processWifiConfigRequest(const uint8_t* payload_data, size_t payload_len);
+    void processCommissioningEndRequest(const uint8_t* payload_data, size_t payload_len);
+    // ... add internal process methods for other requests
+
+    // --- Internal Handling Methods for Responses/Info ---
+    void handleWifiConfigResponse(const uint8_t* payload_data, size_t payload_len);
+    void handleWifiScanResponse(const uint8_t* payload_data, size_t payload_len);
+    void handleConnectivityState(const uint8_t* payload_data, size_t payload_len);
+    void handleCommissioningEndResponse(const uint8_t* payload_data, size_t payload_len);
+    // ... add internal handle methods for other responses/info
+
+
+    // --- Internal Generic Encode & Send Helpers ---
+    bool encodeInternal(const pb_msgdesc_t* fields, const void* src_struct,
+                        uint8_t* out_payload_buffer, size_t out_buffer_capacity,
+                        size_t* out_payload_len);
+
+    bool sendPacket(const uint8_t* packet_data, size_t packet_len);
+
+};
+
+#endif // PACKET_PROCESSOR_HPP
+
+-------------------------------------------------------------------------------------------------------------------------
+
+#include "PacketProcessor.hpp"
+#include <cstring> // For memcpy, memset
+#include <arpa/inet.h> // For htonl, ntohl (or use manual shifts if not available)
+#include <cstdio> // For fprintf stderr
+
+// --- Constructor ---
+PacketProcessor::PacketProcessor(SendFunction sendFunc) : m_sendFunction(std::move(sendFunc)) {}
+
+// --- Checksum Calculation ---
+/*static*/ uint8_t PacketProcessor::calculateChecksum(const uint8_t *data, size_t length) {
+    uint8_t checksum = 0;
+    for (size_t i = 0; i < length; ++i) {
+        checksum += data[i];
+    }
+    return checksum;
+}
+
+// --- Setters for LOGIC Handlers ---
+void PacketProcessor::setLogicHandler(LogicWifiConfig handler) { m_logicWifiConfig = std::move(handler); }
+void PacketProcessor::setLogicHandler(LogicCommEnd handler) { m_logicCommEnd = std::move(handler); }
+// ... other logic setters
+
+// --- Setters for RESPONSE/INFO Handlers ---
+void PacketProcessor::setResponseHandler(HandlerWifiConfigResp handler) { m_handlerWifiConfigResp = std::move(handler); }
+void PacketProcessor::setResponseHandler(HandlerWifiScanResp handler) { m_handlerWifiScanResp = std::move(handler); }
+void PacketProcessor::setResponseHandler(HandlerConnState handler) { m_handlerConnState = std::move(handler); }
+void PacketProcessor::setResponseHandler(HandlerCommEndResp handler) { m_handlerCommEndResp = std::move(handler); }
+// ... other response setters
+
+// --- Packet Creation ---
+/*static*/ bool PacketProcessor::createPacket(MessageType message_type,
+                                              const uint8_t* payload, uint32_t payload_len,
+                                              uint8_t* out_packet_buffer, size_t out_buffer_capacity,
+                                              size_t* out_packet_len)
+{
+    size_t required_len = PACKET_OVERHEAD + payload_len;
+    if (out_packet_buffer == nullptr || out_packet_len == nullptr || out_buffer_capacity < required_len) {
+        fprintf(stderr, "createPacket Error: Invalid buffer or insufficient capacity (%zu needed, %zu available)\n", required_len, out_buffer_capacity);
+        return false; // Invalid args or buffer too small
+    }
+
+    // 1. Start Byte
+    out_packet_buffer[0] = PACKET_START_BYTE;
+    // 2. Message Type
+    out_packet_buffer[1] = static_cast<uint8_t>(message_type);
+    // 3. Payload Length (Big Endian)
+    uint32_t payload_len_be = htonl(payload_len);
+    std::memcpy(&out_packet_buffer[2], &payload_len_be, sizeof(payload_len_be));
+    // 4. Payload
+    if (payload != nullptr && payload_len > 0) {
+        std::memcpy(&out_packet_buffer[PACKET_HEADER_SIZE], payload, payload_len);
+    }
+    // 5. Checksum (Calculated over MsgType + Length + Payload)
+    uint8_t checksum = calculateChecksum(&out_packet_buffer[1], 1 + sizeof(payload_len_be) + payload_len);
+    out_packet_buffer[required_len - 2] = checksum;
+    // 6. End Byte
+    out_packet_buffer[required_len - 1] = PACKET_END_BYTE;
+
+    *out_packet_len = required_len;
+    return true;
+}
+
+
+// --- Received Data Handling (Dispatcher) ---
+bool PacketProcessor::handleReceivedData(const uint8_t* received_data, size_t data_len) {
+    // Basic validation (START, END, MIN_LEN)
+    if (received_data == nullptr || data_len < MIN_PACKET_SIZE ||
+        received_data[0] != PACKET_START_BYTE || received_data[data_len - 1] != PACKET_END_BYTE) {
+        if(received_data && data_len >= 1 && received_data[0] != PACKET_START_BYTE) fprintf(stderr, "Invalid start byte\n");
+        return false;
+    }
+
+    // Extract header info & validate Length
+    MessageType message_type = static_cast<MessageType>(received_data[1]);
+    uint32_t payload_len_be;
+    std::memcpy(&payload_len_be, &received_data[2], sizeof(payload_len_be));
+    uint32_t payload_len = ntohl(payload_len_be);
+    if (PACKET_OVERHEAD + payload_len != data_len) {
+        fprintf(stderr, "Packet length mismatch\n"); return false;
+    }
+
+    // Validate checksum
+    const uint8_t* checksum_calc_start = &received_data[1];
+    size_t checksum_calc_len = 1 + sizeof(payload_len_be) + payload_len;
+    if (calculateChecksum(checksum_calc_start, checksum_calc_len) != received_data[data_len - 2]) {
+        fprintf(stderr, "Checksum mismatch\n"); return false;
+    }
+
+    // Valid packet structure, dispatch based on type
+    const uint8_t* payload_ptr = &received_data[PACKET_HEADER_SIZE];
+
+    switch (message_type) {
+        case MessageType::WIFI_CONFIGURATION_REQUEST:
+            processWifiConfigRequest(payload_ptr, payload_len);
+            return true;
+        case MessageType::COMMISSIONING_END_REQUEST:
+            processCommissioningEndRequest(payload_ptr, payload_len);
+            return true;
+        // Add other REQUEST types here...
+
+        case MessageType::WIFI_CONFIGURATION_RESPONSE:
+            handleWifiConfigResponse(payload_ptr, payload_len);
+            return true;
+         case MessageType::WIFI_SCANNING_RESPONSE:
+            handleWifiScanResponse(payload_ptr, payload_len);
+            return true;
+         case MessageType::CONNECTIVITY_STATE:
+             handleConnectivityState(payload_ptr, payload_len);
+             return true;
+         case MessageType::COMMISSIONING_END_RESPONSE:
+             handleCommissioningEndResponse(payload_ptr, payload_len);
+             return true;
+        // Add other RESPONSE/INFO types here...
+
+        default:
+            fprintf(stderr, "Unknown or unhandled message type in dispatch: %d\n", static_cast<uint8_t>(message_type));
+            return false;
+    }
+}
+
+
+// --- Internal Generic Encode Helper ---
+bool PacketProcessor::encodeInternal(const pb_msgdesc_t* fields, const void* src_struct,
+                                     uint8_t* out_payload_buffer, size_t out_buffer_capacity,
+                                     size_t* out_payload_len)
+{
+    if (out_payload_buffer == nullptr || out_payload_len == nullptr || out_buffer_capacity == 0) {
+         fprintf(stderr, "encodeInternal: Invalid buffer arguments\n");
+         return false;
+    }
+
+    pb_ostream_t stream = pb_ostream_from_buffer(out_payload_buffer, out_buffer_capacity);
+
+    if (!pb_encode(&stream, fields, src_struct)) {
+        fprintf(stderr, "Nanopb encoding failed: %s\n", PB_GET_ERROR(&stream));
+        *out_payload_len = 0;
+        return false;
+    }
+
+    *out_payload_len = stream.bytes_written;
+    return true;
+}
+
+// --- Internal Send Helper ---
+bool PacketProcessor::sendPacket(const uint8_t* packet_data, size_t packet_len) {
+     if (m_sendFunction) {
+         m_sendFunction(packet_data, packet_len);
+         return true;
+     } else {
+         fprintf(stderr, "Send function not set\n");
+         return false;
+     }
+}
+
+
+// --- Internal REQUEST Processing Methods ---
+
+void PacketProcessor::processWifiConfigRequest(const uint8_t* payload_data, size_t payload_len) {
+    pb_istream_t stream = pb_istream_from_buffer(payload_data, payload_len);
+    commissioning_v1_WifiConfigurationRequest request = commissioning_v1_WifiConfigurationRequest_init_zero;
+
+    if (!pb_decode(&stream, commissioning_v1_WifiConfigurationRequest_fields, &request)) {
+        fprintf(stderr, "Failed to decode WifiConfigurationRequest\n");
+        // Optional: Send decode error response (needs buffer mgmt)
+        // commissioning_v1_WifiConfigurationResponse err_resp = commissioning_v1_WifiConfigurationResponse_init_zero;
+        // err_resp.resp_type = commissioning_v1_WifiResponseType_WIFI_RESPONSE_TYPE_DECODE_FAILED;
+        // sendWifiConfigurationResponse(err_resp, m_work_payload_buffer, sizeof(m_work_payload_buffer), m_work_packet_buffer, sizeof(m_work_packet_buffer));
+        return;
+    }
+
+    if (m_logicWifiConfig) {
+        // Call user logic to get the response struct
+        commissioning_v1_WifiConfigurationResponse response = m_logicWifiConfig(request);
+
+        // Encode and send the response using internal work buffers
+        size_t encoded_len = 0;
+        if (encodeInternal(commissioning_v1_WifiConfigurationResponse_fields, &response,
+                           m_work_payload_buffer, sizeof(m_work_payload_buffer), &encoded_len))
+        {
+            size_t packet_len = 0;
+            if(createPacket(MessageType::WIFI_CONFIGURATION_RESPONSE, m_work_payload_buffer, encoded_len,
+                            m_work_packet_buffer, sizeof(m_work_packet_buffer), &packet_len))
+            {
+                sendPacket(m_work_packet_buffer, packet_len);
+            } else {
+                 fprintf(stderr, "Failed to create response packet for WifiConfigurationRequest\n");
+            }
+        } else {
+            fprintf(stderr, "Failed to encode response for WifiConfigurationRequest\n");
+        }
+    } else {
+        fprintf(stderr, "No logic handler set for WifiConfigurationRequest\n");
+        // Optional: Send error response?
+    }
+}
+
+void PacketProcessor::processCommissioningEndRequest(const uint8_t* payload_data, size_t payload_len) {
+     pb_istream_t stream = pb_istream_from_buffer(payload_data, payload_len);
+     commissioning_v1_CommissioningEndRequest request = commissioning_v1_CommissioningEndRequest_init_zero;
+
+    if (!pb_decode(&stream, commissioning_v1_CommissioningEndRequest_fields, &request)) {
+        fprintf(stderr, "Failed to decode CommissioningEndRequest\n");
+        // Optional: Send error response
+        // commissioning_v1_CommissioningEndResponse err_resp = commissioning_v1_CommissioningEndResponse_init_zero;
+        // err_resp.resp_type = commissioning_v1_CommissioningEndResponseType_COMMISSIONING_END_RESPONSE_TYPE_ERROR;
+        // sendCommissioningEndResponse(err_resp, m_work_payload_buffer, sizeof(m_work_payload_buffer), m_work_packet_buffer, sizeof(m_work_packet_buffer));
+        return;
+    }
+
+     if (m_logicCommEnd) {
+        commissioning_v1_CommissioningEndResponse response = m_logicCommEnd(request);
+        size_t encoded_len = 0;
+        if (encodeInternal(commissioning_v1_CommissioningEndResponse_fields, &response,
+                           m_work_payload_buffer, sizeof(m_work_payload_buffer), &encoded_len))
+        {
+            size_t packet_len = 0;
+            if(createPacket(MessageType::COMMISSIONING_END_RESPONSE, m_work_payload_buffer, encoded_len,
+                            m_work_packet_buffer, sizeof(m_work_packet_buffer), &packet_len))
+            {
+                sendPacket(m_work_packet_buffer, packet_len);
+            } else {
+                fprintf(stderr, "Failed to create response packet for CommissioningEndRequest\n");
+            }
+        } else {
+             fprintf(stderr, "Failed to encode response for CommissioningEndRequest\n");
+        }
+     } else {
+         fprintf(stderr, "No logic handler set for CommissioningEndRequest\n");
+     }
+}
+// Add implementations for other processXxxRequest methods...
+
+
+// --- Internal RESPONSE/INFO Handling Methods ---
+
+void PacketProcessor::handleWifiConfigResponse(const uint8_t* payload_data, size_t payload_len) {
+    if (!m_handlerWifiConfigResp) return;
+    pb_istream_t stream = pb_istream_from_buffer(payload_data, payload_len);
+    // Allocate message struct ON THE STACK (no dynamic allocation)
+    commissioning_v1_WifiConfigurationResponse msg = commissioning_v1_WifiConfigurationResponse_init_zero;
+    if (pb_decode(&stream, commissioning_v1_WifiConfigurationResponse_fields, &msg)) {
+        m_handlerWifiConfigResp(msg); // Pass stack-allocated struct by const reference
+    } else {
+         fprintf(stderr, "Failed to decode WifiConfigurationResponse in handler\n");
+    }
+}
+
+void PacketProcessor::handleWifiScanResponse(const uint8_t* payload_data, size_t payload_len) {
+     if (!m_handlerWifiScanResp) return;
+     pb_istream_t stream = pb_istream_from_buffer(payload_data, payload_len);
+     commissioning_v1_WifiScanningResponse msg = commissioning_v1_WifiScanningResponse_init_zero;
+     if (pb_decode(&stream, commissioning_v1_WifiScanningResponse_fields, &msg)) {
+        m_handlerWifiScanResp(msg);
+     } else {
+          fprintf(stderr, "Failed to decode WifiScanningResponse in handler\n");
+     }
+}
+
+void PacketProcessor::handleConnectivityState(const uint8_t* payload_data, size_t payload_len) {
+     if (!m_handlerConnState) return;
+     pb_istream_t stream = pb_istream_from_buffer(payload_data, payload_len);
+     commissioning_v1_ConnectivityState msg = commissioning_v1_ConnectivityState_init_zero;
+     if (pb_decode(&stream, commissioning_v1_ConnectivityState_fields, &msg)) {
+         m_handlerConnState(msg);
+     } else {
+          fprintf(stderr, "Failed to decode ConnectivityState in handler\n");
+     }
+}
+
+void PacketProcessor::handleCommissioningEndResponse(const uint8_t* payload_data, size_t payload_len) {
+     if (!m_handlerCommEndResp) return;
+     pb_istream_t stream = pb_istream_from_buffer(payload_data, payload_len);
+     commissioning_v1_CommissioningEndResponse msg = commissioning_v1_CommissioningEndResponse_init_zero;
+     if (pb_decode(&stream, commissioning_v1_CommissioningEndResponse_fields, &msg)) {
+         m_handlerCommEndResp(msg);
+     } else {
+         fprintf(stderr, "Failed to decode CommissioningEndResponse in handler\n");
+     }
+}
+// Add implementations for other handleXxxResponse/Info methods...
+
+
+// --- Public Send Method Implementations ---
+// Now require caller to provide temporary buffers
+
+bool PacketProcessor::sendWifiConfigurationRequest(
+    const commissioning_v1_WifiConfigurationRequest& request,
+    uint8_t* temp_payload_buf, size_t payload_buf_cap,
+    uint8_t* temp_packet_buf, size_t packet_buf_cap)
+{
+    size_t payload_len = 0;
+    if (!encodeInternal(commissioning_v1_WifiConfigurationRequest_fields, &request, temp_payload_buf, payload_buf_cap, &payload_len)) {
+        return false; // Encode failed
+    }
+    size_t packet_len = 0;
+    if (!createPacket(MessageType::WIFI_CONFIGURATION_REQUEST, temp_payload_buf, payload_len, temp_packet_buf, packet_buf_cap, &packet_len)) {
+        return false; // Packet creation failed
+    }
+    return sendPacket(temp_packet_buf, packet_len);
+}
+
+bool PacketProcessor::sendWifiConfigurationResponse(
+    const commissioning_v1_WifiConfigurationResponse& response,
+    uint8_t* temp_payload_buf, size_t payload_buf_cap,
+    uint8_t* temp_packet_buf, size_t packet_buf_cap)
+{
+    size_t payload_len = 0;
+    if (!encodeInternal(commissioning_v1_WifiConfigurationResponse_fields, &response, temp_payload_buf, payload_buf_cap, &payload_len)) return false;
+    size_t packet_len = 0;
+    if (!createPacket(MessageType::WIFI_CONFIGURATION_RESPONSE, temp_payload_buf, payload_len, temp_packet_buf, packet_buf_cap, &packet_len)) return false;
+    return sendPacket(temp_packet_buf, packet_len);
+}
+
+bool PacketProcessor::sendWifiScanningResponse(
+    const commissioning_v1_WifiScanningResponse& response,
+    uint8_t* temp_payload_buf, size_t payload_buf_cap,
+    uint8_t* temp_packet_buf, size_t packet_buf_cap)
+{
+    size_t payload_len = 0;
+    if (!encodeInternal(commissioning_v1_WifiScanningResponse_fields, &response, temp_payload_buf, payload_buf_cap, &payload_len)) return false;
+    size_t packet_len = 0;
+    if (!createPacket(MessageType::WIFI_SCANNING_RESPONSE, temp_payload_buf, payload_len, temp_packet_buf, packet_buf_cap, &packet_len)) return false;
+    return sendPacket(temp_packet_buf, packet_len);
+}
+
+bool PacketProcessor::sendConnectivityState(
+    const commissioning_v1_ConnectivityState& state,
+    uint8_t* temp_payload_buf, size_t payload_buf_cap,
+    uint8_t* temp_packet_buf, size_t packet_buf_cap)
+{
+    size_t payload_len = 0;
+    if (!encodeInternal(commissioning_v1_ConnectivityState_fields, &state, temp_payload_buf, payload_buf_cap, &payload_len)) return false;
+    size_t packet_len = 0;
+    if (!createPacket(MessageType::CONNECTIVITY_STATE, temp_payload_buf, payload_len, temp_packet_buf, packet_buf_cap, &packet_len)) return false;
+    return sendPacket(temp_packet_buf, packet_len);
+}
+
+bool PacketProcessor::sendCommissioningEndRequest(
+    const commissioning_v1_CommissioningEndRequest& request,
+    uint8_t* temp_payload_buf, size_t payload_buf_cap,
+    uint8_t* temp_packet_buf, size_t packet_buf_cap)
+{
+    size_t payload_len = 0;
+    if (!encodeInternal(commissioning_v1_CommissioningEndRequest_fields, &request, temp_payload_buf, payload_buf_cap, &payload_len)) return false;
+    size_t packet_len = 0;
+    if (!createPacket(MessageType::COMMISSIONING_END_REQUEST, temp_payload_buf, payload_len, temp_packet_buf, packet_buf_cap, &packet_len)) return false;
+    return sendPacket(temp_packet_buf, packet_len);
+}
+
+bool PacketProcessor::sendCommissioningEndResponse(
+    const commissioning_v1_CommissioningEndResponse& response,
+    uint8_t* temp_payload_buf, size_t payload_buf_cap,
+    uint8_t* temp_packet_buf, size_t packet_buf_cap)
+{
+     size_t payload_len = 0;
+     if (!encodeInternal(commissioning_v1_CommissioningEndResponse_fields, &response, temp_payload_buf, payload_buf_cap, &payload_len)) return false;
+     size_t packet_len = 0;
+     if (!createPacket(MessageType::COMMISSIONING_END_RESPONSE, temp_payload_buf, payload_len, temp_packet_buf, packet_buf_cap, &packet_len)) return false;
+     return sendPacket(temp_packet_buf, packet_len);
+}
+
+// Add implementations for other public sendXxx methods here...
