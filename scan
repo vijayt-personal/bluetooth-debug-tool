@@ -1,0 +1,131 @@
+// Defines enums and messages related to Wi-Fi network scanning.
+// Compatible with standard protobuf generators and Nanopb (with .options file).
+
+syntax = "proto3";
+
+// Consistent package name for commissioning/provisioning protos.
+package commissioning.v1;
+
+// Standard option, good for embedded.
+option optimize_for = CODE_SIZE;
+
+// Add other standard options if needed (e.g., java_package)
+// option java_package = "com.yourcompany.commissioning.v1";
+// option java_multiple_files = true;
+
+// --- Enum Definitions ---
+
+// Authentication modes for Wi-Fi networks.
+// Renamed from AUTH_MODE to AuthMode (CamelCase).
+enum AuthMode {
+  // Note: The zero value is typically *_UNSPECIFIED. Preserving original
+  // numbering for compatibility, where 0 represents a specific state (Open).
+  AUTH_MODE_OPEN = 0;
+  AUTH_MODE_WEP = 1;
+  AUTH_MODE_WPA_PSK = 2;
+  AUTH_MODE_WPA2_PSK = 3;
+  AUTH_MODE_WPA_WPA2_PSK = 4;
+  AUTH_MODE_WPA2_ENTERPRISE = 5;
+  AUTH_MODE_WPA3_PSK = 6;
+  AUTH_MODE_WPA2_WPA3_PSK = 7;
+}
+
+// Status results for a scanning operation.
+// Renamed from SCANNING_STATUS to ScanningStatus (CamelCase).
+enum ScanningStatus {
+  // Note: The zero value is typically *_UNSPECIFIED. Preserving original
+  // numbering for compatibility, where 0 represents a specific state (Success).
+  SCANNING_STATUS_SUCCESS = 0;
+  SCANNING_STATUS_FAILED = 1;
+  SCANNING_STATUS_TIMEOUT = 2;
+}
+
+// General Wi-Fi connection status (Currently unused in messages below).
+// Renamed from WIFI_SCAN_STATUS to WifiScanStatus (CamelCase).
+enum WifiScanStatus {
+  // Not Configured might serve as a reasonable default/zero value.
+  WIFI_SCAN_STATUS_NOT_CONFIGURED = 0;
+  WIFI_SCAN_STATUS_CONNECTED = 1;
+  WIFI_SCAN_STATUS_DISCONNECTED = 2;
+}
+
+
+// --- Message Definitions ---
+
+// Represents a single Wi-Fi network found during a scan.
+// Renamed from wifi_networks to WifiNetwork (CamelCase).
+message WifiNetwork {
+  // SSID of the network. Protobuf strings handle length implicitly.
+  string ssid = 1; // Nanopb: max_size must be set in .options
+
+  // [DEPRECATED] Redundant field as string length is implicit in Protobuf encoding.
+  // Kept for compatibility, but should not be used in new code.
+  uint32 ssid_len = 2 [deprecated = true];
+
+  // Received Signal Strength Indicator.
+  int32 rssi = 3; // Nanopb: Consider int_size:IS_16 in .options
+
+  // Authentication mode required by the network.
+  // Type renamed to AuthMode. Field name changed to auth_mode.
+  // Explicit 'optional' kept for compatibility if presence tracking is used.
+  optional AuthMode auth_mode = 4; // Nanopb: Consider int_size:IS_8 in .options
+}
+
+// Represents the response containing the list of scanned Wi-Fi networks.
+// Renamed from wifi_scanning_resp to WifiScanningResponse (CamelCase).
+message WifiScanningResponse {
+  // List of networks found. Type renamed to WifiNetwork.
+  repeated WifiNetwork wifi_list = 1; // Nanopb: max_count must be set in .options
+
+  // [DEPRECATED] Redundant field as repeated field count is implicit in Protobuf.
+  // Kept for compatibility, but should not be used in new code.
+  int32 wifi_network_count = 2 [deprecated = true]; // Nanopb: Consider int_size:IS_16
+
+  // Status of the scanning operation. Type renamed to ScanningStatus.
+  // Field name 'resp' kept for compatibility, though 'status' might be clearer.
+  ScanningStatus resp = 3; // Nanopb: Consider int_size:IS_8 in .options
+}
+
+--------------------------------------------------------------------------------------
+
+# Nanopb options for wifi_scan.proto
+
+# --- Enum Options (Suggesting 8-bit C types) ---
+AuthMode        int_size:IS_8
+ScanningStatus  int_size:IS_8
+WifiScanStatus  int_size:IS_8 // Applied even if currently unused by messages here
+
+# --- WifiNetwork Message Options ---
+
+# Set max encoded size for the WifiNetwork message.
+# Estimate: ssid(k:1+l:1+c:32=34) + ssid_len(k:1+v:5=6) +
+#           rssi(k:1+v:3=4, if IS_16) + auth_mode(k:1+v:1=2, if IS_8) = ~46 bytes.
+# Using a buffer, e.g., 64. Adjust based on actual max SSID and constraints.
+WifiNetwork max_size:64
+
+# Set max content size for the SSID string (excluding C null terminator).
+WifiNetwork.ssid max_size:32
+
+# Set integer size for RSSI field in C struct. IS_16 is often suitable.
+WifiNetwork.rssi int_size:IS_16
+
+# Field type for auth_mode enum is already set by 'AuthMode int_size:IS_8' above
+
+
+# --- WifiScanningResponse Message Options ---
+
+# Set max count for the repeated list of networks.
+# !!! CRITICAL: Adjust '20' based on realistic maximum expected networks
+#              and available device memory !!!
+WifiScanningResponse.wifi_list max_count:20
+
+# Set max encoded size for the WifiScanningResponse message.
+# Estimate depends heavily on wifi_list max_count. Check calculation.
+# wifi_list(k:1+l:~2+c:20*64=~1283) + wifi_network_count(k:1+v:3=4, if IS_16) + resp(k:1+v:1=2) = ~1289 bytes.
+# Using a buffer, e.g., 1400. Review carefully based on max_count!
+WifiScanningResponse max_size:1400
+
+# Set integer size for the deprecated wifi_network_count (if useful for sizing checks)
+WifiScanningResponse.wifi_network_count int_size:IS_16
+
+# Field type for resp enum is already set by 'ScanningStatus int_size:IS_8' above
