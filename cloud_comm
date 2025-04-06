@@ -1,0 +1,742 @@
+#ifndef CLOUD_COMM_H_
+#define CLOUD_COMM_H_
+
+#include <functional>
+#include <string>       // For config paths and callback command names
+#include <string_view>
+#include <cstdint>      // For std::size_t
+#include <atomic>       // For initialized_ flag
+
+// Forward declaration for RapidJSON Value
+namespace rapidjson {
+template<typename Encoding, typename Allocator>
+class GenericValue;
+using Value = GenericValue<>; // Assuming default encoding and allocator
+} // namespace rapidjson
+
+// Include the AWS client header directly
+#include "aws_iot_mqtt_client.hpp"
+
+/**
+ * @brief Namespace for cloud communication module.
+ */
+namespace CloudComms {
+
+// --- Constants ---
+// kMaxTopicLen defined in aws_iot_mqtt_client.hpp (usually 256)
+constexpr std::size_t kMaxPayloadSize = 1024;   ///< Max JSON payload size for stack buffers
+constexpr std::size_t kMaxCommandKeyLen = 64;   ///< Max length for a command key name from shadow
+constexpr std::size_t kMaxThingNameLen = 128;   ///< Max length for the Thing Name itself
+
+/**
+ * @brief Configuration structure for the CloudComm module.
+ */
+struct CloudCommConfig {
+    std::string aws_endpoint;      ///< AWS IoT Core endpoint URL.
+    std::string client_id;         ///< Unique MQTT client ID.
+    std::string thing_name;        ///< AWS IoT Thing Name (max kMaxThingNameLen-1 chars).
+    uint16_t port = 8883;          ///< MQTT broker port (usually 8883 for MQTTS).
+    std::string root_ca_path;      ///< Filesystem path to the Root CA certificate PEM file.
+    std::string device_cert_path;  ///< Filesystem path to the device certificate PEM file.
+    std::string private_key_path;  ///< Filesystem path to the device private key PEM file.
+    // Buffer sizes for underlying client
+    int mqtt_rx_buffer_size = 2048; ///< Underlying MQTT receive buffer size.
+    int mqtt_tx_buffer_size = 2048; ///< Underlying MQTT transmit buffer size.
+};
+
+/**
+ * @brief Callback function type for handling control commands received via shadow.
+ * @param command_name The key in the desired state object representing the command.
+ * @param params A RapidJSON Value object containing the parameters for the command.
+ * The object's lifetime is tied to the callback execution.
+ * @return True if command processing was successful, false otherwise.
+ */
+using ControlCommandCallback = std::function<bool(const std::string& command_name, const rapidjson::Value& params)>;
+
+/**
+ * @brief Callback function type for connection status changes.
+ * @param connected True if connected, false if disconnected.
+ */
+using ConnectionStatusCallback = std::function<void(bool connected)>;
+
+
+/**
+ * @class CloudComm
+ * @brief Provides an application-focused interface for cloud communication using AWS IoT.
+ *
+ * Handles reporting time series, status, events, and processing control commands
+ * received via the AWS IoT Device Shadow. Uses fixed buffers where practical.
+ */
+class CloudComm {
+public:
+    /**
+     * @brief Construct a new CloudComm object.
+     */
+    CloudComm();
+
+    /**
+     * @brief Destroy the CloudComm object, ensuring disconnection.
+     */
+    ~CloudComm();
+
+    // Disable copy and move semantics
+    CloudComm(const CloudComm&) = delete;
+    CloudComm& operator=(const CloudComm&) = delete;
+    CloudComm(CloudComm&&) = delete;
+    CloudComm& operator=(CloudComm&&) = delete;
+
+    /**
+     * @brief Initializes the cloud communication module.
+     *
+     * Loads certificates, configures the underlying client, and sets up subscriptions
+     * for shadow command processing. Must be called before Connect().
+     *
+     * @param config The configuration settings for the connection.
+     * @return True if initialization was successful, false otherwise.
+     */
+    bool Initialize(const CloudCommConfig& config);
+
+    /**
+     * @brief Attempts to establish a connection to AWS IoT Core.
+     *
+     * Initiates the connection process. Status is reported via ConnectionStatusCallback.
+     * Automatically requests the current device shadow state upon connection.
+     *
+     * @return True if the connection attempt was initiated successfully, false otherwise.
+     */
+    bool Connect();
+
+    /**
+     * @brief Disconnects from the AWS IoT Core broker.
+     */
+    void Disconnect();
+
+    /**
+     * @brief Checks the current connection status.
+     * @return True if the client is currently connected, false otherwise.
+     */
+    bool IsConnected() const;
+
+    /**
+     * @brief Sends time series data to the cloud.
+     * @param data A RapidJSON Value object containing the time series data points.
+     * @param qos The Quality of Service level (usually 0 for time series).
+     * @return True if the data was successfully queued for publishing, false otherwise.
+     */
+    bool SendTimeSeriesData(const rapidjson::Value& data, int qos = 0);
+
+    /**
+     * @brief Sends a device status report to the cloud.
+     * @param data A RapidJSON Value object (must be an object) containing the status.
+     * @param qos The Quality of Service level (usually 1 for status).
+     * @return True if the report was successfully queued for publishing, false otherwise.
+     */
+    bool SendStatusReport(const rapidjson::Value& data, int qos = 1);
+
+    /**
+     * @brief Sends a specific event notification to the cloud.
+     * @param event_type A string identifying the type of event (e.g., "low_battery").
+     * @param data A RapidJSON Value object (must be an object) containing event details.
+     * @param qos The Quality of Service level (usually 1 for events).
+     * @return True if the event was successfully queued for publishing, false otherwise.
+     */
+    bool SendEvent(const std::string& event_type, const rapidjson::Value& data, int qos = 1);
+
+    /**
+     * @brief Reports the device's current state to the AWS IoT Shadow 'reported' section.
+     *
+     * Use this to proactively update the cloud about the device's state, independent
+     * of processing commands.
+     *
+     * @param reported_state A RapidJSON Value object (must be an object type)
+     * representing the state keys and values to report.
+     * @param qos The Quality of Service level for the MQTT publish (usually 1).
+     * @return True if the state report was successfully queued, false otherwise.
+     */
+    bool ReportCurrentState(const rapidjson::Value& reported_state, int qos = 1);
+
+    /**
+     * @brief Sets the callback function for processing incoming control commands.
+     * @param callback The function to be called when a command is received.
+     */
+    void SetControlCommandCallback(ControlCommandCallback callback);
+
+    /**
+     * @brief Sets the callback function for reporting connection status changes.
+     * @param callback The function to be called on connect/disconnect events.
+     */
+    void SetConnectionStatusCallback(ConnectionStatusCallback callback);
+
+
+private:
+    // --- Private Helper Methods ---
+    bool LoadCertificateFromFile(const std::string& file_path, char* buffer, std::size_t buffer_size);
+    bool BuildTopicString(char* buffer, std::size_t buffer_len, const char* type_suffix);
+    bool PublishJsonToTopic(const char* topic, const rapidjson::Value& json_payload, int qos, bool retain = false);
+    void RequestShadowState(); // Renamed from GetShadow
+    bool AcknowledgeControlCommand(const char* command_key, std::size_t command_key_len, bool success, const char* message = nullptr);
+    void ProcessReceivedShadowDelta(const rapidjson::Value& delta_state);
+    void ProcessReceivedShadowDocument(std::string_view payload); // Handles get/accepted
+
+    // --- Internal Callbacks for AwsIotMqttClient ---
+    void OnConnected();
+    void OnDisconnected();
+    // Single callback registered with underlying client's shadow helpers
+    void HandleShadowCallback(const std::string& update_type, std::string_view payload);
+
+    // --- Member Variables ---
+    AwsIot::AwsIotMqttClient aws_mqtt_client_;
+    // client_config_ removed, temp copy used in Initialize only
+    char thing_name_[kMaxThingNameLen] = {0}; // Use fixed buffer
+
+    std::atomic<bool> initialized_{false};
+    ControlCommandCallback control_command_callback_{nullptr};
+    ConnectionStatusCallback connection_status_callback_{nullptr};
+
+    // Reusable buffer for JSON parsing (avoids stack allocation churn)
+    char json_parse_buffer_[kMaxPayloadSize] = {0};
+     // Reusable buffer for JSON serialization output
+    char json_serialize_buffer_[kMaxPayloadSize] = {0};
+
+};
+
+} // namespace CloudComms
+
+#endif // CLOUD_COMM_H_
+
+---------------------------------------------------------------------------------------------
+#include "cloud_comm.h"
+
+#include <fstream>
+// #include <sstream> // Can likely remove
+#include <vector>    // Can likely remove if parse buffer is sufficient
+#include <stdexcept> // Should not be used if exceptions disabled
+#include <utility>   // For std::move
+#include <cstring>   // For memcpy, strlen, strncpy, memset
+#include <cstdio>    // For snprintf
+
+// RapidJSON Headers needed for implementation
+#include "rapidjson/document.h"
+#include "rapidjson/memorybuffer.h"
+#include "rapidjson/memorystream.h"
+#include "rapidjson/writer.h"
+
+// Logging - adapt as needed
+#ifdef ESP_PLATFORM
+#include "esp_log.h"
+static const char* TAG = "CloudComm";
+#else
+#include <iostream> // Basic fallback logging
+#define ESP_LOGI(tag, format, ...) printf("[%s] INFO: " format "\n", tag, ##__VA_ARGS__)
+#define ESP_LOGW(tag, format, ...) printf("[%s] WARN: " format "\n", tag, ##__VA_ARGS__)
+#define ESP_LOGE(tag, format, ...) printf("[%s] ERROR: " format "\n", tag, ##__VA_ARGS__)
+#define ESP_LOGD(tag, format, ...) printf("[%s] DEBUG: " format "\n", tag, ##__VA_ARGS__)
+#define ESP_LOGV(tag, format, ...) printf("[%s] VERBOSE: " format "\n", tag, ##__VA_ARGS__)
+static const char* TAG = "CloudComm";
+#endif
+
+
+namespace CloudComms {
+
+// --- Constants ---
+const char* const kDefaultTopicPrefix = "dt"; // Device Topic prefix
+const char* const kTimeSeriesTopicSuffix = "/timeseries";
+const char* const kStatusTopicSuffix = "/status";
+const char* const kEventTopicSuffix = "/event";
+
+// --- Constructor / Destructor ---
+CloudComm::CloudComm() : initialized_(false) {
+    ESP_LOGI(TAG, "CloudComm instance created.");
+    // Ensure buffers are initially empty/null-terminated
+    memset(thing_name_, 0, sizeof(thing_name_));
+    memset(json_parse_buffer_, 0, sizeof(json_parse_buffer_));
+    memset(json_serialize_buffer_, 0, sizeof(json_serialize_buffer_));
+}
+
+CloudComm::~CloudComm() {
+    ESP_LOGI(TAG, "CloudComm instance destroying...");
+    // Disconnect explicitly if connected
+    if (aws_mqtt_client_.IsConnected()) {
+        Disconnect();
+    }
+    ESP_LOGI(TAG, "CloudComm instance destroyed.");
+}
+
+// --- Initialization ---
+bool CloudComm::Initialize(const CloudCommConfig& config) {
+    ESP_LOGI(TAG, "Initializing CloudComm...");
+
+    if (initialized_.load()) {
+        ESP_LOGW(TAG, "Already initialized.");
+        return true;
+    }
+
+    // --- Configuration Validation ---
+    if (config.aws_endpoint.empty() || config.client_id.empty() ||
+        config.thing_name.empty() || config.root_ca_path.empty() ||
+        config.device_cert_path.empty() || config.private_key_path.empty()) {
+        ESP_LOGE(TAG, "Initialization failed: Missing required config parameters or file paths.");
+        return false;
+    }
+    if (config.thing_name.length() >= sizeof(thing_name_)) {
+        ESP_LOGE(TAG, "Initialization failed: Thing name '%s' too long (max %zu chars).",
+                 config.thing_name.c_str(), sizeof(thing_name_) - 1);
+        return false;
+    }
+
+    // --- Store Thing Name ---
+    strncpy(thing_name_, config.thing_name.c_str(), sizeof(thing_name_) - 1);
+    // strncpy doesn't guarantee null termination if src >= dest, so force it.
+    thing_name_[sizeof(thing_name_) - 1] = '\0';
+
+    // --- Prepare Underlying Client Config (Temporary) ---
+    // This struct allocates large buffers on the stack temporarily during init.
+    AwsIot::MqttConfig client_config = {}; // Use aggregate initialization
+    client_config.aws_endpoint = config.aws_endpoint;
+    client_config.client_id = config.client_id;
+    // AwsIotMqttClient needs the std::string version for its internal setup
+    client_config.thing_name = config.thing_name;
+    client_config.port = config.port;
+    client_config.rx_buffer_size = config.mqtt_rx_buffer_size;
+    client_config.tx_buffer_size = config.mqtt_tx_buffer_size;
+
+    // --- Load Certificates ---
+    ESP_LOGI(TAG, "Loading certificates for Thing: %s", thing_name_);
+    if (!LoadCertificateFromFile(config.root_ca_path, client_config.root_ca_pem, AwsIot::kMaxCertLen)) {
+        ESP_LOGE(TAG, "Failed to load Root CA: %s", config.root_ca_path.c_str());
+        return false;
+    }
+    if (!LoadCertificateFromFile(config.device_cert_path, client_config.device_cert_pem, AwsIot::kMaxCertLen)) {
+        ESP_LOGE(TAG, "Failed to load device certificate: %s", config.device_cert_path.c_str());
+        // No need to clear previous certs as they are on the stack and will be gone soon.
+        return false;
+    }
+    if (!LoadCertificateFromFile(config.private_key_path, client_config.private_key_pem, AwsIot::kMaxCertLen)) {
+        ESP_LOGE(TAG, "Failed to load private key: %s", config.private_key_path.c_str());
+        return false;
+    }
+    ESP_LOGD(TAG, "Certificates loaded successfully into temporary config struct.");
+
+    // --- Initialize Underlying Client ---
+    // AwsIotMqttClient copies the necessary config data, including cert PEMs
+    if (!aws_mqtt_client_.Initialize(client_config)) {
+        ESP_LOGE(TAG, "Failed to initialize underlying AwsIotMqttClient.");
+        // Sensitive data in stack-allocated client_config is automatically cleaned up when scope exits.
+        return false;
+    }
+    // client_config goes out of scope here, cleaning up stack memory.
+
+    // --- Set Up Internal Callbacks ---
+    aws_mqtt_client_.SetOnConnectedCallback([this]() { this->OnConnected(); });
+    aws_mqtt_client_.SetOnDisconnectedCallback([this]() { this->OnDisconnected(); });
+
+    // --- Set Up Shadow Subscriptions ---
+    // Subscribe to shadow topics needed for control commands and state retrieval.
+    // This uses the underlying client's helper functions which handle the actual MQTT subscribe.
+    ESP_LOGD(TAG, "Setting up shadow subscriptions.");
+    if (!aws_mqtt_client_.SubscribeToShadowUpdates(
+            [this](const std::string& type, std::string_view payload) {
+                this->HandleShadowCallback(type, payload);
+            })) {
+         ESP_LOGE(TAG, "Failed to set up shadow update subscription during initialization!");
+         // Clean up? Underlying client might be partially initialized. Best to fail init.
+         aws_mqtt_client_.Disconnect(); // Attempt cleanup
+         return false;
+    }
+    if (!aws_mqtt_client_.SubscribeToShadowGetResponses(
+             [this](const std::string& type, std::string_view payload) {
+                 this->HandleShadowCallback(type, payload); // Route to same handler
+             })) {
+        ESP_LOGE(TAG, "Failed to set up shadow get response subscription during initialization!");
+        aws_mqtt_client_.Disconnect(); // Attempt cleanup
+        return false;
+    }
+
+    initialized_.store(true);
+    ESP_LOGI(TAG, "CloudComm initialized successfully for Thing: %s", thing_name_);
+    return true;
+}
+
+// --- Connection Management ---
+bool CloudComm::Connect() {
+    ESP_LOGI(TAG, "Connect requested.");
+    if (!initialized_.load()) {
+        ESP_LOGE(TAG, "Cannot connect: CloudComm not initialized.");
+        return false;
+    }
+    // Underlying client handles connection state logic
+    return aws_mqtt_client_.Connect();
+}
+
+void CloudComm::Disconnect() {
+    ESP_LOGI(TAG, "Disconnect requested.");
+    // Underlying client handles disconnection state logic
+    aws_mqtt_client_.Disconnect();
+    // The OnDisconnected callback will be triggered by the underlying client when done.
+}
+
+bool CloudComm::IsConnected() const {
+    // Delegate directly to the underlying client.
+    return aws_mqtt_client_.IsConnected();
+}
+
+// --- Data Sending Logic ---
+bool CloudComm::SendTimeSeriesData(const rapidjson::Value& data, int qos) {
+    if (!IsConnected()) { ESP_LOGW(TAG, "Cannot send time series: Not connected."); return false; }
+
+    char topic_buffer[AwsIot::kMaxTopicLen];
+    if (!BuildTopicString(topic_buffer, sizeof(topic_buffer), kTimeSeriesTopicSuffix)) {
+        return false; // Error logged within
+    }
+    ESP_LOGD(TAG, "Sending time series data to topic: %s", topic_buffer);
+    return PublishJsonToTopic(topic_buffer, data, qos);
+}
+
+bool CloudComm::SendStatusReport(const rapidjson::Value& data, int qos) {
+    if (!IsConnected()) { ESP_LOGW(TAG, "Cannot send status report: Not connected."); return false; }
+    if (!data.IsObject()) { ESP_LOGE(TAG, "SendStatusReport failed: data must be a JSON object."); return false; }
+
+    char topic_buffer[AwsIot::kMaxTopicLen];
+    if (!BuildTopicString(topic_buffer, sizeof(topic_buffer), kStatusTopicSuffix)) {
+        return false;
+    }
+    ESP_LOGD(TAG, "Sending status report to topic: %s", topic_buffer);
+    return PublishJsonToTopic(topic_buffer, data, qos);
+}
+
+bool CloudComm::SendEvent(const std::string& event_type, const rapidjson::Value& data, int qos) {
+    if (!IsConnected()) { ESP_LOGW(TAG, "Cannot send event: Not connected."); return false; }
+    if (event_type.empty()) { ESP_LOGE(TAG, "SendEvent failed: event_type cannot be empty."); return false; }
+    if (!data.IsObject()) { ESP_LOGE(TAG, "SendEvent failed: data must be a JSON object."); return false; }
+
+    char topic_buffer[AwsIot::kMaxTopicLen];
+    // Build the base event topic: dt/{thingName}/event
+    if (!BuildTopicString(topic_buffer, sizeof(topic_buffer), kEventTopicSuffix)) {
+        return false;
+    }
+
+    // --- Embed event_type within the JSON payload ---
+    rapidjson::Document event_doc(rapidjson::kObjectType);
+    rapidjson::Document::AllocatorType& allocator = event_doc.GetAllocator();
+    // Add event type using StringRef to potentially avoid copy if event_type lifetime is sufficient
+    event_doc.AddMember("event_type", rapidjson::StringRef(event_type.c_str()), allocator);
+    // Add original data under "details", performing a deep copy
+    event_doc.AddMember("details", rapidjson::Value(data, allocator).Move(), allocator);
+
+    ESP_LOGD(TAG, "Sending event '%s' to topic: %s", event_type.c_str(), topic_buffer);
+    return PublishJsonToTopic(topic_buffer, event_doc, qos);
+}
+
+bool CloudComm::ReportCurrentState(const rapidjson::Value& reported_state, int qos) {
+    if (!IsConnected()) { ESP_LOGW(TAG, "Cannot report state: Not connected."); return false; }
+    if (!reported_state.IsObject()) { ESP_LOGE(TAG, "ReportCurrentState failed: input must be a JSON object."); return false; }
+
+    // Construct {"state": {"reported": {...user_data...}}}
+    rapidjson::Document shadow_doc(rapidjson::kObjectType);
+    rapidjson::Document::AllocatorType& allocator = shadow_doc.GetAllocator();
+
+    rapidjson::Value state_val(rapidjson::kObjectType);
+    // Deep copy the user-provided object into our structure within "reported"
+    state_val.AddMember("reported", rapidjson::Value(reported_state, allocator).Move(), allocator);
+    shadow_doc.AddMember("state", state_val, allocator);
+
+    // --- Serialize using fixed buffer ---
+    memset(json_serialize_buffer_, 0, sizeof(json_serialize_buffer_)); // Clear buffer first
+    rapidjson::MemoryOutputStream os(json_serialize_buffer_, sizeof(json_serialize_buffer_));
+    rapidjson::Writer<rapidjson::MemoryOutputStream> writer(os);
+    shadow_doc.Accept(writer);
+    const size_t json_len = os.Tell();
+
+    if (json_len >= sizeof(json_serialize_buffer_)) {
+         ESP_LOGE(TAG, "ReportCurrentState failed: Serialized JSON exceeded buffer size (%zu >= %zu)", json_len, sizeof(json_serialize_buffer_));
+         return false;
+    }
+    // json_serialize_buffer_ is not guaranteed null-terminated by stream, but we use length
+
+    ESP_LOGD(TAG, "Reporting current state to shadow payload (%zu bytes): %.*s", json_len, (int)json_len, json_serialize_buffer_);
+
+    // Use the underlying client's UpdateShadow method which takes string_view
+    // It internally handles topic generation.
+    return aws_mqtt_client_.UpdateShadow(std::string_view(json_serialize_buffer_, json_len), qos);
+}
+
+// --- Callback Setters ---
+void CloudComm::SetControlCommandCallback(ControlCommandCallback callback) {
+    ESP_LOGI(TAG, "Control command callback %s.", callback ? "registered" : "deregistered");
+    control_command_callback_ = std::move(callback);
+}
+
+void CloudComm::SetConnectionStatusCallback(ConnectionStatusCallback callback) {
+    ESP_LOGI(TAG, "Connection status callback %s.", callback ? "registered" : "deregistered");
+    connection_status_callback_ = std::move(callback);
+}
+
+
+// --- Private Helper Methods ---
+
+bool CloudComm::LoadCertificateFromFile(const std::string& file_path, char* buffer, std::size_t buffer_size) {
+    // (Identical to previous versions)
+    if (!buffer || buffer_size == 0) return false;
+    memset(buffer, 0, buffer_size);
+    std::ifstream file(file_path);
+    if (!file.is_open()) { ESP_LOGE(TAG, "Failed to open file: %s", file_path.c_str()); return false; }
+    file.read(buffer, buffer_size - 1);
+    if (file.eof()) {
+        buffer[file.gcount()] = '\0'; file.close(); return true;
+    } else {
+        if (file.fail()) { ESP_LOGE(TAG, "File read failed: %s", file_path.c_str()); }
+        else { ESP_LOGE(TAG, "Buffer too small for file: %s (Size: %zu)", file_path.c_str(), buffer_size); }
+        buffer[0] = '\0'; file.close(); return false;
+    }
+}
+
+bool CloudComm::BuildTopicString(char* buffer, std::size_t buffer_len, const char* type_suffix) {
+    if (!buffer || buffer_len == 0 || !type_suffix || thing_name_[0] == '\0') {
+        ESP_LOGE(TAG, "BuildTopicString: Invalid arguments or thing name not set.");
+        return false;
+    }
+    // Structure: dt/{thingName}/suffix
+    int written = snprintf(buffer, buffer_len, "%s/%s%s",
+                           kDefaultTopicPrefix, thing_name_, type_suffix);
+
+    if (written < 0) {
+        ESP_LOGE(TAG, "BuildTopicString: snprintf encoding error for suffix '%s'.", type_suffix);
+        buffer[0] = '\0'; // Clear buffer
+        return false;
+    }
+    if (static_cast<std::size_t>(written) >= buffer_len) {
+        ESP_LOGE(TAG, "BuildTopicString: Topic truncated for suffix '%s' (needed %d, have %zu).", type_suffix, written + 1, buffer_len);
+        // buffer is null-terminated by snprintf even if truncated.
+        return false; // Treat truncation as failure
+    }
+    // Success
+    return true;
+}
+
+
+bool CloudComm::PublishJsonToTopic(const char* topic, const rapidjson::Value& json_payload, int qos, bool retain) {
+    // --- Serialize JSON to fixed buffer ---
+    memset(json_serialize_buffer_, 0, sizeof(json_serialize_buffer_)); // Clear buffer
+    rapidjson::MemoryOutputStream os(json_serialize_buffer_, sizeof(json_serialize_buffer_));
+    rapidjson::Writer<rapidjson::MemoryOutputStream> writer(os); // Use standard writer
+    json_payload.Accept(writer);
+    const size_t json_len = os.Tell(); // Get actual length written
+
+    // Check for truncation during serialization
+    if (json_len >= sizeof(json_serialize_buffer_)) {
+         ESP_LOGE(TAG, "PublishJsonToTopic failed for topic '%s': Serialized JSON exceeded buffer size (%zu >= %zu)",
+                  topic, json_len, sizeof(json_serialize_buffer_));
+         return false;
+    }
+    // Buffer is not necessarily null-terminated by stream
+
+    ESP_LOGV(TAG, "Publishing to %s (%zu bytes): %.*s", topic, json_len, (int)json_len, json_serialize_buffer_);
+
+    // Publish using buffer and explicit length
+    return aws_mqtt_client_.Publish(topic, reinterpret_cast<const uint8_t*>(json_serialize_buffer_), json_len, qos, retain);
+}
+
+void CloudComm::RequestShadowState() {
+    ESP_LOGI(TAG, "Requesting current shadow state...");
+    // Use underlying client helper, empty client token.
+    if (!aws_mqtt_client_.GetShadow("")) {
+        ESP_LOGE(TAG, "Failed to send shadow get request.");
+    }
+}
+
+bool CloudComm::AcknowledgeControlCommand(const char* command_key, std::size_t command_key_len, bool success, const char* message) {
+    ESP_LOGI(TAG, "Acknowledging command '%.*s': %s", (int)command_key_len, command_key, success ? "SUCCESS" : "FAILED");
+
+    // Construct {"state": {"reported": {command_key: null}}}
+    rapidjson::Document shadow_doc(rapidjson::kObjectType);
+    rapidjson::Document::AllocatorType& allocator = shadow_doc.GetAllocator();
+
+    rapidjson::Value state_val(rapidjson::kObjectType);
+    rapidjson::Value reported_val(rapidjson::kObjectType);
+
+    // Report null for the command key in 'reported' to clear desired state
+    reported_val.AddMember(rapidjson::StringRef(command_key, command_key_len), // Key (StringRef avoids copy)
+                           rapidjson::Value(), // Value (JSON null)
+                           allocator);
+
+    // Optional: Add detailed status message if needed (commented)
+    // if (message) { reported_val.AddMember("last_cmd_status", rapidjson::StringRef(message), allocator); }
+
+    state_val.AddMember("reported", reported_val.Move(), allocator);
+    shadow_doc.AddMember("state", state_val.Move(), allocator);
+
+    // --- Serialize using fixed buffer ---
+    memset(json_serialize_buffer_, 0, sizeof(json_serialize_buffer_)); // Clear buffer
+    rapidjson::MemoryOutputStream os(json_serialize_buffer_, sizeof(json_serialize_buffer_));
+    rapidjson::Writer<rapidjson::MemoryOutputStream> writer(os);
+    shadow_doc.Accept(writer);
+    const size_t json_len = os.Tell();
+
+    if (json_len >= sizeof(json_serialize_buffer_)) {
+         ESP_LOGE(TAG, "AcknowledgeControlCommand failed for '%.*s': Serialized JSON exceeded buffer size (%zu >= %zu)",
+                  (int)command_key_len, command_key, json_len, sizeof(json_serialize_buffer_));
+         return false;
+    }
+
+    ESP_LOGD(TAG, "Acknowledging command payload (%zu bytes): %.*s", json_len, (int)json_len, json_serialize_buffer_);
+
+    // Use underlying UpdateShadow with QoS 1 for reliability
+    if (!aws_mqtt_client_.UpdateShadow(std::string_view(json_serialize_buffer_, json_len), 1)) {
+        ESP_LOGE(TAG, "Failed to publish command acknowledgement for '%.*s'.", (int)command_key_len, command_key);
+        return false;
+    }
+    return true;
+}
+
+
+// --- Internal Callbacks ---
+void CloudComm::OnConnected() {
+    ESP_LOGI(TAG, "MQTT client connected.");
+    // Notify application layer first
+    if (connection_status_callback_) {
+        connection_status_callback_(true);
+    }
+    // Request initial shadow state after notifying app
+    RequestShadowState();
+}
+
+void CloudComm::OnDisconnected() {
+    ESP_LOGW(TAG, "MQTT client disconnected.");
+    // Notify application layer
+    if (connection_status_callback_) {
+        connection_status_callback_(false);
+    }
+    // NOTE: Application must handle reconnect logic via the callback if desired.
+}
+
+void CloudComm::HandleShadowCallback(const std::string& update_type, std::string_view payload) {
+    ESP_LOGD(TAG, "Received shadow callback. Type: '%s', Payload Size: %zu", update_type.c_str(), payload.length());
+    // ESP_LOGV(TAG, "Payload: %.*s", (int)payload.length(), payload.data()); // Verbose
+
+    // --- Prepare shared parsing buffer ---
+    if (payload.length() >= sizeof(json_parse_buffer_)) {
+        ESP_LOGE(TAG, "Shadow payload (type '%s') too large for parse buffer (%zu >= %zu). Skipping.",
+                 update_type.c_str(), payload.length(), sizeof(json_parse_buffer_));
+        return;
+    }
+    // Copy payload to our mutable buffer for ParseInsitu
+    memcpy(json_parse_buffer_, payload.data(), payload.length());
+    json_parse_buffer_[payload.length()] = '\0'; // Null terminate
+
+    // --- Parse the JSON ---
+    rapidjson::Document doc;
+    // ParseInsitu modifies the buffer (json_parse_buffer_)
+    doc.ParseInsitu(json_parse_buffer_);
+
+    if (doc.HasParseError()) {
+        ESP_LOGE(TAG, "Failed to parse shadow JSON (type '%s'). Error %d at offset %llu",
+                 update_type.c_str(), (int)doc.GetParseError(), (unsigned long long)doc.GetErrorOffset());
+        return;
+    }
+
+    // --- Process based on type ---
+    if (update_type == "delta") {
+        ESP_LOGI(TAG, "Processing shadow delta.");
+        // Expected structure: {"state": {...delta...}, "version": ..., ...}
+        if (doc.HasMember("state") && doc["state"].IsObject()) {
+             ProcessReceivedShadowDelta(doc["state"]);
+        } else {
+             ESP_LOGW(TAG, "Shadow delta message missing 'state' object.");
+        }
+    } else if (update_type == "accepted") {
+        ESP_LOGI(TAG, "Processing shadow accepted document.");
+        // Could be response to GetShadow or UpdateShadow. Assume it might contain desired state.
+        ProcessReceivedShadowDocument(payload); // Pass original payload for context if needed later
+    } else if (update_type == "rejected") {
+        ESP_LOGW(TAG, "Received shadow operation rejection.");
+        // Log details from the parsed document 'doc' if available/useful
+        // e.g., if (doc.HasMember("message")) { ESP_LOGW(TAG, " Rejection message: %s", doc["message"].GetString()); }
+    } else {
+        ESP_LOGW(TAG, "Unhandled shadow callback type: %s", update_type.c_str());
+    }
+}
+
+void CloudComm::ProcessReceivedShadowDocument(std::string_view payload) {
+    // This function processes the full shadow document received, typically from 'get/accepted'.
+    // We primarily care about processing any pending 'desired' state.
+    // Re-parse the document (or use the already parsed 'doc' if passed)
+    // For simplicity, let's re-parse using our buffer.
+
+    rapidjson::Document doc;
+    // Assuming payload already copied to json_parse_buffer_ and null-terminated by caller
+    doc.ParseInsitu(json_parse_buffer_); // Re-use buffer content
+
+    if (doc.HasParseError()) {
+         ESP_LOGE(TAG, "Failed to re-parse shadow document in ProcessReceivedShadowDocument. Error %d", (int)doc.GetParseError());
+         return;
+    }
+
+    // Check for desired state: {"state": {"desired": {...}}}
+    if (doc.HasMember("state") && doc["state"].IsObject()) {
+        const auto& state_obj = doc["state"];
+        if (state_obj.HasMember("desired") && state_obj["desired"].IsObject()) {
+             ESP_LOGI(TAG, "Found 'desired' state in received shadow document. Processing commands...");
+             ProcessReceivedShadowDelta(state_obj["desired"]); // Process commands
+        } else {
+             ESP_LOGI(TAG, "Received shadow document does not contain a 'desired' state object.");
+        }
+        // Optionally, could provide the 'reported' state to the app here if needed for sync.
+        // if (state_obj.HasMember("reported") && state_obj["reported"].IsObject()) { ... }
+    } else {
+         ESP_LOGW(TAG, "Received shadow document missing 'state' object.");
+    }
+}
+
+
+void CloudComm::ProcessReceivedShadowDelta(const rapidjson::Value& delta_state) {
+    if (!control_command_callback_) {
+        ESP_LOGD(TAG, "Received shadow delta, but no control command callback is registered. Ignoring.");
+        // Optionally, report all keys back as "unhandled"?
+        return;
+    }
+    if (!delta_state.IsObject()) {
+        ESP_LOGE(TAG, "ProcessReceivedShadowDelta called with non-object value.");
+        return;
+    }
+
+    ESP_LOGI(TAG, "Processing desired state delta for control commands...");
+    // Iterate through keys (commands) in the delta state object.
+    // Process and acknowledge ONE command per iteration fully before moving to the next.
+    for (auto itr = delta_state.MemberBegin(); itr != delta_state.MemberEnd(); /* no increment */ ) {
+        const char* const command_key_ptr = itr->name.GetString();
+        const std::size_t command_key_len = itr->name.GetStringLength();
+        const rapidjson::Value& params = itr->value;
+
+        // Use a stack buffer for the command key for safety during callback/acknowledgement
+        char current_command_key[kMaxCommandKeyLen];
+        if (command_key_len >= sizeof(current_command_key)) {
+             ESP_LOGE(TAG, "Command key '%.*s...' too long (max %zu). Skipping.",
+                      20, command_key_ptr, sizeof(current_command_key) - 1);
+             ++itr; // MUST increment iterator before continuing
+             continue;
+        }
+        memcpy(current_command_key, command_key_ptr, command_key_len);
+        current_command_key[command_key_len] = '\0';
+
+        ESP_LOGI(TAG, "Invoking callback for command: '%s'", current_command_key);
+
+        bool success = false;
+        const char* result_message_ptr = nullptr; // Use C-string for message if possible
+
+        // --- Call the application callback ---
+        // No try/catch block as requested
+        // Assume callback handles its own errors and returns success/failure
+        success = control_command_callback_(current_command_key, params); // Pass safe key copy
+        result_message_ptr = success ? "Processed successfully by application." : "Processing failed per application.";
+        ESP_LOGI(TAG, "%s", result_message_ptr);
+
+        // --- Acknowledge the command ---
+        AcknowledgeControlCommand(current_command_key, command_key_len, success, result_message_ptr);
+
+        // --- Advance iterator only AFTER processing and acknowledging ---
+        ++itr;
+    }
+    ESP_LOGI(TAG, "Finished processing shadow delta commands.");
+}
+
+} // namespace CloudComms
