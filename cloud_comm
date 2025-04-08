@@ -762,3 +762,104 @@ extern "C" void app_main(void)
         loop_counter++;
     }
 }
+
+---------------------------------------------------------------------------------------------------
+/**
+ * @brief Manually initiates a connection attempt OR resets the retry cycle.
+ * Typically only needed if automatic connection via Process() needs to be preempted
+ * or if forcing a reconnect after manual Disconnect().
+ */
+bool CloudComm::Connect(bool reset_retry_state) {
+    State current = current_state_.load();
+    LOG_PRINT(log_print::kINFO, TAG, "Manual Connect requested (reset_retry=%s). Current state: %d",
+             reset_retry_state ? "true" : "false", static_cast<int>(current));
+
+    if (current == State::UNINITIALIZED) { LOG_PRINT(log_print::kERROR, TAG, "Cannot connect: Not initialized."); return false; }
+    if (current == State::CONNECTING || current == State::CONNECTED || current == State::CONNECTED_GETTING_SHADOW) {
+        LOG_PRINT(log_print::kWARN, TAG, "Manual Connect called while already connecting, getting shadow, or connected. Resetting retry state only.");
+        if(reset_retry_state) {
+             reconnect_attempts_ = 0;
+             current_backoff_delay_ms_ = kInitialBackoffMs;
+             last_disconnect_time_ms_ = 0; // Allow immediate retry by Process if currently WAITING
+        }
+        return true; // Indicate it's already active or state was reset
+    }
+
+    // If DISCONNECTED or WAITING_TO_RETRY, reset state if requested and attempt connect immediately
+    if (reset_retry_state) {
+        LOG_PRINT(log_print::kDEBUG1, TAG, "Resetting reconnect state due to manual connect call.");
+        reconnect_attempts_ = 0;
+        current_backoff_delay_ms_ = kInitialBackoffMs;
+        last_disconnect_time_ms_ = 0;
+    }
+    // Attempt connection immediately, regardless of backoff timer when called manually
+    return AttemptReconnect();
+}
+
+/** @brief Internal function that actually calls the underlying client connect */
+bool CloudComm::AttemptReconnect() { /* ... Same logic, sets state to CONNECTING ... */ }
+/** @brief Disconnects from the broker. */
+void CloudComm::Disconnect() { /* ... Same: Sets state=DISCONNECTED, resets retry state, calls client disconnect ... */ }
+/** @brief Checks connection status. */
+bool CloudComm::IsConnected() const { /* ... Same ... */ }
+/** @brief Helper to get timestamp. */
+uint64_t CloudComm::GetTimestampMs() { /* ... Same ... */ }
+/** @brief Handles internal disconnect logic. */
+void CloudComm::HandleDisconnectInternal() { /* ... Same logic, sets state=WAITING_TO_RETRY, calculates backoff ... */ }
+
+// --- Process Function ---
+void CloudComm::Process() {
+    State state = current_state_.load();
+    uint64_t now_ms = GetTimestampMs(); // Get time once
+
+    switch (state) {
+        case State::DISCONNECTED: {
+            // --- NEW: Auto-initiate connection from DISCONNECTED state ---
+            // This assumes Process() is only called when prerequisites (like Wi-Fi) are met.
+            LOG_PRINT(log_print::kINFO, TAG, "Process: State is DISCONNECTED, attempting initial connect...");
+            AttemptReconnect(); // This changes state to CONNECTING if successful
+            // Note: If AttemptReconnect fails immediately, state becomes WAITING_TO_RETRY,
+            // which will be handled on the *next* Process() call's timing check.
+            break;
+            // --- End New Logic ---
+            }
+        case State::WAITING_TO_RETRY: {
+            if (now_ms >= (last_disconnect_time_ms_ + current_backoff_delay_ms_)) {
+                LOG_PRINT(log_print::kINFO, TAG, "Process: Reconnect timer elapsed. Attempting reconnect...");
+                AttemptReconnect(); // Changes state to CONNECTING if successful
+            }
+            break;
+        }
+        case State::CONNECTED_GETTING_SHADOW: {
+            if (initial_shadow_received_) {
+                LOG_PRINT(log_print::kINFO, TAG, "Process: Initial shadow received. Transitioning to CONNECTED.");
+                current_state_.store(State::CONNECTED);
+                break;
+            }
+            if (get_shadow_attempts_ >= kMaxGetShadowAttempts) {
+                LOG_PRINT(log_print::kERROR, TAG, "Process: Max GetShadow attempts reached. Giving up. Transitioning to CONNECTED.");
+                current_state_.store(State::CONNECTED);
+                break;
+            }
+            if (now_ms >= (last_get_shadow_attempt_ms_ + current_get_shadow_backoff_ms_)) {
+                LOG_PRINT(log_print::kINFO, TAG, "Process: Attempting GetShadow (Attempt #%d)...", get_shadow_attempts_ + 1);
+                RequestShadowState();
+                last_get_shadow_attempt_ms_ = now_ms;
+                get_shadow_attempts_++;
+                current_get_shadow_backoff_ms_ = std::min(current_get_shadow_backoff_ms_ + kGetShadowRetryBaseMs, kMaxGetShadowRetryMs);
+                LOG_PRINT(log_print::kDEBUG1, TAG, "Next GetShadow attempt in %u ms.", current_get_shadow_backoff_ms_);
+            }
+            break;
+        }
+        case State::CONNECTING:
+             LOG_PRINT(log_print::kVERBOSE, TAG, "Process: In CONNECTING state...");
+             // Optional: Add a timeout here?
+             break;
+        case State::CONNECTED:
+             LOG_PRINT(log_print::kVERBOSE, TAG, "Process: In CONNECTED state.");
+             break;
+        case State::UNINITIALIZED:
+             // Do nothing
+             break;
+    }
+}
