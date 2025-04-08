@@ -863,3 +863,276 @@ void CloudComm::Process() {
              break;
     }
 }
+
+-------------------------------------------------------------------------------------------------------------------------------------------
+
+#include "cloud_comm.h" // To call cloud_comm.ReportCurrentState
+#include <cstring>      // For strcmp
+#include <vector>       // Example: Store schedule items
+
+// --- Include your logging header/macro ---
+// Assuming LOG_PRINT and log_print::LogLevel defined
+#ifndef LOG_PRINT
+#define LOG_PRINT(level, tag, format, ...) printf(/* Your log impl */)
+#endif
+static const char* APP_TAG = "MyAppCallbacks";
+// ----------------------------------------
+
+// --- Include RapidJSON headers needed by the callback ---
+#include "rapidjson/document.h"
+#include "rapidjson/writer.h"       // Potentially useful for logging params
+#include "rapidjson/stringbuffer.h" // Potentially useful for logging params
+// ------------------------------------------------------
+
+// --- Access to CloudComm instance (assuming global or accessible) ---
+extern CloudComms::CloudComm cloud_comm;
+// -------------------------------------------------------------------
+
+// --- Placeholder application state variables and functions ---
+// Replace these with your actual application logic and state variables
+static bool g_light_on_24x7 = true; // Example state
+static std::string g_op_mode = "CONTINUOUS"; // Example state
+static int g_local_op_mode = 1; // Example state
+
+struct ScheduleEntry {
+    int start_time;
+    int end_time;
+    std::string mode;
+    std::string rc; // Assuming rc is a string, adjust if it's truly hex later
+};
+static std::vector<ScheduleEntry> g_schedule; // Example storage
+
+void SetLightOn24x7(bool on) { g_light_on_24x7 = on; LOG_PRINT(log_print::kINFO, APP_TAG, "App State: LightOn24x7 set to %d", (int)on); }
+bool GetLightOn24x7() { return g_light_on_24x7; }
+
+void SetOperatingMode(const char* mode) { g_op_mode = mode; LOG_PRINT(log_print::kINFO, APP_TAG, "App State: OpMode set to %s", mode); }
+const char* GetOperatingModeString() { return g_op_mode.c_str(); } // Return C-string
+
+void SetLocalOperationMode(int mode) { g_local_op_mode = mode; LOG_PRINT(log_print::kINFO, APP_TAG, "App State: LocalOpMode set to %d", mode); }
+int GetLocalOperationMode() { return g_local_op_mode; }
+
+// Example function to process and store the received schedule
+bool UpdateDeviceSchedule(const rapidjson::Value& schedule_array) {
+    LOG_PRINT(log_print::kINFO, APP_TAG, "Updating device schedule...");
+    std::vector<ScheduleEntry> new_schedule; // Build new schedule
+    bool parse_ok = true;
+
+    if (!schedule_array.IsArray()) {
+        LOG_PRINT(log_print::kERROR, APP_TAG, "Schedule update failed: Input is not an array.");
+        return false;
+    }
+
+    for (const auto& item : schedule_array.GetArray()) {
+        if (!item.IsObject()) { LOG_PRINT(log_print::kWARN, APP_TAG, "Schedule item not an object, skipping."); parse_ok = false; continue; }
+
+        // Validate and extract members
+        if (!item.HasMember("st") || !item["st"].IsInt() ||
+            !item.HasMember("et") || !item["et"].IsInt() ||
+            !item.HasMember("m") || !item["m"].IsString() ||
+            !item.HasMember("rc") || !item["rc"].IsString()) // Assuming rc is string for now
+        {
+            LOG_PRINT(log_print::kWARN, APP_TAG, "Invalid schedule item format, skipping.");
+            parse_ok = false;
+            continue;
+        }
+
+        ScheduleEntry entry;
+        entry.start_time = item["st"].GetInt();
+        entry.end_time = item["et"].GetInt();
+        entry.mode = item["m"].GetString();
+        entry.rc = item["rc"].GetString(); // Store rc as string
+
+        // Add more validation (e.g., start < end, time ranges valid)
+        // ...
+
+        new_schedule.push_back(entry);
+         LOG_PRINT(log_print::kDEBUG1, APP_TAG, "Parsed schedule item: st=%d, et=%d, m=%s, rc=%s",
+                  entry.start_time, entry.end_time, entry.mode.c_str(), entry.rc.c_str());
+    }
+
+    // Atomically update the application's schedule
+    // (Could use mutexes here in a real multi-threaded app)
+    g_schedule = std::move(new_schedule);
+    LOG_PRINT(log_print::kINFO, APP_TAG, "Device schedule updated with %d entries.", g_schedule.size());
+
+    return parse_ok; // Return true if parsing finished, even if some items skipped (adjust as needed)
+}
+// -----------------------------------------------------------
+
+
+/**
+ * @brief Handles control commands received from the cloud via Shadow delta or initial Get.
+ * @return True if command processing was successful, False otherwise.
+ */
+bool HandleControlCommand(const char* command_name, const rapidjson::Value& params) {
+    LOG_PRINT(log_print::kINFO, APP_TAG, "HandleControlCommand: Received command '%s'", command_name);
+    bool success = false; // Assume failure initially
+
+    // Prepare a document *ONLY* for reporting the state *back* if successful
+    // It's crucial this is created fresh for each command processed in the loop
+    // within ProcessReceivedShadowDelta.
+    rapidjson::Document reported_state_update(rapidjson::kObjectType);
+    auto& allocator = reported_state_update.GetAllocator();
+
+    // --- Process Specific Commands ---
+    if (strcmp(command_name, "lon24x7") == 0) {
+        if (!params.IsNumber()) { // Could be bool 0/1 or int 0/1
+            LOG_PRINT(log_print::kERROR, APP_TAG, "Invalid param type for 'lon24x7', expected number (0 or 1).");
+        } else {
+            bool desired_state = params.IsBool() ? params.GetBool() : (params.GetInt() != 0);
+            SetLightOn24x7(desired_state);
+            success = true;
+            // Prepare reported state update
+            reported_state_update.AddMember("lon24x7", GetLightOn24x7(), allocator);
+        }
+    } else if (strcmp(command_name, "opmode") == 0) {
+        if (!params.IsString()) {
+            LOG_PRINT(log_print::kERROR, APP_TAG, "Invalid param type for 'opmode', expected string.");
+        } else {
+            const char* desired_mode = params.GetString();
+            // Add validation if needed (e.g., check against list of valid modes)
+            SetOperatingMode(desired_mode);
+            success = true;
+             // Prepare reported state update
+            reported_state_update.AddMember("opmode", rapidjson::StringRef(GetOperatingModeString()), allocator); // Use StringRef
+        }
+    } else if (strcmp(command_name, "locpmode") == 0) {
+        if (!params.IsInt()) {
+            LOG_PRINT(log_print::kERROR, APP_TAG, "Invalid param type for 'locpmode', expected integer.");
+        } else {
+            int desired_mode = params.GetInt();
+            // Add validation if needed
+            SetLocalOperationMode(desired_mode);
+            success = true;
+            // Prepare reported state update
+            reported_state_update.AddMember("locpmode", GetLocalOperationMode(), allocator);
+        }
+    } else if (strcmp(command_name, "schedule") == 0) {
+        if (!params.IsArray()) {
+            LOG_PRINT(log_print::kERROR, APP_TAG, "Invalid param type for 'schedule', expected array.");
+        } else {
+            // Pass the whole array to the application logic function
+            if (UpdateDeviceSchedule(params)) {
+                 success = true;
+                 // Prepare reported state update - report the schedule back to confirm
+                 // This performs a deep copy of the received array 'params'
+                 reported_state_update.AddMember("schedule", rapidjson::Value(params, allocator).Move(), allocator);
+            } else {
+                 // UpdateDeviceSchedule might return false on partial or full failure
+                 LOG_PRINT(log_print::kERROR, APP_TAG, "Failed to fully process 'schedule' update.");
+                 success = false; // Mark as failure if processing wasn't fully successful
+            }
+        }
+    }
+    // --- Add other command handlers here ---
+    // else if (strcmp(command_name, "some_other_command") == 0) { ... }
+    else {
+        LOG_PRINT(log_print::kWARN, APP_TAG, "Unknown command key in delta: '%s'", command_name);
+        success = false; // Treat unknown command as failure? Or success (acknowledged but ignored)? Let's say failure.
+    }
+
+    // --- IMPORTANT: Call ReportCurrentState IF successful AND state needs reporting ---
+    // This updates the 'reported' section and implicitly clears the 'desired' key
+    if (success && reported_state_update.MemberCount() > 0) {
+        LOG_PRINT(log_print::kINFO, APP_TAG, "Reporting state back to shadow after processing '%s'.", command_name);
+        if (!cloud_comm.ReportCurrentState(reported_state_update)) {
+            // Log failure to queue report. The desired state might persist on the broker.
+            LOG_PRINT(log_print::kWARN, APP_TAG, "Failed to queue state report for command '%s'.", command_name);
+        }
+    } else if (success) {
+         // Command succeeded but resulted in no specific state to report back
+         // (e.g., maybe 'reboot' before it actually rebooted, or a simple ack needed)
+         // Optionally report null for the command key to ensure desired state clears
+         LOG_PRINT(log_print::kINFO, APP_TAG, "Command '%s' processed successfully, reporting null acknowledgment.", command_name);
+         rapidjson::Document null_ack_doc(rapidjson::kObjectType);
+         null_ack_doc.AddMember(rapidjson::StringRef(command_name), // Key is the command name
+                                rapidjson::Value(), // Value is JSON null
+                                null_ack_doc.GetAllocator());
+         if (!cloud_comm.ReportCurrentState(null_ack_doc)) {
+              LOG_PRINT(log_print::kWARN, APP_TAG, "Failed to queue null ack state report for command '%s'.", command_name);
+         }
+    }
+    // If success was false, we report nothing, leaving the desired state intact.
+
+    return success; // Return overall processing status for this command
+}
+
+
+// --- Main Application Task ---
+extern "C" void app_main(void)
+{
+    LOG_PRINT(log_print::kINFO, APP_TAG, "Starting Application...");
+    // init_filesystem();
+
+    // --- Prepare CloudComm Configuration ---
+    CloudComms::CloudCommConfig config = {};
+    // !! Populate config with YOUR endpoint, ID, thing name, and FULL cert paths !!
+    // Example: strncpy(config.aws_endpoint, "...", sizeof(config.aws_endpoint)-1); etc.
+    const char* endpoint = "your_endpoint.amazonaws.com"; /* CHANGE */ strncpy(config.aws_endpoint, endpoint, sizeof(config.aws_endpoint) - 1); config.aws_endpoint[sizeof(config.aws_endpoint)-1] = '\0';
+    const char* client_id = "your_client_id"; /* CHANGE */ strncpy(config.client_id, client_id, sizeof(config.client_id) - 1); config.client_id[sizeof(config.client_id)-1] = '\0';
+    const char* thing_name = "your_thing_name"; /* CHANGE */ strncpy(config.thing_name, thing_name, sizeof(config.thing_name) - 1); config.thing_name[sizeof(config.thing_name)-1] = '\0';
+    const char* ca_path = "/spiffs/ca.pem"; /* CHANGE */ strncpy(config.root_ca_path, ca_path, sizeof(config.root_ca_path) - 1); config.root_ca_path[sizeof(config.root_ca_path)-1] = '\0';
+    const char* cert_path = "/spiffs/cert.pem"; /* CHANGE */ strncpy(config.device_cert_path, cert_path, sizeof(config.device_cert_path) - 1); config.device_cert_path[sizeof(config.device_cert_path)-1] = '\0';
+    const char* key_path = "/spiffs/key.pem"; /* CHANGE */ strncpy(config.private_key_path, key_path, sizeof(config.private_key_path) - 1); config.private_key_path[sizeof(config.private_key_path)-1] = '\0';
+
+
+    // --- Initialize CloudComm ---
+    if (!cloud_comm.Initialize(config)) { /* ... handle error ... */ return; }
+
+    // --- Register Callbacks ---
+    cloud_comm.SetConnectionStatusCallback(HandleConnectionStatus);
+    cloud_comm.SetControlCommandCallback(HandleControlCommand);
+
+    // --- Initiate Connection ---
+    LOG_PRINT(log_print::kINFO, APP_TAG, "Initiating connection...");
+    // Process() will handle actual connection attempts when Wi-Fi is ready
+    // but we might still call Connect() once to ensure state machine starts if desired
+    // Or just rely on Process() finding DISCONNECTED state when Wi-Fi is up.
+    // Let's rely on Process() as discussed. Commenting out Connect() call here.
+    // cloud_comm.Connect(true);
+
+
+    // --- Main Application Loop ---
+    uint64_t loop_counter = 0;
+    while (true) {
+        // --- Check prerequisites ---
+        bool wifi_ready = true; // Replace with your actual Wi-Fi check
+        // bool time_synced = is_time_synced(); // Check time sync if needed
+
+        if (wifi_ready /* && time_synced */) {
+            // --- Call Process() ONLY when Wi-Fi is usable ---
+            cloud_comm.Process(); // Handles connection state & reconnect timing
+
+            // --- Perform actions only when fully connected ---
+            if (cloud_comm.IsConnected()) {
+                // Send data, etc.
+                // if ((loop_counter % 10) == 0) { /* ... SendTimeSeriesData ... */ }
+
+                // Example: Proactively report state occasionally
+                 if ((loop_counter % 120) == 0 && loop_counter > 0) { // Every 2 minutes
+                     LOG_PRINT(log_print::kINFO, APP_TAG, "Proactively reporting current state...");
+                     rapidjson::Document current_state_doc(rapidjson::kObjectType);
+                     auto& allocator = current_state_doc.GetAllocator();
+                     current_state_doc.AddMember("led_is_on", GetDeviceLedState(), allocator);
+                     current_state_doc.AddMember("uptime_seconds", (uint32_t)(loop_counter), allocator);
+                     current_state_doc.AddMember("opmode", rapidjson::StringRef(GetOperatingModeString()), allocator);
+                     if(!cloud_comm.ReportCurrentState(current_state_doc)) {
+                         LOG_PRINT(log_print::kWARN, APP_TAG, "Failed to queue proactive state report.");
+                     }
+                 }
+
+            } else {
+                LOG_PRINT(log_print::kDEBUG1, APP_TAG, "Wi-Fi connected, but waiting for MQTT (State: %d)...", static_cast<int>(cloud_comm.current_state_.load()));
+            }
+        } else {
+            LOG_PRINT(log_print::kWARN, APP_TAG, "Wi-Fi is disconnected. CloudComm::Process() paused.");
+            // Ensure Wi-Fi manager is trying to reconnect Wi-Fi...
+        }
+
+        // Other application logic...
+
+        vTaskDelay(pdMS_TO_TICKS(1000)); // Loop delay
+        loop_counter++;
+    }
+}
+
