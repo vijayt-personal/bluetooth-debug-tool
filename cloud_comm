@@ -1135,4 +1135,97 @@ extern "C" void app_main(void)
         loop_counter++;
     }
 }
+-----------------------------------------------------------------------------------
+// Inside your application's HandleControlCommand function:
 
+// (Includes, logging setup, other command handlers like lon24x7, opmode etc.)
+
+else if (strcmp(command_name, "lampcontrol") == 0) {
+    LOG_PRINT(log_print::kDEBUG1, APP_TAG, "Processing 'lampcontrol' command.");
+
+    // 1. Validate that the parameters are a JSON object
+    if (!params.IsObject()) {
+        LOG_PRINT(log_print::kERROR, APP_TAG, "Invalid params for 'lampcontrol': Expected JSON object.");
+        success = false;
+    } else {
+        // 2. Validate and Extract individual members
+        int desired_lset = -1; // Use invalid default
+        int desired_timeout = -1;
+        uint64_t desired_timestamp = 0;
+        bool params_ok = true;
+
+        // Check and get 'lset'
+        if (params.HasMember("lset") && params["lset"].IsInt()) {
+            desired_lset = params["lset"].GetInt();
+        } else {
+            LOG_PRINT(log_print::kWARN, APP_TAG, "'lampcontrol' missing or invalid 'lset'.");
+            params_ok = false;
+        }
+
+        // Check and get 'timeout'
+        if (params.HasMember("timeout") && params["timeout"].IsInt()) {
+            desired_timeout = params["timeout"].GetInt();
+        } else {
+            LOG_PRINT(log_print::kWARN, APP_TAG, "'lampcontrol' missing or invalid 'timeout'.");
+            params_ok = false;
+        }
+
+        // Check and get 'timestamp' (assuming it fits uint64_t)
+        if (params.HasMember("timestamp") && (params["timestamp"].IsUint64() || params["timestamp"].IsUint())) {
+             desired_timestamp = params["timestamp"].IsUint64() ? params["timestamp"].GetUint64() : params["timestamp"].GetUint();
+        } else {
+             LOG_PRINT(log_print::kWARN, APP_TAG, "'lampcontrol' missing or invalid 'timestamp'.");
+             params_ok = false;
+        }
+
+        // 3. Perform Action if parameters were valid
+        if (params_ok) {
+            LOG_PRINT(log_print::kINFO, APP_TAG, "Applying lamp control settings: lset=%d, timeout=%d, ts=%llu",
+                      desired_lset, desired_timeout, desired_timestamp);
+            // --- TODO: Call your actual function to apply these settings ---
+            // success = ApplyLampControlSettings(desired_lset, desired_timeout, desired_timestamp);
+            success = true; // Assume success for example
+            // ----------------------------------------------------------------
+
+            // 4. Prepare reported state update IF successful
+            if (success) {
+                 // Create a JSON object representing the *actual* state after applying
+                 rapidjson::Value lamp_control_report(rapidjson::kObjectType);
+                 // Replace Get... with functions fetching the actual current settings
+                 // lamp_control_report.AddMember("lset", GetActualLampLset(), allocator);
+                 // lamp_control_report.AddMember("timeout", GetActualLampTimeout(), allocator);
+                 // lamp_control_report.AddMember("timestamp", GetActualLampTimestamp(), allocator);
+
+                 // For simplicity in example, let's report back the desired values assuming they were applied
+                 lamp_control_report.AddMember("lset", desired_lset, allocator);
+                 lamp_control_report.AddMember("timeout", desired_timeout, allocator);
+                 lamp_control_report.AddMember("timestamp", desired_timestamp, allocator);
+
+
+                 // Add this object under the 'lampcontrol' key in the main reported doc
+                 reported_state_update.AddMember("lampcontrol", lamp_control_report, allocator);
+            }
+        } else {
+            success = false; // Mark as failed due to invalid parameters
+        }
+    }
+}
+// ... other command handlers ...
+
+// --- IMPORTANT: Call ReportCurrentState AFTER the if/else if block ---
+// (This part is outside the specific 'lampcontrol' block but after all commands checked)
+if (success && reported_state_update.MemberCount() > 0) {
+    LOG_PRINT(log_print::kINFO, APP_TAG, "Reporting state back to shadow after processing '%s'.", command_name);
+    if (!cloud_comm.ReportCurrentState(reported_state_update)) {
+        LOG_PRINT(log_print::kWARN, APP_TAG, "Failed to queue state report for command '%s'.", command_name);
+    }
+} else if (success) {
+    // Handle success cases where no specific state change needs reporting (report null ack)
+    LOG_PRINT(log_print::kINFO, APP_TAG, "Command '%s' processed successfully, reporting null acknowledgment.", command_name);
+    rapidjson::Document null_ack_doc(rapidjson::kObjectType);
+    null_ack_doc.AddMember(rapidjson::StringRef(command_name), rapidjson::Value(), null_ack_doc.GetAllocator());
+    if (!cloud_comm.ReportCurrentState(null_ack_doc)) { /* ... */ }
+}
+// --------------------------------------------------------------------
+
+return success; // Return overall status
