@@ -1,84 +1,51 @@
 #ifndef CLOUD_COMM_H_
 #define CLOUD_COMM_H_
 
-#include <functional>
-#include <string>       // Still used for config struct members
-#include <string_view>
-#include <cstdint>
-#include <atomic>
+#include <atomic>       // Required for std::atomic
+#include <cstddef>      // For size_t
+#include <cstdint>      // For uint types
+#include <functional>   // For std::function
+#include <string>       // Required for std::string
+#include <string_view>  // For std::string_view
 
-// --- Include RapidJSON headers directly ---
-#include "rapidjson/document.h"
-#include "rapidjson/value.h"
-// -----------------------------------------
+// --- Assumed Platform Includes ---
+// NOTE: Adjust these based on your actual platform/framework
+#include "platform/mutex.h"             // For platform::mutex::Mutex/LockGuard
+#include "platform/storage/file_system.h" // Original include
+#include "platform/network/aws_iot_mqtt_client.h" // Original include
+// --- End Assumed Platform Includes ---
 
-// Include the AWS client header directly
-#include "aws_iot_mqtt_client.hpp" // Defines AwsIot::MqttConfig
-
-// --- Forward declare or include your custom logging header ---
-// Assuming log_print::kERROR etc are defined elsewhere in your project
-namespace log_print {
-    enum LogLevel { kERROR, kWARN, kINFO, kDEBUG1, kVERBOSE };
-}
-// Assuming LOG_PRINT macro is defined elsewhere
-// #define LOG_PRINT(level, tag, format, ...) YourLogImplementation(level, TAG, format, ##__VA_ARGS__)
-// -------------------------------------------------------------
+// --- Assumed Project Includes ---
+#include "backlog_packets.h" // Assuming this holds the DataBuffer definition
+#include "rapidjson/document.h" // For rapidjson types in callbacks/params
+// --- End Assumed Project Includes ---
 
 
-namespace CloudComms {
+namespace visium {
 
-// --- Constants ---
-constexpr std::size_t kMaxPayloadSize = 1024;   ///< Max JSON payload size for internal PARSING buffer
-constexpr std::size_t kMaxCommandKeyLen = 64;   ///< Max length for a command key name from shadow
-constexpr std::size_t kMaxThingNameLen = 128;   ///< Max length for the Thing Name itself
-constexpr std::size_t kMaxFilePathLen = 128;    ///< Max length for internal file path buffer if needed (not for config)
-// Reconnect Timing Defaults
-constexpr uint32_t kInitialBackoffMs = 1000;    // 1 second initial reconnect delay
-constexpr uint32_t kMaxBackoffMs = 60000;       // 60 seconds maximum reconnect delay
+// --- Type Definitions ---
 
 /**
- * @brief Configuration struct passed to Initialize. All fields are required,
- * except for MQTT buffer sizes which have defaults.
+ * @brief Callback function type for control commands received via shadow delta.
+ * @param command_key The key (command name) from the shadow delta state object.
+ * @param params A RapidJSON Value (likely an object or primitive) containing parameters for the command.
+ * @return True if the command was processed successfully by the application, false otherwise.
+ * Returning true implies the application has actioned the command and the corresponding
+ * 'reported' state should ideally be updated.
  */
-struct CloudCommConfig {
-    // --- Connectivity ---
-    std::string aws_endpoint; ///< REQUIRED AWS IoT Core endpoint URL.
-    std::string client_id;    ///< REQUIRED Unique MQTT client ID for this device.
-    std::string thing_name;   ///< REQUIRED AWS IoT Thing Name (max kMaxThingNameLen-1 chars).
-    // Port 8883 is hardcoded internally
-
-    // --- Certificates (Full Paths Required) ---
-    std::string root_ca_path;       ///< REQUIRED Full path to the Root CA certificate PEM file.
-    std::string device_cert_path;   ///< REQUIRED Full path to the device certificate PEM file.
-    std::string private_key_path;   ///< REQUIRED Full path to the device private key PEM file.
-
-    // --- Optional MQTT Tuning ---
-    int mqtt_rx_buffer_size = 2048; ///< Underlying MQTT receive buffer size. Default 2048.
-    int mqtt_tx_buffer_size = 2048; ///< Underlying MQTT transmit buffer size. Default 2048.
-};
-
-
-// --- Callbacks ---
-/**
- * @brief Callback function type for handling control commands received via shadow.
- * @param command_name Null-terminated C-string representing the command key.
- * @param params A RapidJSON Value object containing the parameters for the command.
- * @return True if command processing was successful, false otherwise. If true, the
- * application should call ReportCurrentState() to update the shadow.
- */
-using ControlCommandCallback = std::function<bool(const char* command_name, const rapidjson::Value& params)>;
+using ControlCommandCallback = std::function<bool(const char* command_key, const rapidjson::Value& params)>;
 
 /**
  * @brief Callback function type for connection status changes (informational).
- * @param connected True if connected, false if disconnected.
+ * @param connected True if connected, false if disconnected/connecting/retrying.
  */
 using ConnectionStatusCallback = std::function<void(bool connected)>;
 
 
 // --- CloudComm Class ---
 class CloudComm {
-public:
-    CloudComm();
+   public:
+    explicit CloudComm(platform::storage::FileSystem& file_manager);
     ~CloudComm();
 
     // Disable copy/move
@@ -88,25 +55,26 @@ public:
     CloudComm& operator=(CloudComm&&) = delete;
 
     /**
-     * @brief Initializes the cloud communication module using provided configuration.
-     * Loads certificates from the fully specified paths in the config struct.
+     * @brief Initializes the cloud communication module using configuration loaded internally.
+     * Loads certificates and MQTT endpoint details from files specified by member paths.
      * Configures the underlying client and sets up necessary subscriptions.
-     * @param config Configuration settings containing endpoint, IDs, full cert paths etc.
      * @return True if initialization was successful, false otherwise.
      */
-    bool Initialize(const CloudCommConfig& config);
+    bool Initialize();
 
     /**
      * @brief Initiates a connection attempt to AWS IoT Core.
      * Handles the transition to the CONNECTING state. Use Process() to manage retries.
      * @param reset_retry_state If true (default), resets the internal reconnect backoff state.
-     * @return True if the connection attempt was newly initiated or already in progress/connected, false on immediate error.
+     * @return True if the connection attempt was newly initiated or already in progress/connected,
+     * false on immediate error (e.g., not initialized).
      */
     bool Connect(bool reset_retry_state = true);
 
     /**
      * @brief Disconnects from the AWS IoT Core broker.
      * Resets the internal state to DISCONNECTED and stops automatic retries.
+     * Clears any pending shadow report.
      */
     void Disconnect();
 
@@ -117,33 +85,40 @@ public:
     bool IsConnected() const;
 
     /**
-     * @brief Processes internal state, including reconnection logic.
-     * MUST be called periodically by the application to handle connection retries.
+     * @brief Processes internal state, including reconnection logic and pending shadow reports.
+     * MUST be called periodically by the application to handle connection retries,
+     * process underlying client events, and send pending shadow updates.
      */
     void Process();
 
-    // --- Device to Cloud Reports ---
-    bool SendTimeSeriesData(const rapidjson::Value& data, int qos = 0);
-    bool SendStatusReport(const rapidjson::Value& data, int qos = 1);
     /**
-     * @brief Sends a specific event notification to the cloud. Uses dynamic memory
-     * (StringBuffer) internally for JSON serialization.
-     * @param event_type Null-terminated C-string identifying the type of event.
-     * @param data A RapidJSON Value object (must be an object) containing event details.
-     * @param qos The Quality of Service level (usually 1 for events).
-     * @return True if the event was successfully queued for publishing, false otherwise.
+     * @brief Sends a status packet (e.g., sensor data, events) to the MQTT broker.
+     * Constructs a JSON message and publishes to the appropriate topic (status or timeseries).
+     * If not connected, data may be backlogged (implementation specific via DataBuffer).
+     * @param packet_type The type identifier of the status packet.
+     * @param packet_data A pointer to the raw packet data structure.
+     * @param packet_size The size of the packet data structure.
+     * @return true if the packet was sent immediately or successfully backlogged, false on error.
      */
-    bool SendEvent(const char* event_type, const rapidjson::Value& data, int qos = 1);
+    bool SendDataToCloud(uint8_t packet_type, const void* packet_data, size_t packet_size);
 
-    // --- Device to Cloud Shadow State ---
     /**
-     * @brief Reports the device's current state to the AWS IoT Shadow 'reported' section.
+     * @brief Sends queued log events to the cloud logging topic. (Rate limited internally).
+     * Intended to be called periodically, potentially from within Process().
+     * @return True if a log event was successfully published, false otherwise (no event, not connected, or publish error).
+     */
+    bool SendLogEvent();
+
+    /**
+     * @brief Reports the device's current state PROACTIVELY to the AWS IoT Shadow 'reported' section.
+     * Use this function when the application wants to push its state outside of responding to a delta.
      * Call this after successfully processing a command from the shadow 'desired' state,
      * or anytime the device needs to proactively report its state. Uses dynamic memory
      * (StringBuffer) internally for JSON serialization.
-     * @param reported_state A RapidJSON Value object (must be an object type) representing the state to report.
+     * @param reported_state A RapidJSON Value object (must be an object type) representing the
+     * state to report.
      * @param qos The Quality of Service level (usually 1).
-     * @return True if the state report was successfully queued, false otherwise.
+     * @return True if the state report was successfully queued for publishing, false otherwise.
      */
     bool ReportCurrentState(const rapidjson::Value& reported_state, int qos = 1);
 
@@ -151,181 +126,212 @@ public:
     void SetControlCommandCallback(ControlCommandCallback callback);
     void SetConnectionStatusCallback(ConnectionStatusCallback callback);
 
-private:
+   private:
+    platform::storage::FileSystem& file_manager_;
+
     // --- Internal State Machine ---
     enum class State { UNINITIALIZED, DISCONNECTED, CONNECTING, CONNECTED, WAITING_TO_RETRY };
     std::atomic<State> current_state_{State::UNINITIALIZED};
 
-    // --- Private Constants ---
+    // --- MQTT Client ---
+    platform::network::AwsIotMqttClient aws_mqtt_client_;
+
+    // --- Configuration & Topics (Loaded from file) ---
+    char thing_name_[kMaxThingNameLen] = {0};
+    char staging_env_[10] = {0}; // Consider increasing size if needed
+    char mqtt_endpoint_[kMaxMqttEndPointLen] = {0};
+    char logger_topic_[kMaxTopicLen] = {0};
+    char status_topic_[kMaxTopicLen] = {0};
+    char timeseries_topic_[kMaxTopicLen] = {0};
+    // Paths for configuration files (can be overridden if needed)
+    const char* root_ca_path_ = "/certCA.pem";
+    const char* device_cert_path_ = "/certificate.pem";
+    const char* private_key_path_ = "/private.pem.key";
+    const char* mqtt_config_path_ = "/mqttConfiguration.json";
+
+    // --- Callbacks ---
+    ControlCommandCallback control_command_callback_{nullptr};
+    ConnectionStatusCallback connection_status_callback_{nullptr};
+
+    // --- Buffers ---
+    char json_parse_buffer_[kMaxPayloadSize] = {0}; // Buffer for parsing incoming JSON payloads
+    DataBuffer backlog_packets_; // For queueing packets when offline (ensure class definition exists)
+
+    // --- Reconnect Logic ---
+    uint64_t last_disconnect_time_ms_ = 0;
+    uint32_t current_backoff_delay_ms_ = kInitialBackoffMs;
+    int reconnect_attempts_ = 0;
+
+    // --- Shadow Handling ---
+    bool initial_shadow_received_ = false;
+    uint16_t get_shadow_attempts_ = 0;
+    uint64_t last_get_shadow_attempt_ms_ = 0;
+    uint32_t current_get_shadow_backoff_ms_ = kGetShadowRetryBaseMs; // Start with base retry delay
+
+    // --- Pending Shadow Report State (NEW) ---
+    std::atomic<bool> shadow_report_pending_{false}; // Flag to indicate a report is ready in the payload
+    std::string pending_shadow_report_payload_;      // Stores the full JSON payload {"state":{"reported":{...}}}
+    platform::mutex::Mutex pending_report_mutex_;    // Mutex to protect access to the payload string
+
+
+    // --- Timers / Intervals ---
+    uint64_t last_log_event_send_check_time_ = 0;
+    uint64_t last_backlog_packet_sent_time_ = 0; // Added for potential backlog processing
+
+    // --- Constants ---
+    // Network Config
     static constexpr uint16_t kDefaultMqttPort = 8883;
-    static constexpr int kDefaultMqttRxBufferSize = 2048;
-    static constexpr int kDefaultMqttTxBufferSize = 2048;
+    static constexpr int kDefaultMqttRxBufferSize = 2048; // Adjust if needed
+    static constexpr int kDefaultMqttTxBufferSize = 2048; // Adjust if needed
+    // Sizes
+    static constexpr std::size_t kMaxPayloadSize = 2048;  // Max JSON payload size for internal PARSING buffer
+    static constexpr size_t kMaxTopicLen = 128;          // Increased topic length buffer
+    static constexpr size_t kMaxCommandKeyLen = 64;      // Max length for a command key name from shadow
+    static constexpr size_t kMaxThingNameLen = 64;       // Increased thing name buffer
+    static constexpr size_t kMaxMqttEndPointLen = 128;   // Increased endpoint buffer
+    static constexpr size_t kMaxFilePathLen = 128;       // Max length for cert/config file paths
+    // Reconnect Timing
+    static constexpr uint32_t kInitialBackoffMs = 1000;  // 1 second initial reconnect delay
+    static constexpr uint32_t kMaxBackoffMs = 60000;     // 60 seconds maximum reconnect delay
+    // Get Shadow Retry Timing
+    static constexpr uint16_t kMaxGetShadowAttempts = 10; // Limit initial get attempts
+    static constexpr uint32_t kGetShadowRetryBaseMs = 5000; // Base retry for get shadow (e.g., 5s)
+    static constexpr uint32_t kMaxGetShadowRetryMs = 30000; // Max retry for get shadow (e.g., 30s)
+    // Log Event Interval
+    static constexpr uint32_t kLogEventSendIntervalMs = 10000; // Check for logs every 10s
 
     // --- Private Helper Methods ---
-    bool LoadCertificateFromFile(const char* full_path, char* buffer, std::size_t buffer_size);
-    bool BuildTopicString(char* buffer, std::size_t buffer_len, const char* type_suffix);
-    /**
-     * @brief Internal helper to serialize JSON using StringBuffer and publish.
-     * NOTE: Uses dynamic memory allocation via StringBuffer.
-     */
-    bool PublishJsonToTopic(const char* topic, const rapidjson::Value& json_payload, int qos, bool retain = false);
-    void RequestShadowState();
-    // AcknowledgeControlCommand removed
-    void ProcessReceivedShadowDelta(const rapidjson::Value& delta_state);
-    void ProcessReceivedShadowDocument(std::string_view payload);
-    uint64_t GetTimestampMs();
-    void HandleDisconnectInternal();
     bool AttemptReconnect();
     bool CommonInitializeSetup();
+    void HandleDisconnectInternal();
+    void PollShadow(); // Renamed from PollShadow for clarity
+    bool LoadCertificateFromFile(const char* full_path, char* buffer, std::size_t buffer_size);
+    bool LoadMqttConfigs();
+    bool PublishJsonToTopic(const char* topic, const rapidjson::Value& json_payload, int qos = 1, bool retain = false);
+    void RequestShadowState();
+    void ProcessReceivedShadowDelta(const rapidjson::Value& delta_state); // Processes commands, prepares report if needed
+    void ProcessReceivedShadowDocument(rapidjson::Document& doc); // Processes full shadow doc (e.g., /get/accepted)
 
     // --- Internal Callbacks ---
     void OnConnected();
     void OnDisconnected();
-    // Use correct signature matching AwsIotMqttClient callback type
+    // Callback signature matching AwsIotMqttClient expected type
     void HandleShadowCallback(const std::string& update_type, std::string_view payload);
 
-    // --- Member Variables ---
-    AwsIot::AwsIotMqttClient aws_mqtt_client_;
-    char thing_name_[kMaxThingNameLen] = {0}; // Fixed buffer
-    ControlCommandCallback control_command_callback_{nullptr};
-    ConnectionStatusCallback connection_status_callback_{nullptr};
-    // Reusable internal buffers
-    char json_parse_buffer_[kMaxPayloadSize] = {0}; // For parsing incoming JSON
-    // json_serialize_buffer_ removed
-    // Reconnect State
-    uint64_t last_disconnect_time_ms_ = 0;
-    uint32_t current_backoff_delay_ms_ = kInitialBackoffMs;
-    int reconnect_attempts_ = 0;
-};
+}; // class CloudComm
 
-} // namespace CloudComms
+} // namespace visium
 
 #endif // CLOUD_COMM_H_
 
-------------------------------------------------------------------------------------------
+----------------------------------------------------------------------------------------------------------------------------------------
 
-#include "cloud_comm.h"
+#include "cloud_communication.h" // Include the header first
 
-#include <fstream>
-#include <utility>   // For std::move
-#include <cstring>   // For memcpy, strlen, strncpy, memset
-#include <cstdio>    // For snprintf
-#include <algorithm> // For std::min
-#include <string>    // Needed for temporary std::string during init
+#include <algorithm>
+#include <cstdio>
+#include <cstring>
+// <string>, <atomic>, <functional>, <string_view>, <cstddef>, <cstdint> are included via header
+// <platform/mutex.h>, <platform/storage/file_system.h>, <platform/network/aws_iot_mqtt_client.h> included via header
+// <rapidjson/document.h> included via header
 
-// --- Required RapidJSON includes for implementation ---
-// #include "rapidjson/memorystream.h" // No longer needed
-#include "rapidjson/stringbuffer.h" // Include for StringBuffer
-#include "rapidjson/writer.h"       // For Writer
-// ----------------------------------------------------
+// --- Assumed Project Includes ---
+// Ensure these are accessible and correct
+#include "log_print.h"          // For LOG_PRINT
+#include "log_transfer.h"       // For GetLogEvent, CreateLogEvent
+#include "status_packet.h"      // For TOTAL_STATUS_PACKET_TYPES etc. and CreateStatusPacketJSON placeholder
+#include "system_uptime.h"      // For GetMs, ExceedsMs
+#include "version.h"            // For VISIUM_FW_VERSION (make sure this define exists)
+// --- End Assumed Project Includes ---
 
-// --- Platform specific includes & Logging ---
-#ifdef ESP_PLATFORM
-#include "esp_timer.h" // For esp_timer_get_time
-#include "esp_log.h"   // If using ESP_LOG for the LOG_PRINT macro backend
-static const char* TAG = "CloudComm";
-// Define LOG_PRINT using ESP_LOGx here if not defined globally
-#ifndef LOG_PRINT
-#define LOG_PRINT(level, tag, format, ...) do { \
-    switch(level) { \
-        case log_print::kERROR:   ESP_LOGE(tag, format, ##__VA_ARGS__); break; \
-        case log_print::kWARN:    ESP_LOGW(tag, format, ##__VA_ARGS__); break; \
-        case log_print::kINFO:    ESP_LOGI(tag, format, ##__VA_ARGS__); break; \
-        case log_print::kDEBUG1:  ESP_LOGD(tag, format, ##__VA_ARGS__); break; \
-        case log_print::kVERBOSE: ESP_LOGV(tag, format, ##__VA_ARGS__); break; \
-        default:                  ESP_LOGI(tag, format, ##__VA_ARGS__); break; \
-    } \
-} while(0)
-#endif // LOG_PRINT
-
-#else
-// Define basic logging macros and a dummy time function if not ESP_PLATFORM
-#include <iostream>
-#include <chrono>
-#define LOG_PRINT(level, tag, format, ...) printf("[%s] %d: " format "\n", tag, static_cast<int>(level), ##__VA_ARGS__)
-static const char* TAG = "CloudComm";
-uint64_t esp_timer_get_time() { return std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::high_resolution_clock::now().time_since_epoch()).count(); }
-#endif
-// ------------------------------------------
+#include "rapidjson/stringbuffer.h" // Needed for serialization
+#include "rapidjson/writer.h"       // Needed for serialization
 
 
-namespace CloudComms {
+namespace visium {
 
-// --- NO static constexpr definitions needed here ---
+using namespace platform; // Assuming FileSystem, Mutex, etc. are in platform namespace
 
-// --- Topic constants ---
-const char* const kDefaultTopicPrefix = "dt";
-const char* const kTimeSeriesTopicSuffix = "/timeseries";
-const char* const kStatusTopicSuffix = "/status";
-const char* const kEventTopicSuffix = "/event";
+// --- Forward declare helper if needed ---
+// Placeholder - ensure this exists and is implemented correctly elsewhere
+bool CreateStatusPacketJSON(rapidjson::Document& doc, rapidjson::Document::AllocatorType& allocator, uint8_t packet_type, const void* packet_data);
 
-// --- Constructor / Destructor ---
-CloudComm::CloudComm() : current_state_(State::UNINITIALIZED) {
-    LOG_PRINT(log_print::kINFO, TAG, "CloudComm instance created.");
+
+// --- Constructor ---
+CloudComm::CloudComm(storage::FileSystem& file_manager)
+    : file_manager_(file_manager),
+      current_state_(State::UNINITIALIZED),
+      shadow_report_pending_{false} // Initialize new atomic flag
+      // pending_report_mutex_ is default constructed
+{
+    // Existing initializations...
     memset(thing_name_, 0, sizeof(thing_name_));
     memset(json_parse_buffer_, 0, sizeof(json_parse_buffer_));
+    // NOTE: Mutex (`pending_report_mutex_`) usually doesn't need explicit initialization
+    // unless your platform specific mutex requires it.
 }
 
+// --- Destructor ---
 CloudComm::~CloudComm() {
-    LOG_PRINT(log_print::kINFO, TAG, "CloudComm instance destroying...");
     State current = current_state_.load();
     if (current != State::UNINITIALIZED && current != State::DISCONNECTED) {
-         Disconnect();
+        Disconnect(); // Ensure disconnection on destruction if connected/connecting
     }
-    LOG_PRINT(log_print::kINFO, TAG, "CloudComm instance destroyed.");
 }
 
+// --- Public Methods ---
 
-// --- Initialization ---
-bool CloudComm::Initialize(const CloudCommConfig& config) {
-     LOG_PRINT(log_print::kINFO, TAG, "Initializing CloudComm...");
-
+bool CloudComm::Initialize() {
+    LOG_PRINT(log_print::kVERBOSE, "Initializing CloudComm...");
     if (current_state_.load() != State::UNINITIALIZED) {
-        LOG_PRINT(log_print::kWARN, TAG, "Already initialized or initializing.");
+        LOG_PRINT(log_print::kWARN, "Already initialized or initializing.");
         return (current_state_.load() != State::UNINITIALIZED);
     }
 
-    // --- Validate ALL Required Parameters ---
-    if (config.aws_endpoint.empty() || config.client_id.empty() || config.thing_name.empty() ||
-        config.root_ca_path.empty() || config.device_cert_path.empty() || config.private_key_path.empty()) {
-        LOG_PRINT(log_print::kERROR, TAG, "Initialize failed: Endpoint, Client ID, Thing Name, and all Certificate Paths are required.");
-        return false;
-    }
-    if (config.thing_name.length() >= kMaxThingNameLen) { // Use kMax const directly
-         LOG_PRINT(log_print::kERROR, TAG, "Initialize failed: Thing name '%s' too long (max %zu chars).",
-                 config.thing_name.c_str(), kMaxThingNameLen - 1);
-        return false;
+    if (!LoadMqttConfigs()) { // Load config first to get thing name, endpoint etc.
+         LOG_PRINT(log_print::kERROR, "Failed to load MQTT configurations.");
+         return false;
     }
 
-    // --- Store Thing Name ---
-    strncpy(thing_name_, config.thing_name.c_str(), sizeof(thing_name_) - 1);
-    thing_name_[sizeof(thing_name_) - 1] = '\0';
-
-    // --- Prepare Underlying Client Config (Temporary on stack) ---
-    AwsIot::MqttConfig client_config_internal = {};
-    // **Create temporary std::string objects required by underlying client's config**
-    client_config_internal.aws_endpoint = config.aws_endpoint; // Implicit conversion
-    client_config_internal.client_id = config.client_id;       // Implicit conversion
-    client_config_internal.thing_name = config.thing_name;     // Implicit conversion
-    // ***********************************************************
+    network::MqttConfig client_config_internal = {};
+    client_config_internal.aws_endpoint = mqtt_endpoint_;
+    client_config_internal.client_id = thing_name_;
+    client_config_internal.thing_name = thing_name_;
     client_config_internal.port = kDefaultMqttPort;
-    client_config_internal.rx_buffer_size = config.mqtt_rx_buffer_size > 0 ? config.mqtt_rx_buffer_size : kDefaultMqttRxBufferSize;
-    client_config_internal.tx_buffer_size = config.mqtt_tx_buffer_size > 0 ? config.mqtt_tx_buffer_size : kDefaultMqttTxBufferSize;
-    LOG_PRINT(log_print::kINFO, TAG, "MQTT Buffers: RX=%d, TX=%d", client_config_internal.rx_buffer_size, client_config_internal.tx_buffer_size);
+    client_config_internal.rx_buffer_size = kDefaultMqttRxBufferSize;
+    client_config_internal.tx_buffer_size = kDefaultMqttTxBufferSize;
 
-    // --- Load Certificates using fully specified paths from config ---
-    LOG_PRINT(log_print::kINFO, TAG, "Loading certificates from specified paths...");
-    LOG_PRINT(log_print::kDEBUG1, TAG, "Loading CA from: %s", config.root_ca_path.c_str());
-    if (!LoadCertificateFromFile(config.root_ca_path.c_str(), client_config_internal.root_ca_pem, AwsIot::kMaxCertLen)) { LOG_PRINT(log_print::kERROR, TAG,"Failed to load CA cert: %s", config.root_ca_path.c_str()); return false; }
-    LOG_PRINT(log_print::kDEBUG1, TAG, "Loading device cert from: %s", config.device_cert_path.c_str());
-    if (!LoadCertificateFromFile(config.device_cert_path.c_str(), client_config_internal.device_cert_pem, AwsIot::kMaxCertLen)) { LOG_PRINT(log_print::kERROR, TAG,"Failed to load device cert: %s", config.device_cert_path.c_str()); return false; }
-    LOG_PRINT(log_print::kDEBUG1, TAG, "Loading private key from: %s", config.private_key_path.c_str());
-    if (!LoadCertificateFromFile(config.private_key_path.c_str(), client_config_internal.private_key_pem, AwsIot::kMaxCertLen)) { LOG_PRINT(log_print::kERROR, TAG,"Failed to load private key: %s", config.private_key_path.c_str()); return false; }
-    LOG_PRINT(log_print::kDEBUG1, TAG, "Certificates loaded successfully.");
+    LOG_PRINT(log_print::kDEBUG5, "Loading CA from: %s", root_ca_path_);
+    // Allocate temporary buffers for certs on stack if kMaxCertLen is reasonable, else use members
+    char root_ca_buffer[network::kMaxCertLen];
+    char device_cert_buffer[network::kMaxCertLen];
+    char private_key_buffer[network::kMaxCertLen];
+
+    if (!LoadCertificateFromFile(root_ca_path_, root_ca_buffer, sizeof(root_ca_buffer))) {
+        LOG_PRINT(log_print::kERROR, "Failed to load CA cert: %s", root_ca_path_);
+        return false;
+    }
+    client_config_internal.root_ca_pem = root_ca_buffer;
+
+    LOG_PRINT(log_print::kDEBUG5, "Loading device cert from: %s", device_cert_path_);
+    if (!LoadCertificateFromFile(device_cert_path_, device_cert_buffer, sizeof(device_cert_buffer))) {
+        LOG_PRINT(log_print::kERROR, "Failed to load device cert: %s", device_cert_path_);
+        return false;
+    }
+    client_config_internal.device_cert_pem = device_cert_buffer;
+
+    LOG_PRINT(log_print::kDEBUG5, "Loading private key from: %s", private_key_path_);
+    if (!LoadCertificateFromFile(private_key_path_, private_key_buffer, sizeof(private_key_buffer))) {
+        LOG_PRINT(log_print::kERROR, "Failed to load private key: %s", private_key_path_);
+        return false;
+    }
+    client_config_internal.private_key_pem = private_key_buffer;
+
+    LOG_PRINT(log_print::kDEBUG5, "Certificates loaded successfully.");
 
     // --- Initialize Underlying Client ---
     if (!aws_mqtt_client_.Initialize(client_config_internal)) {
-        LOG_PRINT(log_print::kERROR, TAG, "Failed to initialize underlying AwsIotMqttClient.");
+        LOG_PRINT(log_print::kERROR, "Failed to initialize underlying AwsIotMqttClient.");
         return false;
     }
 
@@ -340,892 +346,954 @@ bool CloudComm::Initialize(const CloudCommConfig& config) {
     last_disconnect_time_ms_ = 0;
     current_backoff_delay_ms_ = kInitialBackoffMs;
     reconnect_attempts_ = 0;
-    LOG_PRINT(log_print::kINFO, TAG, "CloudComm initialized successfully for Thing: %s. State: DISCONNECTED.", thing_name_);
+
+    // Reset pending report state on initialization
+    shadow_report_pending_.store(false);
+    pending_shadow_report_payload_.clear();
+
+    LOG_PRINT(log_print::kINFO,
+              "CloudComm initialized successfully for Thing: %s. State: DISCONNECTED.",
+              thing_name_);
     return true;
 }
 
-
-/** @brief Common setup steps called by Initialize. */
-bool CloudComm::CommonInitializeSetup() {
-    aws_mqtt_client_.SetOnConnectedCallback([this]() { this->OnConnected(); });
-    aws_mqtt_client_.SetOnDisconnectedCallback([this]() { this->OnDisconnected(); });
-
-    LOG_PRINT(log_print::kDEBUG1, TAG, "Setting up shadow subscriptions.");
-    // Define the lambda matching the expected signature directly
-    auto shadow_handler = [this](const std::string& type, std::string_view payload) {
-        this->HandleShadowCallback(type, payload); // Direct call, signatures match
-    };
-    if (!aws_mqtt_client_.SubscribeToShadowUpdates(shadow_handler)) {
-        LOG_PRINT(log_print::kERROR, TAG, "Common setup failed: Shadow update subscription failed!");
-        return false;
-    }
-    if (!aws_mqtt_client_.SubscribeToShadowGetResponses(shadow_handler)) {
-        LOG_PRINT(log_print::kERROR, TAG, "Common setup failed: Shadow get response subscription failed!");
-        return false;
-    }
-    return true;
-}
-
-
-/** @brief Initiates connection attempt. */
 bool CloudComm::Connect(bool reset_retry_state) {
     State current = current_state_.load();
-    LOG_PRINT(log_print::kINFO, TAG, "Connect requested by application (reset_retry=%s). Current state: %d",
-             reset_retry_state ? "true" : "false", static_cast<int>(current));
-    if (current == State::UNINITIALIZED) { LOG_PRINT(log_print::kERROR, TAG, "Cannot connect: Not initialized."); return false; }
-    if (current == State::CONNECTING || current == State::CONNECTED) { LOG_PRINT(log_print::kWARN, TAG, "Connect called while already %s.", (current == State::CONNECTING) ? "connecting" : "connected"); return true; }
-    if (reset_retry_state) {
-        LOG_PRINT(log_print::kDEBUG1, TAG, "Resetting reconnect state due to explicit connect call.");
-        reconnect_attempts_ = 0;
-        current_backoff_delay_ms_ = kInitialBackoffMs;
-        last_disconnect_time_ms_ = 0;
-    }
-    return AttemptReconnect();
-}
+    LOG_PRINT(log_print::kINFO, "Manual Connect requested (reset_retry=%s). Current state: %d",
+              reset_retry_state ? "true" : "false", static_cast<int>(current));
 
-/** @brief Internal function that actually calls the underlying client connect */
-bool CloudComm::AttemptReconnect() {
-    LOG_PRINT(log_print::kINFO, TAG, "Attempting MQTT connection (Attempt #%d)...", reconnect_attempts_ + 1);
-    State expected_disconnected = State::DISCONNECTED;
-    State expected_waiting = State::WAITING_TO_RETRY;
-    if (!current_state_.compare_exchange_strong(expected_waiting, State::CONNECTING) &&
-        !current_state_.compare_exchange_strong(expected_disconnected, State::CONNECTING))
-    {
-         State actual_state = current_state_.load();
-         LOG_PRINT(log_print::kWARN, TAG, "AttemptReconnect failed: Could not transition from WAITING/DISCONNECTED state. Current state: %d", static_cast<int>(actual_state));
-         return false;
-    }
-    if (!aws_mqtt_client_.Connect()) {
-        LOG_PRINT(log_print::kWARN, TAG, "Underlying aws_mqtt_client_.Connect() call failed initiation.");
-        HandleDisconnectInternal(); // Treat as immediate disconnect to trigger retry via Process()
+    if (current == State::UNINITIALIZED) {
+        LOG_PRINT(log_print::kERROR, "Cannot connect: Not initialized.");
         return false;
     }
-    LOG_PRINT(log_print::kDEBUG1, TAG, "MQTT connection attempt initiated. State: CONNECTING.");
-    reconnect_attempts_++;
-    return true;
-}
 
-/** @brief Disconnects from the broker. */
-void CloudComm::Disconnect() {
-    LOG_PRINT(log_print::kINFO, TAG, "Disconnect requested by application.");
-    State previous_state = current_state_.exchange(State::DISCONNECTED);
-    if (previous_state != State::UNINITIALIZED && previous_state != State::DISCONNECTED) {
-         LOG_PRINT(log_print::kDEBUG1, TAG,"Calling underlying MQTT disconnect.");
-         aws_mqtt_client_.Disconnect();
-    } else { LOG_PRINT(log_print::kDEBUG1, TAG,"Already disconnected or uninitialized."); }
-    reconnect_attempts_ = 0;
-    current_backoff_delay_ms_ = kInitialBackoffMs;
-    last_disconnect_time_ms_ = 0;
-}
-
-/** @brief Checks connection status. */
-bool CloudComm::IsConnected() const { return (current_state_.load() == State::CONNECTED); }
-
-/** @brief Helper to get timestamp. */
-uint64_t CloudComm::GetTimestampMs() { return esp_timer_get_time() / 1000; }
-
-/** @brief Handles internal disconnect logic. */
-void CloudComm::HandleDisconnectInternal() {
-     State previous_state = current_state_.load();
-    if (previous_state == State::CONNECTED || previous_state == State::CONNECTING) {
-        LOG_PRINT(log_print::kWARN, TAG, "Internal: Handling disconnection event. Previous state: %d", (int)previous_state);
-        last_disconnect_time_ms_ = GetTimestampMs();
-        uint64_t next_delay = static_cast<uint64_t>(current_backoff_delay_ms_) * 2;
-        current_backoff_delay_ms_ = static_cast<uint32_t>(std::min(next_delay, static_cast<uint64_t>(kMaxBackoffMs)));
-        State expected_state = previous_state;
-        if (current_state_.compare_exchange_strong(expected_state, State::WAITING_TO_RETRY)) {
-            LOG_PRINT(log_print::kINFO, TAG, "State changed to WAITING_TO_RETRY. Next attempt (#%d) in %u ms.", reconnect_attempts_ +1, current_backoff_delay_ms_);
-             if (connection_status_callback_) { connection_status_callback_(false); }
-        } else { LOG_PRINT(log_print::kWARN, TAG, "Disconnect handling aborted: State changed unexpectedly from %d to %d.", (int)previous_state, (int)expected_state); }
-    } else { LOG_PRINT(log_print::kDEBUG1, TAG, "Internal: Ignoring redundant disconnect event while in state %d.", (int)previous_state); }
-}
-
-/** @brief Processes internal state machine (call periodically). */
-void CloudComm::Process() {
-    State state = current_state_.load();
-    if (state == State::WAITING_TO_RETRY) {
-        uint64_t now_ms = GetTimestampMs();
-        if (now_ms >= (last_disconnect_time_ms_ + current_backoff_delay_ms_)) {
-            LOG_PRINT(log_print::kINFO, TAG, "Process: Retry timer elapsed. Attempting reconnect...");
-            AttemptReconnect();
+    if (current == State::CONNECTING || current == State::CONNECTED) {
+        LOG_PRINT(log_print::kWARN,
+                  "Manual Connect called while already connecting or connected. "
+                  "Resetting retry state only.");
+        if (reset_retry_state) {
+            reconnect_attempts_ = 0;
+            current_backoff_delay_ms_ = kInitialBackoffMs;
+            last_disconnect_time_ms_ = 0; // Allow immediate retry by Process if currently WAITING
         }
-    }
-    // Add verbose logging if needed: LOG_PRINT(log_print::kVERBOSE, TAG, "Process: State=%d", (int)state);
-}
-
-// --- Data Sending Logic ---
-bool CloudComm::SendTimeSeriesData(const rapidjson::Value& data, int qos) { if (!IsConnected()) { LOG_PRINT(log_print::kWARN, TAG, "Not connected"); return false; } char topic_buffer[AwsIot::kMaxTopicLen]; if (!BuildTopicString(topic_buffer, sizeof(topic_buffer), kTimeSeriesTopicSuffix)) return false; LOG_PRINT(log_print::kDEBUG1, TAG, "Sending time series data to topic: %s", topic_buffer); return PublishJsonToTopic(topic_buffer, data, qos); }
-bool CloudComm::SendStatusReport(const rapidjson::Value& data, int qos) { if (!IsConnected()) { LOG_PRINT(log_print::kWARN, TAG, "Not connected"); return false; } if (!data.IsObject()) { LOG_PRINT(log_print::kERROR, TAG, "Status data must be object"); return false; } char topic_buffer[AwsIot::kMaxTopicLen]; if (!BuildTopicString(topic_buffer, sizeof(topic_buffer), kStatusTopicSuffix)) return false; LOG_PRINT(log_print::kDEBUG1, TAG, "Sending status report to topic: %s", topic_buffer); return PublishJsonToTopic(topic_buffer, data, qos); }
-bool CloudComm::SendEvent(const char* event_type, const rapidjson::Value& data, int qos) { if (!IsConnected()) { LOG_PRINT(log_print::kWARN, TAG, "Not connected"); return false; } if (!event_type || event_type[0] == '\0' || !data.IsObject()) { LOG_PRINT(log_print::kERROR, TAG, "Invalid event args"); return false; } char topic_buffer[AwsIot::kMaxTopicLen]; if (!BuildTopicString(topic_buffer, sizeof(topic_buffer), kEventTopicSuffix)) return false; rapidjson::Document event_doc(rapidjson::kObjectType); auto& allocator = event_doc.GetAllocator(); event_doc.AddMember("event_type", rapidjson::StringRef(event_type), allocator); event_doc.AddMember("details", rapidjson::Value(data, allocator).Move(), allocator); LOG_PRINT(log_print::kDEBUG1, TAG, "Sending event '%s' to topic: %s", event_type, topic_buffer); return PublishJsonToTopic(topic_buffer, event_doc, qos); }
-bool CloudComm::ReportCurrentState(const rapidjson::Value& reported_state, int qos) { if (!IsConnected()) { LOG_PRINT(log_print::kWARN, TAG,"Not connected"); return false; } if (!reported_state.IsObject()) { LOG_PRINT(log_print::kERROR, TAG,"Reported state must be object"); return false; } rapidjson::Document shadow_doc(rapidjson::kObjectType); auto& allocator = shadow_doc.GetAllocator(); rapidjson::Value state_val(rapidjson::kObjectType); state_val.AddMember("reported", rapidjson::Value(reported_state, allocator).Move(), allocator); shadow_doc.AddMember("state", state_val, allocator); rapidjson::StringBuffer string_buffer; rapidjson::Writer<rapidjson::StringBuffer> writer(string_buffer); shadow_doc.Accept(writer); const char* json_string = string_buffer.GetString(); size_t json_len = string_buffer.GetSize(); LOG_PRINT(log_print::kDEBUG1, TAG, "Reporting current state to shadow (%zu bytes): %s", json_len, json_string); return aws_mqtt_client_.UpdateShadow(std::string_view(json_string, json_len), qos); }
-
-// --- Callback Setters ---
-void CloudComm::SetControlCommandCallback(ControlCommandCallback callback) { control_command_callback_ = std::move(callback); LOG_PRINT(log_print::kINFO, TAG,"Control cb set"); }
-void CloudComm::SetConnectionStatusCallback(ConnectionStatusCallback callback) { connection_status_callback_ = std::move(callback); LOG_PRINT(log_print::kINFO, TAG,"Connection cb set"); }
-
-// --- Private Helper Methods ---
-bool CloudComm::LoadCertificateFromFile(const char* full_path, char* buffer, std::size_t buffer_size) { if (!full_path || !buffer || buffer_size == 0) return false; memset(buffer, 0, buffer_size); std::ifstream file(full_path); if (!file.is_open()) { LOG_PRINT(log_print::kERROR, TAG, "Failed to open file: %s", full_path); return false; } file.read(buffer, buffer_size - 1); if (file.eof()) { buffer[file.gcount()] = '\0'; file.close(); return true; } else { if (file.fail()) { LOG_PRINT(log_print::kERROR, TAG, "File read failed: %s", full_path); } else { LOG_PRINT(log_print::kERROR, TAG, "Buffer too small for file: %s (Size: %zu)", full_path, buffer_size); } buffer[0] = '\0'; file.close(); return false; } }
-bool CloudComm::BuildTopicString(char* buffer, std::size_t buffer_len, const char* type_suffix) { if (!buffer || buffer_len == 0 || !type_suffix || thing_name_[0] == '\0') return false; int written = snprintf(buffer, buffer_len, "%s/%s%s", kDefaultTopicPrefix, thing_name_, type_suffix); if (written < 0 || static_cast<std::size_t>(written) >= buffer_len) { LOG_PRINT(log_print::kERROR, TAG, "BuildTopicString failed/truncated (suffix: %s, len: %zu)", type_suffix, buffer_len); buffer[0] = '\0'; return false; } return true; }
-bool CloudComm::PublishJsonToTopic(const char* topic, const rapidjson::Value& json_payload, int qos, bool retain) { rapidjson::StringBuffer string_buffer; rapidjson::Writer<rapidjson::StringBuffer> writer(string_buffer); json_payload.Accept(writer); const char* json_string = string_buffer.GetString(); size_t json_len = string_buffer.GetSize(); LOG_PRINT(log_print::kVERBOSE, TAG, "Publishing to %s (%zu bytes): %s", topic, json_len, json_string); return aws_mqtt_client_.Publish(topic, reinterpret_cast<const uint8_t*>(json_string), json_len, qos, retain); }
-void CloudComm::RequestShadowState() { LOG_PRINT(log_print::kINFO, TAG, "Requesting current shadow state..."); if (!aws_mqtt_client_.GetShadow("")) { LOG_PRINT(log_print::kERROR, TAG, "Failed to send shadow get request."); } }
-// AcknowledgeControlCommand removed
-void CloudComm::ProcessReceivedShadowDelta(const rapidjson::Value& delta_state) { if (!control_command_callback_) { LOG_PRINT(log_print::kDEBUG1, TAG, "Shadow delta received, but no control command callback registered."); return; } if (!delta_state.IsObject()) { LOG_PRINT(log_print::kERROR, TAG, "ProcessReceivedShadowDelta called with non-object."); return; } LOG_PRINT(log_print::kINFO, TAG, "Processing desired state delta for commands..."); for (auto itr = delta_state.MemberBegin(); itr != delta_state.MemberEnd(); ++itr ) { const char* key_ptr = itr->name.GetString(); const std::size_t key_len = itr->name.GetStringLength(); const rapidjson::Value& params = itr->value; char current_key[kMaxCommandKeyLen]; if (key_len >= sizeof(current_key)) { LOG_PRINT(log_print::kERROR, TAG, "Command key '%.*s...' too long (max %zu). Skipping.", 20, key_ptr, sizeof(current_key) - 1); continue; } memcpy(current_key, key_ptr, key_len); current_key[key_len] = '\0'; LOG_PRINT(log_print::kINFO, TAG, "Invoking callback for command: '%s'", current_key); bool success = control_command_callback_(current_key, params); if (success) { LOG_PRINT(log_print::kINFO, TAG, "Command '%s' processed successfully by application. Application should call ReportCurrentState().", current_key); } else { LOG_PRINT(log_print::kWARN, TAG, "Command '%s' processing failed per app callback.", current_key); } } LOG_PRINT(log_print::kINFO, TAG, "Finished processing shadow delta commands iteration."); }
-void CloudComm::ProcessReceivedShadowDocument(std::string_view /*payload*/) { rapidjson::Document doc; doc.ParseInsitu(json_parse_buffer_); if (doc.HasParseError()) { LOG_PRINT(log_print::kERROR, TAG,"Re-parse failed in ProcessReceivedShadowDocument"); return; } if (doc.HasMember("state") && doc["state"].IsObject()) { const auto& state_obj = doc["state"]; if (state_obj.HasMember("desired") && state_obj["desired"].IsObject()) { LOG_PRINT(log_print::kINFO, TAG, "Processing 'desired' state from received document."); ProcessReceivedShadowDelta(state_obj["desired"]); } else { LOG_PRINT(log_print::kDEBUG1, TAG, "Received document has no 'desired' state."); } } else { LOG_PRINT(log_print::kWARN, TAG, "Received document missing 'state' object."); } }
-void CloudComm::HandleShadowCallback(const std::string& update_type, std::string_view payload) { LOG_PRINT(log_print::kDEBUG1, TAG, "HandleShadowCallback: Type: '%s', Size: %zu", update_type.c_str(), payload.length()); if (payload.length() >= sizeof(json_parse_buffer_)) { LOG_PRINT(log_print::kERROR, TAG,"Shadow payload too large"); return; } memcpy(json_parse_buffer_, payload.data(), payload.length()); json_parse_buffer_[payload.length()] = '\0'; rapidjson::Document doc; doc.ParseInsitu(json_parse_buffer_); if (doc.HasParseError()) { LOG_PRINT(log_print::kERROR, TAG,"Shadow JSON parse error (type %s)", update_type.c_str()); return; } if (update_type == "delta") { if (doc.HasMember("state") && doc["state"].IsObject()) { ProcessReceivedShadowDelta(doc["state"]); } else { LOG_PRINT(log_print::kWARN, TAG, "Delta missing 'state' object."); } } else if (update_type == "accepted") { LOG_PRINT(log_print::kINFO, TAG, "Processing shadow accepted document."); ProcessReceivedShadowDocument(payload); } else if (update_type == "rejected") { LOG_PRINT(log_print::kWARN, TAG, "Received shadow operation rejection."); if (doc.HasMember("message") && doc["message"].IsString()) { LOG_PRINT(log_print::kWARN, TAG, " Rejection message: %s", doc["message"].GetString()); } } else { LOG_PRINT(log_print::kWARN, TAG, "Unhandled shadow callback type: %s", update_type.c_str()); } }
-
-// --- Internal Callbacks (Update State) ---
-void CloudComm::OnConnected() { LOG_PRINT(log_print::kINFO, TAG, "Internal: OnConnected event received."); reconnect_attempts_ = 0; current_backoff_delay_ms_ = kInitialBackoffMs; last_disconnect_time_ms_ = 0; current_state_.store(State::CONNECTED); if (connection_status_callback_) { connection_status_callback_(true); } RequestShadowState(); }
-void CloudComm::OnDisconnected() { HandleDisconnectInternal(); }
-
-
-} // namespace CloudComms
-
----------------------------------------------------------------------------------------------------------
-#include <stdio.h>
-#include <string.h>
-#include <string>
-#include <chrono>
-
-// Platform specific (ESP-IDF example)
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
-#include "esp_log.h"
-#include "esp_timer.h"
-#include "esp_spiffs.h"
-#include "esp_system.h"
-
-// CloudComm Module Header
-#include "cloud_comm.h" // Your CloudComm header
-
-// RapidJSON Headers (Needed by Application)
-#include "rapidjson/document.h"
-#include "rapidjson/writer.h"
-#include "rapidjson/stringbuffer.h" // Useful for creating reported state
-
-// --- Application TAG ---
-static const char* APP_TAG = "ShadowExampleApp";
-
-// --- EXAMPLE LOG_PRINT Implementation ---
-// Define this properly according to your logging framework
-namespace log_print { enum LogLevel { kERROR, kWARN, kINFO, kDEBUG1, kVERBOSE }; }
-#ifndef LOG_PRINT
-#define LOG_PRINT(level, tag, format, ...) do { /* Your logging implementation */ \
-    switch(level) { \
-        case log_print::kERROR:   ESP_LOGE(tag, format, ##__VA_ARGS__); break; \
-        case log_print::kWARN:    ESP_LOGW(tag, format, ##__VA_ARGS__); break; \
-        case log_print::kINFO:    ESP_LOGI(tag, format, ##__VA_ARGS__); break; \
-        case log_print::kDEBUG1:  ESP_LOGD(tag, format, ##__VA_ARGS__); break; \
-        case log_print::kVERBOSE: ESP_LOGV(tag, format, ##__VA_ARGS__); break; \
-        default:                  ESP_LOGI(tag, format, ##__VA_ARGS__); break; \
-    } \
-} while(0)
-#endif // LOG_PRINT
-// --- End EXAMPLE LOG_PRINT ---
-
-
-// --- Global CloudComm instance ---
-CloudComms::CloudComm cloud_comm;
-
-// --- Placeholder for actual device state/actions ---
-static bool g_current_led_state = false;
-static int g_current_report_interval = 60;
-
-// Function to set hardware AND update internal state variable
-void SetDeviceLedState(bool on) {
-    g_current_led_state = on;
-    LOG_PRINT(log_print::kINFO, APP_TAG, "Hardware: Setting LED to %s", on ? "ON" : "OFF");
-    // TODO: Add actual hardware control code
-}
-
-// Function to get current state
-bool GetDeviceLedState() {
-    // TODO: Read actual hardware state if possible, otherwise return variable
-    return g_current_led_state;
-}
-
-// Function to set config AND update internal state variable
-void SetDeviceReportInterval(int interval_sec) {
-     if (interval_sec >= 5 && interval_sec <= 3600) { // Example validation
-        g_current_report_interval = interval_sec;
-        LOG_PRINT(log_print::kINFO, APP_TAG, "Config: Setting report interval to %d sec", interval_sec);
-        // TODO: Store persistently if needed
-     } else {
-         LOG_PRINT(log_print::kWARN, APP_TAG, "Config: Invalid report interval %d rejected.", interval_sec);
-         // Optional: Throw an error or return false if SetDeviceReportInterval could fail
-     }
-}
-
-int GetDeviceReportInterval() {
-    return g_current_report_interval;
-}
-
-void TriggerReboot() {
-    LOG_PRINT(log_print::kWARN, APP_TAG, "Hardware: Rebooting system in 5 seconds...");
-    vTaskDelay(pdMS_TO_TICKS(5000));
-    esp_restart();
-}
-
-// --- Application Callback Implementations ---
-
-void HandleConnectionStatus(bool connected) {
-    LOG_PRINT(log_print::kINFO, APP_TAG, "Application Notified: Connection Status = %s", connected ? "CONNECTED" : "DISCONNECTED");
-    // Informational only for the app. CloudComm::Process handles retries.
-}
-
-/**
- * @brief Handles control commands received from the cloud via Shadow delta or initial Get.
- * @return True if command processing was successful, False otherwise.
- */
-bool HandleControlCommand(const char* command_name, const rapidjson::Value& params) {
-    LOG_PRINT(log_print::kINFO, APP_TAG, "Application Handling Command: '%s'", command_name);
-    bool success = false;
-
-    // Prepare a document *ONLY* for reporting the state *back* if successful
-    rapidjson::Document reported_state_update(rapidjson::kObjectType);
-    auto& allocator = reported_state_update.GetAllocator();
-
-    // --- Process Specific Commands ---
-    if (strcmp(command_name, "reboot") == 0) {
-        LOG_PRINT(log_print::kWARN, APP_TAG, "Reboot command executing...");
-        // No state to report back before rebooting
-        TriggerReboot();
-        success = true; // Technically won't return, but mark as success if scheduled
-
-    } else if (strcmp(command_name, "set_led") == 0) {
-        if (!params.IsObject() || !params.HasMember("state") || !params["state"].IsBool()) {
-            LOG_PRINT(log_print::kERROR, APP_TAG, "Invalid params for set_led.");
-            success = false;
-        } else {
-            bool desired_state = params["state"].GetBool();
-            SetDeviceLedState(desired_state); // Perform the action
-            success = true; // Assume hardware control worked
-
-            // *** Prepare the reported state update ***
-            if (success) {
-                 // Use a key representing the actual device state
-                 reported_state_update.AddMember("led_is_on", GetDeviceLedState(), allocator);
-            }
-        }
-    } else if (strcmp(command_name, "update_config") == 0) {
-         if (!params.IsObject()) {
-             LOG_PRINT(log_print::kERROR, APP_TAG, "Invalid params for update_config.");
-             success = false;
-         } else {
-             LOG_PRINT(log_print::kINFO, APP_TAG, "Processing configuration update...");
-             bool config_changed = false;
-             // Example: Extract reporting interval
-             if (params.HasMember("report_interval_sec") && params["report_interval_sec"].IsInt()) {
-                 int requested_interval = params["report_interval_sec"].GetInt();
-                 int current_interval = GetDeviceReportInterval();
-                 // Only apply and report if the value is valid and different
-                 if (requested_interval >= 5 && requested_interval <= 3600 && requested_interval != current_interval) {
-                     SetDeviceReportInterval(requested_interval);
-                     // *** Prepare the reported state update ***
-                     reported_state_update.AddMember("report_interval_sec", GetDeviceReportInterval(), allocator);
-                     config_changed = true;
-                 } else if (requested_interval == current_interval) {
-                      LOG_PRINT(log_print::kINFO, APP_TAG,"Requested interval matches current value.");
-                      // No actual change, but command is "handled"
-                      config_changed = false; // Set flag explicitly
-                 } else {
-                      LOG_PRINT(log_print::kWARN, APP_TAG,"Requested interval %d invalid/rejected.", requested_interval);
-                      // Config not changed for this parameter
-                 }
-             }
-             // TODO: Process other config parameters...
-
-             // Determine overall success (e.g., true if no errors encountered, even if no change made)
-             success = true;
-
-             // *** Handle reporting for config update ***
-             if (success && !config_changed && !params.ObjectEmpty()) {
-                 // If command was valid but caused no state change (e.g., value already set),
-                 // report the command key itself back as null to clear the desired state.
-                  reported_state_update.AddMember(rapidjson::StringRef(command_name), // Copy key name
-                                                 rapidjson::Value(), // JSON null
-                                                 allocator);
-             }
-             // If config_changed is true, the specific changed values are already in reported_state_update
-         }
-    } else {
-        LOG_PRINT(log_print::kWARN, APP_TAG, "Unknown command received: %s", command_name);
-        success = false; // Indicate failure: Unknown command
-    }
-
-
-    // --- IMPORTANT: Call ReportCurrentState IF successful AND there is state to report ---
-    // This updates the 'reported' section and implicitly clears the 'desired' key
-    if (success && reported_state_update.MemberCount() > 0) { // Check if we actually added members
-        LOG_PRINT(log_print::kINFO, APP_TAG, "Reporting state back to shadow after processing '%s'.", command_name);
-        if (!cloud_comm.ReportCurrentState(reported_state_update)) {
-            LOG_PRINT(log_print::kWARN, APP_TAG, "Failed to queue state report for command '%s'. Shadow 'desired' state may persist.", command_name);
-        }
-    } else if (success) {
-         LOG_PRINT(log_print::kINFO, APP_TAG, "Command '%s' processed successfully, but no specific state to report back.", command_name);
-         // This might happen for commands like 'reboot' or simple actions.
-         // The desired state might persist if not explicitly cleared by reporting null for the key,
-         // but often this is acceptable for action-only commands. Alternatively, report null:
-         // rapidjson::Document null_ack(rapidjson::kObjectType);
-         // null_ack.AddMember(rapidjson::StringRef(command_name), rapidjson::Value(), null_ack.GetAllocator());
-         // cloud_comm.ReportCurrentState(null_ack);
-    }
-    // If success is false, we do nothing, letting the desired state persist.
-    // -----------------------------------------------------------------------------
-
-    return success; // Return overall status for CloudComm internal logging
-}
-
-// --- Filesystem Initialization (Example) ---
-bool init_filesystem() { /* ... Assume implementation works ... */ LOG_PRINT(log_print::kINFO, APP_TAG,"FS Init done."); return true; }
-
-
-// --- Main Application Task ---
-extern "C" void app_main(void)
-{
-    LOG_PRINT(log_print::kINFO, APP_TAG, "Starting Application...");
-    if (!init_filesystem()) { /* ... handle error ... */ return; }
-
-    // --- Prepare CloudComm Configuration ---
-    CloudComms::CloudCommConfig config = {};
-    // !! IMPORTANT: Populate with YOUR details and FULL paths !!
-    const char* endpoint = "your_endpoint.amazonaws.com"; // CHANGE
-    const char* client_id = "your_client_id";              // CHANGE
-    const char* thing_name = "your_thing_name";            // CHANGE
-    const char* ca_path = "/spiffs/ca.pem";              // CHANGE
-    const char* cert_path = "/spiffs/cert.pem";            // CHANGE
-    const char* key_path = "/spiffs/key.pem";            // CHANGE
-    strncpy(config.aws_endpoint, endpoint, sizeof(config.aws_endpoint) - 1);
-    strncpy(config.client_id, client_id, sizeof(config.client_id) - 1);
-    strncpy(config.thing_name, thing_name, sizeof(config.thing_name) - 1);
-    strncpy(config.root_ca_path, ca_path, sizeof(config.root_ca_path) - 1);
-    strncpy(config.device_cert_path, cert_path, sizeof(config.device_cert_path) - 1);
-    strncpy(config.private_key_path, key_path, sizeof(config.private_key_path) - 1);
-    // Ensure null termination (safer if source strings might not be)
-    config.aws_endpoint[sizeof(config.aws_endpoint)-1] = '\0';
-    // ... null terminate others ...
-
-    // --- Initialize CloudComm ---
-    if (!cloud_comm.Initialize(config)) { /* ... handle error ... */ return; }
-
-    // --- Register Callbacks ---
-    cloud_comm.SetConnectionStatusCallback(HandleConnectionStatus);
-    cloud_comm.SetControlCommandCallback(HandleControlCommand);
-
-    // --- Initiate Connection ---
-    LOG_PRINT(log_print::kINFO, APP_TAG, "Initiating connection...");
-    cloud_comm.Connect(true); // Start connection attempts
-
-    // --- Main Application Loop ---
-    uint64_t loop_counter = 0;
-    uint32_t last_proactive_report_time = 0;
-    uint32_t proactive_report_interval_ms = 30000; // Report state every 30s
-
-    while (true) {
-        // --- CRITICAL: Call Process() periodically ---
-        cloud_comm.Process(); // Handles connection state & reconnect timing
-
-        uint64_t now_ms = cloud_comm.GetTimestampMs();
-
-        // --- Application Logic ---
-        if (cloud_comm.IsConnected()) {
-
-            // --- Proactive State Reporting (Example) ---
-            // Report state even if no command was received
-            if ((now_ms - last_proactive_report_time) >= proactive_report_interval_ms) {
-                 last_proactive_report_time = now_ms;
-                 LOG_PRINT(log_print::kINFO, APP_TAG, "Proactively reporting current state...");
-                 rapidjson::Document current_state_doc(rapidjson::kObjectType);
-                 auto& allocator = current_state_doc.GetAllocator();
-                 // Include important current state values
-                 current_state_doc.AddMember("led_is_on", GetDeviceLedState(), allocator);
-                 current_state_doc.AddMember("uptime_seconds", (uint32_t)(loop_counter), allocator);
-                 current_state_doc.AddMember("report_interval_sec", GetDeviceReportInterval(), allocator);
-                 // current_state_doc.AddMember("rssi", GetRssi(), allocator); // Add other state...
-
-                 if (!cloud_comm.ReportCurrentState(current_state_doc)) {
-                      LOG_PRINT(log_print::kWARN, APP_TAG, "Failed to queue proactive state report.");
-                 }
-            }
-
-            // Send other telemetry data...
-            // if ((loop_counter % 10) == 0) { /* ... SendTimeSeriesData ... */ }
-
-
-        } else {
-            LOG_PRINT(log_print::kDEBUG1, APP_TAG, "Waiting for connection...");
-        }
-
-        // Other application tasks...
-
-        // --- Delay ---
-        vTaskDelay(pdMS_TO_TICKS(1000)); // Call Process() approx every second
-        loop_counter++;
-    }
-}
-
----------------------------------------------------------------------------------------------------
-/**
- * @brief Manually initiates a connection attempt OR resets the retry cycle.
- * Typically only needed if automatic connection via Process() needs to be preempted
- * or if forcing a reconnect after manual Disconnect().
- */
-bool CloudComm::Connect(bool reset_retry_state) {
-    State current = current_state_.load();
-    LOG_PRINT(log_print::kINFO, TAG, "Manual Connect requested (reset_retry=%s). Current state: %d",
-             reset_retry_state ? "true" : "false", static_cast<int>(current));
-
-    if (current == State::UNINITIALIZED) { LOG_PRINT(log_print::kERROR, TAG, "Cannot connect: Not initialized."); return false; }
-    if (current == State::CONNECTING || current == State::CONNECTED || current == State::CONNECTED_GETTING_SHADOW) {
-        LOG_PRINT(log_print::kWARN, TAG, "Manual Connect called while already connecting, getting shadow, or connected. Resetting retry state only.");
-        if(reset_retry_state) {
-             reconnect_attempts_ = 0;
-             current_backoff_delay_ms_ = kInitialBackoffMs;
-             last_disconnect_time_ms_ = 0; // Allow immediate retry by Process if currently WAITING
-        }
-        return true; // Indicate it's already active or state was reset
+        return true;
     }
 
     // If DISCONNECTED or WAITING_TO_RETRY, reset state if requested and attempt connect immediately
     if (reset_retry_state) {
-        LOG_PRINT(log_print::kDEBUG1, TAG, "Resetting reconnect state due to manual connect call.");
+        LOG_PRINT(log_print::kDEBUG1, "Resetting reconnect state due to manual connect call.");
         reconnect_attempts_ = 0;
         current_backoff_delay_ms_ = kInitialBackoffMs;
         last_disconnect_time_ms_ = 0;
     }
+
     // Attempt connection immediately, regardless of backoff timer when called manually
     return AttemptReconnect();
 }
 
-/** @brief Internal function that actually calls the underlying client connect */
-bool CloudComm::AttemptReconnect() { /* ... Same logic, sets state to CONNECTING ... */ }
-/** @brief Disconnects from the broker. */
-void CloudComm::Disconnect() { /* ... Same: Sets state=DISCONNECTED, resets retry state, calls client disconnect ... */ }
-/** @brief Checks connection status. */
-bool CloudComm::IsConnected() const { /* ... Same ... */ }
-/** @brief Helper to get timestamp. */
-uint64_t CloudComm::GetTimestampMs() { /* ... Same ... */ }
-/** @brief Handles internal disconnect logic. */
-void CloudComm::HandleDisconnectInternal() { /* ... Same logic, sets state=WAITING_TO_RETRY, calculates backoff ... */ }
+void CloudComm::Disconnect() {
+    LOG_PRINT(log_print::kINFO, "Disconnect requested by application.");
+    State previous_state = current_state_.exchange(State::DISCONNECTED); // Atomically set state
 
-// --- Process Function ---
+    if (previous_state != State::UNINITIALIZED && previous_state != State::DISCONNECTED) {
+        LOG_PRINT(log_print::kDEBUG1, "Calling underlying MQTT disconnect.");
+        aws_mqtt_client_.Disconnect();
+    } else {
+        LOG_PRINT(log_print::kDEBUG1, "Already disconnected or uninitialized.");
+    }
+
+    // Reset connection state regardless of previous state
+    reconnect_attempts_ = 0;
+    current_backoff_delay_ms_ = kInitialBackoffMs;
+    last_disconnect_time_ms_ = 0;
+
+    // Also clear any pending report on explicit disconnect
+    {
+        platform::mutex::LockGuard lock(pending_report_mutex_);
+        shadow_report_pending_.store(false, std::memory_order_relaxed); // Relaxed ok inside lock
+        pending_shadow_report_payload_.clear();
+    }
+     // Reset shadow flags as well
+    initial_shadow_received_ = false;
+    get_shadow_attempts_ = 0;
+    last_get_shadow_attempt_ms_ = 0;
+    current_get_shadow_backoff_ms_ = kGetShadowRetryBaseMs;
+}
+
+bool CloudComm::IsConnected() const {
+    return (current_state_.load() == State::CONNECTED);
+}
+
 void CloudComm::Process() {
     State state = current_state_.load();
-    uint64_t now_ms = GetTimestampMs(); // Get time once
 
     switch (state) {
         case State::DISCONNECTED: {
-            // --- NEW: Auto-initiate connection from DISCONNECTED state ---
-            // This assumes Process() is only called when prerequisites (like Wi-Fi) are met.
-            LOG_PRINT(log_print::kINFO, TAG, "Process: State is DISCONNECTED, attempting initial connect...");
-            AttemptReconnect(); // This changes state to CONNECTING if successful
-            // Note: If AttemptReconnect fails immediately, state becomes WAITING_TO_RETRY,
-            // which will be handled on the *next* Process() call's timing check.
+            // Waiting for manual Connect() or external event.
+            LOG_PRINT(log_print::kDEBUG4,"Process: State is DISCONNECTED.");
             break;
-            // --- End New Logic ---
-            }
+        }
         case State::WAITING_TO_RETRY: {
-            if (now_ms >= (last_disconnect_time_ms_ + current_backoff_delay_ms_)) {
-                LOG_PRINT(log_print::kINFO, TAG, "Process: Reconnect timer elapsed. Attempting reconnect...");
-                AttemptReconnect(); // Changes state to CONNECTING if successful
+            if (system_uptime::ExceedsMs(last_disconnect_time_ms_, current_backoff_delay_ms_)) {
+                LOG_PRINT(log_print::kINFO,
+                          "Process: Reconnect timer elapsed. Attempting reconnect...");
+                AttemptReconnect(); // This will change state to CONNECTING if successful
+            } else {
+                 LOG_PRINT(log_print::kDEBUG4,"Process: State is WAITING_TO_RETRY.");
             }
             break;
         }
-        case State::CONNECTED_GETTING_SHADOW: {
-            if (initial_shadow_received_) {
-                LOG_PRINT(log_print::kINFO, TAG, "Process: Initial shadow received. Transitioning to CONNECTED.");
-                current_state_.store(State::CONNECTED);
-                break;
-            }
-            if (get_shadow_attempts_ >= kMaxGetShadowAttempts) {
-                LOG_PRINT(log_print::kERROR, TAG, "Process: Max GetShadow attempts reached. Giving up. Transitioning to CONNECTED.");
-                current_state_.store(State::CONNECTED);
-                break;
-            }
-            if (now_ms >= (last_get_shadow_attempt_ms_ + current_get_shadow_backoff_ms_)) {
-                LOG_PRINT(log_print::kINFO, TAG, "Process: Attempting GetShadow (Attempt #%d)...", get_shadow_attempts_ + 1);
-                RequestShadowState();
-                last_get_shadow_attempt_ms_ = now_ms;
-                get_shadow_attempts_++;
-                current_get_shadow_backoff_ms_ = std::min(current_get_shadow_backoff_ms_ + kGetShadowRetryBaseMs, kMaxGetShadowRetryMs);
-                LOG_PRINT(log_print::kDEBUG1, TAG, "Next GetShadow attempt in %u ms.", current_get_shadow_backoff_ms_);
-            }
-            break;
+        case State::CONNECTED: {
+             LOG_PRINT(log_print::kDEBUG4,"Process: State is CONNECTED.");
+            // --- Check for pending shadow report ---
+            if (shadow_report_pending_.load(std::memory_order_acquire)) {
+                std::string payload_to_send;
+                bool report_was_pending = false;
+                { // Mutex scope
+                    platform::mutex::LockGuard lock(pending_report_mutex_);
+                    // Re-check flag inside lock to handle race where flag was cleared between outer check and acquiring lock
+                    if (shadow_report_pending_.load(std::memory_order_relaxed)) { // Relaxed is fine inside lock
+                         payload_to_send = std::move(pending_shadow_report_payload_);
+                         pending_shadow_report_payload_.clear();
+                         shadow_report_pending_.store(false, std::memory_order_relaxed); // Clear flag inside lock
+                         report_was_pending = true;
+                    }
+                } // Mutex released
+
+                if (report_was_pending && !payload_to_send.empty()) {
+                     LOG_PRINT(log_print::kINFO, "Process: Sending pending shadow state report (%zu bytes)...", payload_to_send.length());
+                     // Perform potentially blocking call OUTSIDE the mutex lock
+                     if (!aws_mqtt_client_.UpdateShadow(std::string_view(payload_to_send))) {
+                         LOG_PRINT(log_print::kERROR, "Process: Failed to send pending shadow update via MQTT client.");
+                         // Failure here doesn't reset the flag; the report payload is consumed.
+                         // The system will rely on the next delta or application action to try again if needed.
+                     } else {
+                         LOG_PRINT(log_print::kDEBUG1, "Process: Pending shadow report sent successfully.");
+                     }
+                }
+            } // End check for pending report
+
+            // --- Poll for initial shadow if needed ---
+            PollShadow();
+
+            // --- Send Log Events ---
+            // SendLogEvent(); // Call if desired
+
+            // --- Send Backlogged Data ---
+            // Add logic here if Process() should handle sending backlogged data
+            // e.g., SendNextBacklogItem();
+
+            break; // End CONNECTED case
         }
-        case State::CONNECTING:
-             LOG_PRINT(log_print::kVERBOSE, TAG, "Process: In CONNECTING state...");
-             // Optional: Add a timeout here?
+        case State::CONNECTING: {
+             // Waiting for OnConnected or OnDisconnected callback from underlying client
+             LOG_PRINT(log_print::kDEBUG3, "Process: State is CONNECTING. Waiting for connection result...");
+             // Optional: Add a timeout check for the CONNECTING state here?
              break;
-        case State::CONNECTED:
-             LOG_PRINT(log_print::kVERBOSE, TAG, "Process: In CONNECTED state.");
-             break;
+        }
         case State::UNINITIALIZED:
-             // Do nothing
-             break;
+        default:
+            // Do nothing
+             LOG_PRINT(log_print::kDEBUG4,"Process: State is UNINITIALIZED or unknown (%d).", (int)state);
+            break;
+    } // End switch(state)
+
+     // Yield or process underlying client events periodically regardless of state (MANDATORY for many clients)
+    aws_mqtt_client_.Yield(); // Replace Yield() with the actual function name if different (e.g., loop(), ProcessLoop())
+}
+
+
+bool CloudComm::SendDataToCloud(uint8_t packet_type, const void* packet_data, size_t packet_size) {
+    if (packet_type >= TOTAL_STATUS_PACKET_TYPES) { // Assuming TOTAL_STATUS_PACKET_TYPES is defined
+         LOG_PRINT(log_print::kERROR, "SendDataToCloud: Invalid packet_type: %u", packet_type);
+         return false;
+    }
+    if (!packet_data || packet_size == 0) {
+         LOG_PRINT(log_print::kERROR, "SendDataToCloud: Invalid packet data or size for type %u.", packet_type);
+         return false;
+    }
+
+
+    if (IsConnected()) {
+        LOG_PRINT(log_print::kDEBUG1, "SendDataToCloud: Connected. Sending Packet Type: %u, Size: %zu", packet_type, packet_size);
+        rapidjson::Document data_doc; // Use Document for allocator ownership
+        rapidjson::Document::AllocatorType& allocator = data_doc.GetAllocator();
+        data_doc.SetObject();
+
+        // Create the JSON payload using the provided function (ensure it exists and works)
+        if (!CreateStatusPacketJSON(data_doc, allocator, packet_type, packet_data)) {
+             LOG_PRINT(log_print::kERROR, "SendDataToCloud: Failed to create JSON for packet type %u", packet_type);
+             return false;
+        }
+
+        last_backlog_packet_sent_time_ = system_uptime::GetMs(); // Record time even if publish fails? Maybe only on success.
+
+        // Determine the correct topic
+        const char* topic_to_use = nullptr;
+        if (packet_type == PACKET_TYPE_ENV_SENSOR_DATA) { // Assuming these constants exist
+            topic_to_use = timeseries_topic_;
+        } else {
+            topic_to_use = status_topic_; // Default topic for other types
+        }
+
+         bool success = PublishJsonToTopic(topic_to_use, data_doc); // Pass the Document
+
+         if (success) {
+              last_backlog_packet_sent_time_ = system_uptime::GetMs(); // Update time on success
+              if (packet_type != PACKET_TYPE_ENV_SENSOR_DATA) {
+                   // Clear corresponding non-timeseries backlog entry *after* successful send.
+                   // Assuming AddStatusData with size 0 means 'clear' or 'mark sent'
+                   backlog_packets_.AddStatusData(packet_type, nullptr, 0); // Use nullptr for data
+              }
+         }
+         return success;
+
+    } else {
+        // Not connected, add to backlog
+        LOG_PRINT(log_print::kWARN, "SendDataToCloud: Not connected. Backlogging packet type %u.", packet_type);
+        if (packet_type == PACKET_TYPE_ENV_SENSOR_DATA) {
+            // Assuming AddData is for timeseries backlog
+            return backlog_packets_.AddData(packet_type, static_cast<const uint8_t*>(packet_data), packet_size);
+        } else {
+            // Assuming AddStatusData is for other status/event backlog
+            return backlog_packets_.AddStatusData(packet_type, static_cast<const uint8_t*>(packet_data), packet_size);
+        }
+        // Return value indicates success/failure of backlogging operation itself
     }
 }
 
--------------------------------------------------------------------------------------------------------------------------------------------
-
-#include "cloud_comm.h" // To call cloud_comm.ReportCurrentState
-#include <cstring>      // For strcmp
-#include <vector>       // Example: Store schedule items
-
-// --- Include your logging header/macro ---
-// Assuming LOG_PRINT and log_print::LogLevel defined
-#ifndef LOG_PRINT
-#define LOG_PRINT(level, tag, format, ...) printf(/* Your log impl */)
-#endif
-static const char* APP_TAG = "MyAppCallbacks";
-// ----------------------------------------
-
-// --- Include RapidJSON headers needed by the callback ---
-#include "rapidjson/document.h"
-#include "rapidjson/writer.h"       // Potentially useful for logging params
-#include "rapidjson/stringbuffer.h" // Potentially useful for logging params
-// ------------------------------------------------------
-
-// --- Access to CloudComm instance (assuming global or accessible) ---
-extern CloudComms::CloudComm cloud_comm;
-// -------------------------------------------------------------------
-
-// --- Placeholder application state variables and functions ---
-// Replace these with your actual application logic and state variables
-static bool g_light_on_24x7 = true; // Example state
-static std::string g_op_mode = "CONTINUOUS"; // Example state
-static int g_local_op_mode = 1; // Example state
-
-struct ScheduleEntry {
-    int start_time;
-    int end_time;
-    std::string mode;
-    std::string rc; // Assuming rc is a string, adjust if it's truly hex later
-};
-static std::vector<ScheduleEntry> g_schedule; // Example storage
-
-void SetLightOn24x7(bool on) { g_light_on_24x7 = on; LOG_PRINT(log_print::kINFO, APP_TAG, "App State: LightOn24x7 set to %d", (int)on); }
-bool GetLightOn24x7() { return g_light_on_24x7; }
-
-void SetOperatingMode(const char* mode) { g_op_mode = mode; LOG_PRINT(log_print::kINFO, APP_TAG, "App State: OpMode set to %s", mode); }
-const char* GetOperatingModeString() { return g_op_mode.c_str(); } // Return C-string
-
-void SetLocalOperationMode(int mode) { g_local_op_mode = mode; LOG_PRINT(log_print::kINFO, APP_TAG, "App State: LocalOpMode set to %d", mode); }
-int GetLocalOperationMode() { return g_local_op_mode; }
-
-// Example function to process and store the received schedule
-bool UpdateDeviceSchedule(const rapidjson::Value& schedule_array) {
-    LOG_PRINT(log_print::kINFO, APP_TAG, "Updating device schedule...");
-    std::vector<ScheduleEntry> new_schedule; // Build new schedule
-    bool parse_ok = true;
-
-    if (!schedule_array.IsArray()) {
-        LOG_PRINT(log_print::kERROR, APP_TAG, "Schedule update failed: Input is not an array.");
+bool CloudComm::SendLogEvent() {
+    if (!IsConnected()) {
+        LOG_PRINT(log_print::kDEBUG2, "SendLogEvent: Cannot send, not connected.");
         return false;
     }
 
-    for (const auto& item : schedule_array.GetArray()) {
-        if (!item.IsObject()) { LOG_PRINT(log_print::kWARN, APP_TAG, "Schedule item not an object, skipping."); parse_ok = false; continue; }
+    // Check if it's time to check for logs
+    if (system_uptime::ExceedsMs(last_log_event_send_check_time_, kLogEventSendIntervalMs)) {
+        last_log_event_send_check_time_ = system_uptime::GetMs();
 
-        // Validate and extract members
-        if (!item.HasMember("st") || !item["st"].IsInt() ||
-            !item.HasMember("et") || !item["et"].IsInt() ||
-            !item.HasMember("m") || !item["m"].IsString() ||
-            !item.HasMember("rc") || !item["rc"].IsString()) // Assuming rc is string for now
-        {
-            LOG_PRINT(log_print::kWARN, APP_TAG, "Invalid schedule item format, skipping.");
-            parse_ok = false;
-            continue;
+        // Check if log_transfer has an event
+        uint8_t buffer[128]; // Adjust buffer size as needed
+        uint32_t event_code = 0;
+        uint64_t timestamp = 0;
+
+        // Assuming GetLogEvent returns true if an event is available
+        if (log_transfer::GetLogEvent(&event_code, &timestamp)) {
+            size_t size =
+                log_transfer::CreateLogEvent(event_code, timestamp, buffer, sizeof(buffer));
+
+            if (size > 0 && size < sizeof(buffer)) { // Check size validity
+                LOG_PRINT(log_print::kDEBUG1, "Sending log event: Code=%u, Timestamp=%llu, Size=%zu",
+                         event_code, timestamp, size);
+                // Publish directly using AwsIotMqttClient
+                if (aws_mqtt_client_.Publish(logger_topic_, buffer, size)) {
+                    // Optional: Add logic here if GetLogEvent needs confirmation before removing the event.
+                    return true; // Successfully published
+                } else {
+                     LOG_PRINT(log_print::kERROR, "Failed to publish log event to topic: %s", logger_topic_);
+                     // Optional: Put the event back? Or retry later? Current code just fails for this attempt.
+                     return false; // Publish failed
+                }
+            } else {
+                 LOG_PRINT(log_print::kERROR, "Failed to create log event payload (size %zu).", size);
+                 return false; // Payload creation failed
+            }
+        } else {
+            // No log event currently available
+            LOG_PRINT(log_print::kDEBUG4, "No log event available to send.");
+            return false; // No event to send
         }
+    }
+     return false; // Not time to check yet
+}
 
-        ScheduleEntry entry;
-        entry.start_time = item["st"].GetInt();
-        entry.end_time = item["et"].GetInt();
-        entry.mode = item["m"].GetString();
-        entry.rc = item["rc"].GetString(); // Store rc as string
-
-        // Add more validation (e.g., start < end, time ranges valid)
-        // ...
-
-        new_schedule.push_back(entry);
-         LOG_PRINT(log_print::kDEBUG1, APP_TAG, "Parsed schedule item: st=%d, et=%d, m=%s, rc=%s",
-                  entry.start_time, entry.end_time, entry.mode.c_str(), entry.rc.c_str());
+bool CloudComm::ReportCurrentState(const rapidjson::Value& reported_state, int qos) {
+    // This function is for *proactive* reporting initiated by the application.
+    if (!IsConnected()) {
+        LOG_PRINT(log_print::kWARN, "ReportCurrentState: Cannot report, not connected.");
+        return false;
+    }
+    if (!reported_state.IsObject()) {
+        LOG_PRINT(log_print::kERROR, "ReportCurrentState: Input 'reported_state' must be a JSON object.");
+        return false;
     }
 
-    // Atomically update the application's schedule
-    // (Could use mutexes here in a real multi-threaded app)
-    g_schedule = std::move(new_schedule);
-    LOG_PRINT(log_print::kINFO, APP_TAG, "Device schedule updated with %d entries.", g_schedule.size());
+    // Construct the full shadow update payload: {"state":{"reported":{...}}}
+    rapidjson::Document shadow_doc(rapidjson::kObjectType);
+    auto& allocator = shadow_doc.GetAllocator();
 
-    return parse_ok; // Return true if parsing finished, even if some items skipped (adjust as needed)
+    rapidjson::Value state_val(rapidjson::kObjectType);
+    // IMPORTANT: Need to deep copy the incoming reported_state using the allocator
+    state_val.AddMember("reported", rapidjson::Value(reported_state, allocator).Move(), allocator);
+
+    shadow_doc.AddMember("state", state_val, allocator);
+
+    // Serialize the document
+    rapidjson::StringBuffer string_buffer;
+    rapidjson::Writer<rapidjson::StringBuffer> writer(string_buffer);
+    shadow_doc.Accept(writer);
+
+    const char* json_string = string_buffer.GetString();
+    size_t json_len = string_buffer.GetSize();
+
+    LOG_PRINT(log_print::kINFO, "Reporting application-initiated state to shadow (%zu bytes): %s", json_len,
+              json_string);
+
+    // Publish using the underlying client's UpdateShadow method
+    return aws_mqtt_client_.UpdateShadow(std::string_view(json_string, json_len), qos);
 }
-// -----------------------------------------------------------
+
+void CloudComm::SetControlCommandCallback(ControlCommandCallback callback) {
+    control_command_callback_ = std::move(callback);
+    LOG_PRINT(log_print::kVERBOSE, "Control command callback registered.");
+}
+
+void CloudComm::SetConnectionStatusCallback(ConnectionStatusCallback callback) {
+    connection_status_callback_ = std::move(callback);
+    LOG_PRINT(log_print::kVERBOSE, "Connection status callback registered.");
+}
 
 
-/**
- * @brief Handles control commands received from the cloud via Shadow delta or initial Get.
- * @return True if command processing was successful, False otherwise.
- */
-bool HandleControlCommand(const char* command_name, const rapidjson::Value& params) {
-    LOG_PRINT(log_print::kINFO, APP_TAG, "HandleControlCommand: Received command '%s'", command_name);
-    bool success = false; // Assume failure initially
+// --- Private Helper Methods ---
 
-    // Prepare a document *ONLY* for reporting the state *back* if successful
-    // It's crucial this is created fresh for each command processed in the loop
-    // within ProcessReceivedShadowDelta.
+bool CloudComm::CommonInitializeSetup() {
+    aws_mqtt_client_.SetOnConnectedCallback([this]() { this->OnConnected(); });
+    aws_mqtt_client_.SetOnDisconnectedCallback([this]() { this->OnDisconnected(); });
+
+    LOG_PRINT(log_print::kVERBOSE, "Setting up shadow subscriptions.");
+    auto shadow_handler = [this](const std::string& type, std::string_view payload) {
+        this->HandleShadowCallback(type, payload);
+    };
+
+    // Subscribe to the topics needed for shadow interaction
+    if (!aws_mqtt_client_.SubscribeToShadowUpdates(shadow_handler)) {
+        LOG_PRINT(log_print::kERROR, "Common setup failed: Shadow update subscription failed!");
+        return false;
+    }
+
+    if (!aws_mqtt_client_.SubscribeToShadowGetResponses(shadow_handler)) {
+        LOG_PRINT(log_print::kERROR,
+                  "Common setup failed: Shadow get response subscription failed!");
+        return false;
+    }
+    return true;
+}
+
+bool CloudComm::AttemptReconnect() {
+    LOG_PRINT(log_print::kINFO, "Attempting MQTT connection (Attempt #%d)...",
+              reconnect_attempts_ + 1);
+    State expected_disconnected = State::DISCONNECTED;
+    State expected_waiting = State::WAITING_TO_RETRY;
+
+    // Try to transition from WAITING or DISCONNECTED to CONNECTING
+    if (!current_state_.compare_exchange_strong(expected_waiting, State::CONNECTING) &&
+        !current_state_.compare_exchange_strong(expected_disconnected, State::CONNECTING))
+    {
+        State actual_state = current_state_.load();
+        // This condition means we are already CONNECTING or CONNECTED, or maybe UNINITIALIZED. Don't try again.
+        LOG_PRINT(log_print::kWARN,
+                  "AttemptReconnect skipped: Could not transition from WAITING/DISCONNECTED state. "
+                  "Current state: %d", static_cast<int>(actual_state));
+        return false;
+    }
+
+    // --- State is now CONNECTING ---
+    LOG_PRINT(log_print::kDEBUG1, "State changed to CONNECTING.");
+
+    if (!aws_mqtt_client_.Connect()) {
+        LOG_PRINT(log_print::kWARN,
+                  "Underlying aws_mqtt_client_.Connect() call failed initiation immediately.");
+        // Connection attempt failed immediately, go back to WAITING_TO_RETRY
+        // Use HandleDisconnectInternal to manage the state transition and backoff.
+        HandleDisconnectInternal(); // This should set state to WAITING_TO_RETRY
+        return false; // Indicate immediate failure
+    }
+
+    // Underlying client initiated the connection attempt (async)
+    LOG_PRINT(log_print::kDEBUG1, "MQTT connection attempt initiated via client. Waiting for callback.");
+    reconnect_attempts_++; // Increment attempt count
+    return true; // Indicate connection attempt was started
+}
+
+
+void CloudComm::HandleDisconnectInternal() {
+    State previous_state = current_state_.load();
+
+    // Only process disconnect if we were previously connected or trying to connect
+    if (previous_state == State::CONNECTED || previous_state == State::CONNECTING) {
+        LOG_PRINT(log_print::kWARN, "Internal: Handling disconnection event. Previous state: %d",
+                  (int)previous_state);
+        last_disconnect_time_ms_ = system_uptime::GetMs();
+
+        // Calculate next backoff delay only if we were connected (don't increase delay if CONNECTING failed)
+        if (previous_state == State::CONNECTED) {
+             uint64_t next_delay = static_cast<uint64_t>(current_backoff_delay_ms_) * 2;
+             current_backoff_delay_ms_ =
+                 static_cast<uint32_t>(std::min(next_delay, static_cast<uint64_t>(kMaxBackoffMs)));
+        } else {
+            // If connect attempt failed (was CONNECTING), maybe use initial delay or keep current one?
+            // Let's reset to initial for failed connection attempts.
+             current_backoff_delay_ms_ = kInitialBackoffMs;
+        }
+
+
+        // Attempt to transition to WAITING_TO_RETRY atomically
+        State expected_state = previous_state; // We expect to be in the state we just read
+        if (current_state_.compare_exchange_strong(expected_state, State::WAITING_TO_RETRY)) {
+            LOG_PRINT(log_print::kINFO,
+                      "State changed to WAITING_TO_RETRY. Next attempt (#%d) in %u ms.",
+                      reconnect_attempts_ + 1, current_backoff_delay_ms_);
+
+            // Clear pending report on disconnect
+            {
+                platform::mutex::LockGuard lock(pending_report_mutex_);
+                shadow_report_pending_.store(false, std::memory_order_relaxed);
+                pending_shadow_report_payload_.clear();
+            }
+            // Reset shadow flags
+            initial_shadow_received_ = false;
+            get_shadow_attempts_ = 0;
+            last_get_shadow_attempt_ms_ = 0;
+            current_get_shadow_backoff_ms_ = kGetShadowRetryBaseMs; // Reset shadow retry backoff
+
+
+            // Notify application about disconnection status change *after* state is updated
+            if (connection_status_callback_) {
+                connection_status_callback_(false);
+            }
+        } else {
+            // This case means the state changed *again* between reading `previous_state`
+            // and the `compare_exchange_strong`. Could be an external Disconnect() call.
+            LOG_PRINT(log_print::kWARN,
+                      "Disconnect handling aborted: State changed unexpectedly from %d to %d "
+                      "before transitioning to WAITING_TO_RETRY.",
+                      (int)previous_state, (int)expected_state);
+            // State is already something else (likely DISCONNECTED), so don't force it back to WAITING.
+            // Ensure pending report is cleared anyway if the new state is disconnected.
+            if (expected_state == State::DISCONNECTED) {
+                 platform::mutex::LockGuard lock(pending_report_mutex_);
+                 shadow_report_pending_.store(false, std::memory_order_relaxed);
+                 pending_shadow_report_payload_.clear();
+            }
+        }
+    } else {
+        // Ignore redundant disconnect events if we are already disconnected, waiting, or uninitialized.
+        LOG_PRINT(log_print::kDEBUG1,
+                  "Internal: Ignoring redundant disconnect event while in state %d.",
+                  (int)previous_state);
+    }
+}
+
+
+void CloudComm::PollShadow() {
+    // Only poll if connected and initial shadow hasn't been received
+    if (initial_shadow_received_ || current_state_.load() != State::CONNECTED) {
+        return;
+    }
+
+    if (system_uptime::ExceedsMs(last_get_shadow_attempt_ms_, current_get_shadow_backoff_ms_)) {
+        if (get_shadow_attempts_ >= kMaxGetShadowAttempts) {
+            LOG_PRINT(log_print::kERROR,
+                      "PollShadow: Max GetShadow attempts (%u) reached. Giving up polling.",
+                      kMaxGetShadowAttempts);
+            // Mark as received to stop polling, even though it failed.
+            // Consider alternative error handling - maybe trigger disconnect/reconnect?
+            initial_shadow_received_ = true; // Stop polling
+            return;
+        }
+
+        LOG_PRINT(log_print::kINFO, "PollShadow: Attempting GetShadow (Attempt #%u)...",
+                  get_shadow_attempts_ + 1);
+        RequestShadowState(); // This sends the MQTT message for /get
+
+        last_get_shadow_attempt_ms_ = system_uptime::GetMs();
+        get_shadow_attempts_++;
+
+        // Increase backoff delay for next attempt (simple linear increase for example)
+        current_get_shadow_backoff_ms_ = std::min(
+            current_get_shadow_backoff_ms_ + kGetShadowRetryBaseMs, kMaxGetShadowRetryMs);
+
+        LOG_PRINT(log_print::kDEBUG1, "Next GetShadow attempt in %u ms.",
+                  current_get_shadow_backoff_ms_);
+    }
+}
+
+bool CloudComm::LoadCertificateFromFile(const char* file_path, char* buffer, size_t buffer_size) {
+    if (!file_path || !buffer || buffer_size == 0) {
+        LOG_PRINT(log_print::kERROR, "LoadCertificateFromFile: Invalid arguments.");
+        return false;
+    }
+
+    memset(buffer, 0, buffer_size); // Clear buffer first
+    size_t bytes_read = 0;
+    // Read one less than buffer size to guarantee space for null terminator
+    storage::FileSystem::ErrorCode err =
+        file_manager_.Read(file_path, buffer, buffer_size - 1, &bytes_read);
+
+    if (err == storage::FileSystem::ErrorCode::kOk) {
+        buffer[bytes_read] = '\0'; // Ensure null termination
+        LOG_PRINT(log_print::kDEBUG5, "Successfully read %zu bytes from %s", bytes_read, file_path);
+        return true;
+    } else {
+        LOG_PRINT(log_print::kERROR, "Failed to read file %s. Error code: %d", file_path, static_cast<int>(err));
+        memset(buffer, 0, buffer_size); // Clear buffer on failure
+        return false;
+    }
+}
+
+bool CloudComm::LoadMqttConfigs() {
+    LOG_PRINT(log_print::kDEBUG1, "Loading MQTT config from: %s", mqtt_config_path_);
+    // Use a dynamically sized buffer or a larger static one if needed
+    char read_buffer[512]; // Adjust size as necessary
+    size_t bytes_read = 0;
+
+    storage::FileSystem::ErrorCode err =
+        file_manager_.Read(mqtt_config_path_, read_buffer, sizeof(read_buffer) - 1 , &bytes_read);
+
+    if (err != storage::FileSystem::ErrorCode::kOk) {
+         LOG_PRINT(log_print::kERROR, "Failed to read MQTT config file: %s, Error: %d",
+                 mqtt_config_path_, static_cast<int>(err));
+        return false;
+    }
+    read_buffer[bytes_read] = '\0'; // Null terminate the read content
+
+    rapidjson::Document mqtt_config;
+    // Use Parse, not ParseInsitu, as read_buffer might change if file system reuses buffers etc.
+    mqtt_config.Parse(read_buffer); // Parse the null-terminated string
+
+    if (mqtt_config.HasParseError()) {
+        LOG_PRINT(log_print::kERROR, "Failed to parse MQTT config JSON. Error '%s' at offset %zu",
+                 rapidjson::GetParseError_En(mqtt_config.GetParseError()), // Get error string
+                 mqtt_config.GetErrorOffset());
+        return false;
+    }
+
+    if (!mqtt_config.IsObject()) {
+         LOG_PRINT(log_print::kERROR, "MQTT config JSON root is not an object.");
+         return false;
+    }
+
+    // Extract values safely using HasMember and type checks
+    bool success = true;
+    if (mqtt_config.HasMember("clientid") && mqtt_config["clientid"].IsString()) {
+        strncpy(thing_name_, mqtt_config["clientid"].GetString(), sizeof(thing_name_) - 1);
+        thing_name_[sizeof(thing_name_) - 1] = '\0'; // Ensure null termination
+    } else {
+        LOG_PRINT(log_print::kERROR, "MQTT config missing or invalid 'clientid' (string).");
+        success = false;
+    }
+
+    if (mqtt_config.HasMember("env") && mqtt_config["env"].IsString()) {
+        strncpy(staging_env_, mqtt_config["env"].GetString(), sizeof(staging_env_) - 1);
+        staging_env_[sizeof(staging_env_) - 1] = '\0'; // Ensure null termination
+    } else {
+        LOG_PRINT(log_print::kERROR, "MQTT config missing or invalid 'env' (string).");
+        success = false;
+    }
+
+    if (mqtt_config.HasMember("host") && mqtt_config["host"].IsString()) {
+        strncpy(mqtt_endpoint_, mqtt_config["host"].GetString(), sizeof(mqtt_endpoint_) - 1);
+        mqtt_endpoint_[sizeof(mqtt_endpoint_) - 1] = '\0'; // Ensure null termination
+    } else {
+        LOG_PRINT(log_print::kERROR, "MQTT config missing or invalid 'host' (string).");
+        success = false;
+    }
+
+    // Allow execution to continue to construct topics even if some configs failed,
+    // but return the overall success state.
+    if (!success) {
+         LOG_PRINT(log_print::kERROR, "One or more essential MQTT config values are missing or invalid.");
+    }
+
+    // Construct topics using snprintf for safety against buffer overflows
+    // Ensure VISIUM_FW_VERSION is defined, perhaps in version.h
+    snprintf(status_topic_, sizeof(status_topic_), "lit/%s/cloud/status/%s", staging_env_, VISIUM_FW_VERSION);
+    snprintf(timeseries_topic_, sizeof(timeseries_topic_), "lit/%s/cloud/timeseries/%s", staging_env_, VISIUM_FW_VERSION);
+    snprintf(logger_topic_, sizeof(logger_topic_), "lit/%s/cloud/logging/%s", staging_env_, thing_name_); // Use thing_name_ for logger topic
+
+    LOG_PRINT(log_print::kINFO, "MQTT Config Loaded: Thing=%s, Endpoint=%s, Env=%s", thing_name_, mqtt_endpoint_, staging_env_);
+    LOG_PRINT(log_print::kDEBUG5, "Status topic: %s", status_topic_);
+    LOG_PRINT(log_print::kDEBUG5, "Timeseries topic: %s", timeseries_topic_);
+    LOG_PRINT(log_print::kDEBUG5, "Logger topic: %s", logger_topic_);
+
+    return success; // Return true only if all essential configs were found
+}
+
+bool CloudComm::PublishJsonToTopic(const char* topic, const rapidjson::Value& json_payload, int qos, bool retain) {
+    if (!IsConnected()) {
+        LOG_PRINT(log_print::kWARN, "PublishJsonToTopic: Cannot publish, not connected.");
+        return false;
+    }
+    if (!topic || strlen(topic) == 0) {
+         LOG_PRINT(log_print::kERROR, "PublishJsonToTopic: Invalid topic (null or empty).");
+         return false;
+    }
+     // Allow publishing non-objects if necessary, but log if it's not an object.
+    if (!json_payload.IsObject()) {
+         LOG_PRINT(log_print::kDEBUG1,"PublishJsonToTopic: Payload is not a JSON object (type: %d).", json_payload.GetType());
+    }
+
+    rapidjson::StringBuffer string_buffer;
+    rapidjson::Writer<rapidjson::StringBuffer> writer(string_buffer);
+    json_payload.Accept(writer);
+
+    const char* json_string = string_buffer.GetString();
+    size_t json_len = string_buffer.GetSize();
+
+    if (json_len == 0) {
+         LOG_PRINT(log_print::kWARN,"PublishJsonToTopic: Serialized JSON payload is empty.");
+         // Depending on requirements, maybe return true or false here. Let's allow sending empty payload.
+    }
+
+    LOG_PRINT(log_print::kVERBOSE, "Publishing to %s (QoS %d, Retain %d, Size %zu): %s",
+              topic, qos, retain, json_len, json_string);
+
+    // Publish using the underlying client
+    return aws_mqtt_client_.Publish(topic, reinterpret_cast<const uint8_t*>(json_string), json_len, qos, retain);
+}
+
+void CloudComm::RequestShadowState() {
+     if (!IsConnected()) {
+         LOG_PRINT(log_print::kWARN,"RequestShadowState: Cannot request, not connected.");
+         return;
+     }
+    LOG_PRINT(log_print::kINFO, "Requesting current shadow state ($aws/things/%s/shadow/get)...", thing_name_);
+    if (!aws_mqtt_client_.GetShadow("")) { // Empty client token for now
+        LOG_PRINT(log_print::kERROR, "Failed to publish shadow get request via MQTT client.");
+    } else {
+         LOG_PRINT(log_print::kDEBUG1,"Shadow get request published.");
+    }
+}
+
+void CloudComm::ProcessReceivedShadowDelta(const rapidjson::Value& delta_state) {
+    // This function prepares the report payload but DOES NOT send it.
+    // It's only called by HandleShadowCallback if a report is NOT already pending.
+
+    if (!control_command_callback_) {
+        LOG_PRINT(log_print::kDEBUG1,
+                  "ProcessReceivedShadowDelta: No control command callback registered. Ignoring delta.");
+        return;
+    }
+    if (!delta_state.IsObject()) {
+        LOG_PRINT(log_print::kERROR, "ProcessReceivedShadowDelta: Input delta_state must be a JSON object.");
+        return;
+    }
+
+    LOG_PRINT(log_print::kINFO, "Processing desired state delta commands...");
+
+    // Local document to accumulate the state keys/values that were successfully processed
     rapidjson::Document reported_state_update(rapidjson::kObjectType);
     auto& allocator = reported_state_update.GetAllocator();
+    bool command_processed_successfully = false;
 
-    // --- Process Specific Commands ---
-    if (strcmp(command_name, "lon24x7") == 0) {
-        if (!params.IsNumber()) { // Could be bool 0/1 or int 0/1
-            LOG_PRINT(log_print::kERROR, APP_TAG, "Invalid param type for 'lon24x7', expected number (0 or 1).");
-        } else {
-            bool desired_state = params.IsBool() ? params.GetBool() : (params.GetInt() != 0);
-            SetLightOn24x7(desired_state);
-            success = true;
-            // Prepare reported state update
-            reported_state_update.AddMember("lon24x7", GetLightOn24x7(), allocator);
+    for (auto itr = delta_state.MemberBegin(); itr != delta_state.MemberEnd(); ++itr) {
+        const char* key_ptr = itr->name.GetString();
+        const std::size_t key_len = itr->name.GetStringLength();
+        const rapidjson::Value& params = itr->value; // This is the desired value for the key
+
+        char current_key[kMaxCommandKeyLen];
+        if (key_len >= sizeof(current_key)) {
+            LOG_PRINT(log_print::kERROR, "Command key '%.*s...' too long (max %zu). Skipping.",
+                     20, key_ptr, sizeof(current_key) - 1); // Print first 20 chars
+            continue;
         }
-    } else if (strcmp(command_name, "opmode") == 0) {
-        if (!params.IsString()) {
-            LOG_PRINT(log_print::kERROR, APP_TAG, "Invalid param type for 'opmode', expected string.");
+        memcpy(current_key, key_ptr, key_len);
+        current_key[key_len] = '\0';
+
+        LOG_PRINT(log_print::kINFO, "Invoking callback for command: '%s'", current_key);
+        bool success = control_command_callback_(current_key, params);
+
+        if (success) {
+            LOG_PRINT(log_print::kINFO, "Command '%s' processed successfully by application.", current_key);
+            command_processed_successfully = true;
+
+            // Add the key and its *desired* value to the reported state update.
+            // We report back the state we were asked to achieve.
+            // Deep copy the key and the params value using the allocator.
+            reported_state_update.AddMember(
+                rapidjson::Value(current_key, allocator).Move(), // Copy key
+                rapidjson::Value(params, allocator).Move(),      // Deep copy desired value (params)
+                allocator);
         } else {
-            const char* desired_mode = params.GetString();
-            // Add validation if needed (e.g., check against list of valid modes)
-            SetOperatingMode(desired_mode);
-            success = true;
-             // Prepare reported state update
-            reported_state_update.AddMember("opmode", rapidjson::StringRef(GetOperatingModeString()), allocator); // Use StringRef
+            LOG_PRINT(log_print::kWARN, "Command '%s' processing failed per application callback.", current_key);
+            // Do not add to reported_state_update if processing failed.
+            // The delta will likely persist until the command succeeds or desired state changes.
         }
-    } else if (strcmp(command_name, "locpmode") == 0) {
-        if (!params.IsInt()) {
-            LOG_PRINT(log_print::kERROR, APP_TAG, "Invalid param type for 'locpmode', expected integer.");
-        } else {
-            int desired_mode = params.GetInt();
-            // Add validation if needed
-            SetLocalOperationMode(desired_mode);
-            success = true;
-            // Prepare reported state update
-            reported_state_update.AddMember("locpmode", GetLocalOperationMode(), allocator);
-        }
-    } else if (strcmp(command_name, "schedule") == 0) {
-        if (!params.IsArray()) {
-            LOG_PRINT(log_print::kERROR, APP_TAG, "Invalid param type for 'schedule', expected array.");
-        } else {
-            // Pass the whole array to the application logic function
-            if (UpdateDeviceSchedule(params)) {
-                 success = true;
-                 // Prepare reported state update - report the schedule back to confirm
-                 // This performs a deep copy of the received array 'params'
-                 reported_state_update.AddMember("schedule", rapidjson::Value(params, allocator).Move(), allocator);
+    } // End for loop iterating through delta members
+
+    // After processing all commands in this delta:
+    if (command_processed_successfully) {
+         LOG_PRINT(log_print::kINFO,"Finished processing delta. Preparing shadow report payload.");
+
+         // Construct the full shadow update payload: {"state":{"reported":{...}}}
+         rapidjson::Document shadow_doc(rapidjson::kObjectType);
+         auto& shadow_allocator = shadow_doc.GetAllocator();
+         rapidjson::Value state_val(rapidjson::kObjectType);
+
+         // Move the accumulated reported updates into the state object
+         // Ensure reported_state_update is valid before moving
+         if (reported_state_update.IsObject()) {
+             state_val.AddMember("reported", reported_state_update.Move(), shadow_allocator);
+         } else {
+              // Should not happen if commands succeeded, but handle defensively
+              state_val.AddMember("reported", rapidjson::Value(rapidjson::kObjectType).Move(), shadow_allocator);
+              LOG_PRINT(log_print::kERROR,"Internal error: reported_state_update was not an object after processing commands.");
+         }
+
+         shadow_doc.AddMember("state", state_val, shadow_allocator);
+
+         // Serialize the full document
+         rapidjson::StringBuffer string_buffer;
+         rapidjson::Writer<rapidjson::StringBuffer> writer(string_buffer);
+         shadow_doc.Accept(writer);
+
+         // Store payload and set flag under mutex protection
+         {
+              platform::mutex::LockGuard lock(pending_report_mutex_);
+              pending_shadow_report_payload_ = string_buffer.GetString();
+              shadow_report_pending_.store(true, std::memory_order_release); // Set flag *after* payload is ready
+              LOG_PRINT(log_print::kDEBUG1,"Shadow report payload generated (%zu bytes) and flagged as pending.",
+                        pending_shadow_report_payload_.length());
+         }
+    } else {
+         LOG_PRINT(log_print::kINFO, "Finished processing delta. No commands succeeded, no report generated.");
+    }
+}
+
+void CloudComm::ProcessReceivedShadowDocument(rapidjson::Document& doc) {
+    // Processes a full shadow document (e.g., from /get/accepted)
+
+     bool was_initial = !initial_shadow_received_;
+     if (was_initial) {
+         LOG_PRINT(log_print::kINFO, "Processing initial shadow document received.");
+         initial_shadow_received_ = true; // Mark initial shadow as processed
+         // Reset retry logic for get shadow as we received one response
+         get_shadow_attempts_ = 0;
+         last_get_shadow_attempt_ms_ = 0;
+         current_get_shadow_backoff_ms_ = kGetShadowRetryBaseMs;
+     } else {
+         LOG_PRINT(log_print::kINFO, "Processing updated shadow document received (e.g., /update/accepted).");
+     }
+
+
+    if (doc.HasMember("state") && doc["state"].IsObject()) {
+        const auto& state_obj = doc["state"];
+
+        // Process the 'desired' section if it exists to synchronize state
+        if (state_obj.HasMember("desired") && state_obj["desired"].IsObject()) {
+            LOG_PRINT(log_print::kINFO, "Processing 'desired' state from received document.");
+
+            // According to our agreed logic, we should check the pending flag here too.
+            // If a report is pending, we drop processing this 'desired' state, relying
+            // on the shadow service to re-issue a delta later if needed after the pending
+            // report is sent.
+            if (shadow_report_pending_.load(std::memory_order_acquire)) {
+                 LOG_PRINT(log_print::kWARN, "Processing 'desired' state from full document skipped: report already pending.");
             } else {
-                 // UpdateDeviceSchedule might return false on partial or full failure
-                 LOG_PRINT(log_print::kERROR, APP_TAG, "Failed to fully process 'schedule' update.");
-                 success = false; // Mark as failure if processing wasn't fully successful
+                // No report pending, process this desired state.
+                ProcessReceivedShadowDelta(state_obj["desired"]); // This will trigger callbacks & potentially set flag/payload
             }
-        }
-    }
-    // --- Add other command handlers here ---
-    // else if (strcmp(command_name, "some_other_command") == 0) { ... }
-    else {
-        LOG_PRINT(log_print::kWARN, APP_TAG, "Unknown command key in delta: '%s'", command_name);
-        success = false; // Treat unknown command as failure? Or success (acknowledged but ignored)? Let's say failure.
-    }
 
-    // --- IMPORTANT: Call ReportCurrentState IF successful AND state needs reporting ---
-    // This updates the 'reported' section and implicitly clears the 'desired' key
-    if (success && reported_state_update.MemberCount() > 0) {
-        LOG_PRINT(log_print::kINFO, APP_TAG, "Reporting state back to shadow after processing '%s'.", command_name);
-        if (!cloud_comm.ReportCurrentState(reported_state_update)) {
-            // Log failure to queue report. The desired state might persist on the broker.
-            LOG_PRINT(log_print::kWARN, APP_TAG, "Failed to queue state report for command '%s'.", command_name);
+        } else {
+            LOG_PRINT(log_print::kDEBUG1, "Received shadow document has no 'desired' state or it's not an object.");
+            // If this was the initial shadow GET response and desired is empty, we are in sync initially.
         }
-    } else if (success) {
-         // Command succeeded but resulted in no specific state to report back
-         // (e.g., maybe 'reboot' before it actually rebooted, or a simple ack needed)
-         // Optionally report null for the command key to ensure desired state clears
-         LOG_PRINT(log_print::kINFO, APP_TAG, "Command '%s' processed successfully, reporting null acknowledgment.", command_name);
-         rapidjson::Document null_ack_doc(rapidjson::kObjectType);
-         null_ack_doc.AddMember(rapidjson::StringRef(command_name), // Key is the command name
-                                rapidjson::Value(), // Value is JSON null
-                                null_ack_doc.GetAllocator());
-         if (!cloud_comm.ReportCurrentState(null_ack_doc)) {
-              LOG_PRINT(log_print::kWARN, APP_TAG, "Failed to queue null ack state report for command '%s'.", command_name);
+
+        // Optional: Process 'reported' section if needed by the application?
+        // Generally, the application knows its own reported state.
+        // if (state_obj.HasMember("reported") && state_obj["reported"].IsObject()) {
+        //     LOG_PRINT(log_print::kDEBUG1, "Received document contains 'reported' state.");
+        // }
+
+    } else {
+        LOG_PRINT(log_print::kWARN, "Received shadow document missing 'state' object.");
+    }
+}
+
+void CloudComm::HandleShadowCallback(const std::string& update_type, std::string_view payload) {
+    LOG_PRINT(log_print::kDEBUG1, "HandleShadowCallback: Type='%s', Size=%zu",
+              update_type.c_str(), payload.length());
+
+    // --- Handle Delta Updates ---
+    if (update_type == "delta") {
+        // **** CONDITIONAL PROCESSING LOGIC ****
+        if (shadow_report_pending_.load(std::memory_order_acquire)) {
+            LOG_PRINT(log_print::kWARN, "HandleShadowCallback: Delta received but report is already pending. Ignoring/dropping this delta.");
+            return; // Ignore this delta - IMPORTANT PART OF THE AGREED LOGIC
+        }
+        // **** END CONDITIONAL PROCESSING LOGIC ****
+
+        // Report not pending, proceed to parse and process this delta
+        if (payload.empty()) {
+             LOG_PRINT(log_print::kWARN,"HandleShadowCallback: Received empty delta payload.");
+             return;
+        }
+        if (payload.length() >= sizeof(json_parse_buffer_)) {
+            LOG_PRINT(log_print::kERROR, "HandleShadowCallback: Delta payload too large (%zu bytes, max %zu).",
+                     payload.length(), sizeof(json_parse_buffer_)-1);
+            return;
+        }
+        // Copy payload to mutable buffer for in-situ parsing
+        memcpy(json_parse_buffer_, payload.data(), payload.length());
+        json_parse_buffer_[payload.length()] = '\0'; // Null terminate
+
+        rapidjson::Document doc;
+        doc.ParseInsitu(json_parse_buffer_); // Use Insitu as buffer is prepared
+
+        if (doc.HasParseError()) {
+            LOG_PRINT(log_print::kERROR, "HandleShadowCallback: Delta JSON parse error: %s (offset %zu).",
+                      rapidjson::GetParseError_En(doc.GetParseError()), doc.GetErrorOffset());
+            return;
+        }
+
+        // The delta payload usually contains {"version": N, "timestamp": T, "state": {...delta_content...}}
+        if (doc.HasMember("state") && doc["state"].IsObject()) {
+             LOG_PRINT(log_print::kDEBUG1, "HandleShadowCallback: Processing delta state...");
+             ProcessReceivedShadowDelta(doc["state"]); // Pass the actual delta state object
+        } else {
+             LOG_PRINT(log_print::kWARN, "HandleShadowCallback: Delta payload missing 'state' object or it's not an object.");
+        }
+
+    // --- Handle Get/Accepted Responses ---
+    } else if (update_type == "accepted") {
+        // This handles responses for both /get/accepted and /update/accepted
+        if (payload.empty()) {
+             LOG_PRINT(log_print::kWARN,"HandleShadowCallback: Received empty '/accepted' payload.");
+             return;
+        }
+        if (payload.length() >= sizeof(json_parse_buffer_)) {
+            LOG_PRINT(log_print::kERROR, "HandleShadowCallback: Accepted payload too large (%zu bytes, max %zu).",
+                     payload.length(), sizeof(json_parse_buffer_)-1);
+            return;
+        }
+        // Copy payload to mutable buffer
+        memcpy(json_parse_buffer_, payload.data(), payload.length());
+        json_parse_buffer_[payload.length()] = '\0';
+
+        rapidjson::Document doc;
+        doc.ParseInsitu(json_parse_buffer_);
+
+        if (doc.HasParseError()) {
+            LOG_PRINT(log_print::kERROR, "HandleShadowCallback: Accepted JSON parse error: %s (offset %zu).",
+                      rapidjson::GetParseError_En(doc.GetParseError()), doc.GetErrorOffset());
+            return;
+        }
+
+        LOG_PRINT(log_print::kINFO, "HandleShadowCallback: Processing '/accepted' document.");
+        ProcessReceivedShadowDocument(doc); // Process the full document state
+
+    // --- Handle Rejected Responses ---
+    } else if (update_type == "rejected") {
+        LOG_PRINT(log_print::kERROR, "HandleShadowCallback: Received shadow operation rejection.");
+        // Parse payload for more details if possible/needed
+         if (payload.length() < sizeof(json_parse_buffer_)) {
+              memcpy(json_parse_buffer_, payload.data(), payload.length());
+              json_parse_buffer_[payload.length()] = '\0';
+              LOG_PRINT(log_print::kERROR, "Rejection payload: %s", json_parse_buffer_);
+              // Example parsing:
+              // rapidjson::Document doc;
+              // doc.ParseInsitu(json_parse_buffer_);
+              // if (!doc.HasParseError() && doc.HasMember("message")) {
+              //    LOG_PRINT(log_print::kERROR, "Rejection message: %s", doc["message"].GetString());
+              // }
+         }
+        // If an /update was rejected, clear the pending flag so the system can react to the next delta.
+         {
+             platform::mutex::LockGuard lock(pending_report_mutex_);
+             if(shadow_report_pending_.load(std::memory_order_relaxed)) {
+                 LOG_PRINT(log_print::kWARN,"Resetting pending report flag due to shadow operation rejection.");
+                 pending_shadow_report_payload_.clear(); // Clear the rejected payload
+                 shadow_report_pending_.store(false, std::memory_order_relaxed);
+             }
+         }
+
+    } else {
+        LOG_PRINT(log_print::kWARN, "HandleShadowCallback: Unhandled shadow callback type: %s", update_type.c_str());
+    }
+}
+
+// --- Internal Callbacks ---
+
+void CloudComm::OnConnected() {
+    LOG_PRINT(log_print::kINFO, "MQTT client connection successful callback received!");
+    State expected_state = State::CONNECTING;
+    // Atomically transition from CONNECTING to CONNECTED
+    if(current_state_.compare_exchange_strong(expected_state, State::CONNECTED)) {
+         LOG_PRINT(log_print::kINFO, "State transitioned to CONNECTED.");
+
+         // Reset backoff and retry counts on successful connection
+         reconnect_attempts_ = 0;
+         current_backoff_delay_ms_ = kInitialBackoffMs;
+         last_disconnect_time_ms_ = 0; // Clear disconnect time
+
+         // Reset initial shadow flag and retry logic, connection might have dropped before first shadow was received
+         initial_shadow_received_ = false;
+         get_shadow_attempts_ = 0;
+         last_get_shadow_attempt_ms_ = 0;
+         current_get_shadow_backoff_ms_ = kGetShadowRetryBaseMs;
+
+
+         // Clear any potentially stale pending report from before connection drop
+         {
+             platform::mutex::LockGuard lock(pending_report_mutex_);
+             shadow_report_pending_.store(false, std::memory_order_relaxed);
+             pending_shadow_report_payload_.clear();
+         }
+
+
+         // Trigger application callback *after* internal state is consistent
+         if (connection_status_callback_) {
+              connection_status_callback_(true);
+         }
+
+         // PollShadow() in Process() will handle the initial Get request and retries.
+         LOG_PRINT(log_print::kINFO,"Connection established. Initial shadow poll will start via Process() loop.");
+
+    } else {
+         // This could happen if Disconnect() was called while the client was connecting.
+         LOG_PRINT(log_print::kWARN, "OnConnected callback received but state was not CONNECTING (current: %d). Might have been disconnected manually.", (int)expected_state);
+         // If the current state is DISCONNECTED, ensure the underlying client is told to disconnect too, just in case.
+         if(expected_state == State::DISCONNECTED) {
+             aws_mqtt_client_.Disconnect();
          }
     }
-    // If success was false, we report nothing, leaving the desired state intact.
+}
 
-    return success; // Return overall processing status for this command
+void CloudComm::OnDisconnected() {
+     // This is the callback from the underlying MQTT client when *it* detects disconnection.
+     LOG_PRINT(log_print::kWARN, "MQTT client reported disconnection event via callback.");
+     // Handle the state transition and backoff logic using the shared internal function
+     HandleDisconnectInternal();
+     // Note: The application callback (connection_status_callback_(false)) is called inside HandleDisconnectInternal if state changes.
 }
 
 
-// --- Main Application Task ---
-extern "C" void app_main(void)
-{
-    LOG_PRINT(log_print::kINFO, APP_TAG, "Starting Application...");
-    // init_filesystem();
+// --- Placeholder Implementation ---
+// Ensure this function is properly implemented based on your specific packet structures
+bool CreateStatusPacketJSON(rapidjson::Document& doc, rapidjson::Document::AllocatorType& allocator, uint8_t packet_type, const void* packet_data) {
+     // Implementation depends heavily on your packet structure definitions.
+     // Example:
+     doc.AddMember("packetType", packet_type, allocator);
+     doc.AddMember("timestamp", system_uptime::GetMs(), allocator); // Add timestamp
 
-    // --- Prepare CloudComm Configuration ---
-    CloudComms::CloudCommConfig config = {};
-    // !! Populate config with YOUR endpoint, ID, thing name, and FULL cert paths !!
-    // Example: strncpy(config.aws_endpoint, "...", sizeof(config.aws_endpoint)-1); etc.
-    const char* endpoint = "your_endpoint.amazonaws.com"; /* CHANGE */ strncpy(config.aws_endpoint, endpoint, sizeof(config.aws_endpoint) - 1); config.aws_endpoint[sizeof(config.aws_endpoint)-1] = '\0';
-    const char* client_id = "your_client_id"; /* CHANGE */ strncpy(config.client_id, client_id, sizeof(config.client_id) - 1); config.client_id[sizeof(config.client_id)-1] = '\0';
-    const char* thing_name = "your_thing_name"; /* CHANGE */ strncpy(config.thing_name, thing_name, sizeof(config.thing_name) - 1); config.thing_name[sizeof(config.thing_name)-1] = '\0';
-    const char* ca_path = "/spiffs/ca.pem"; /* CHANGE */ strncpy(config.root_ca_path, ca_path, sizeof(config.root_ca_path) - 1); config.root_ca_path[sizeof(config.root_ca_path)-1] = '\0';
-    const char* cert_path = "/spiffs/cert.pem"; /* CHANGE */ strncpy(config.device_cert_path, cert_path, sizeof(config.device_cert_path) - 1); config.device_cert_path[sizeof(config.device_cert_path)-1] = '\0';
-    const char* key_path = "/spiffs/key.pem"; /* CHANGE */ strncpy(config.private_key_path, key_path, sizeof(config.private_key_path) - 1); config.private_key_path[sizeof(config.private_key_path)-1] = '\0';
+     // Example: Cast packet_data based on packet_type and add members
+     // if (packet_type == PACKET_TYPE_MOTION_SENSOR_DATA) {
+     //     const MotionData* motion = static_cast<const MotionData*>(packet_data);
+     //     doc.AddMember("motionDetected", motion->detected, allocator);
+     //     doc.AddMember("axisX", motion->x, allocator);
+     // } else if (...) {
+     //     ...
+     // }
 
+     if (!packet_data) {
+         // Handle cases where packet_data might be null if just sending type/timestamp
+         LOG_PRINT(log_print::kDEBUG2, "CreateStatusPacketJSON called with null data for type %u", packet_type);
+     }
 
-    // --- Initialize CloudComm ---
-    if (!cloud_comm.Initialize(config)) { /* ... handle error ... */ return; }
-
-    // --- Register Callbacks ---
-    cloud_comm.SetConnectionStatusCallback(HandleConnectionStatus);
-    cloud_comm.SetControlCommandCallback(HandleControlCommand);
-
-    // --- Initiate Connection ---
-    LOG_PRINT(log_print::kINFO, APP_TAG, "Initiating connection...");
-    // Process() will handle actual connection attempts when Wi-Fi is ready
-    // but we might still call Connect() once to ensure state machine starts if desired
-    // Or just rely on Process() finding DISCONNECTED state when Wi-Fi is up.
-    // Let's rely on Process() as discussed. Commenting out Connect() call here.
-    // cloud_comm.Connect(true);
-
-
-    // --- Main Application Loop ---
-    uint64_t loop_counter = 0;
-    while (true) {
-        // --- Check prerequisites ---
-        bool wifi_ready = true; // Replace with your actual Wi-Fi check
-        // bool time_synced = is_time_synced(); // Check time sync if needed
-
-        if (wifi_ready /* && time_synced */) {
-            // --- Call Process() ONLY when Wi-Fi is usable ---
-            cloud_comm.Process(); // Handles connection state & reconnect timing
-
-            // --- Perform actions only when fully connected ---
-            if (cloud_comm.IsConnected()) {
-                // Send data, etc.
-                // if ((loop_counter % 10) == 0) { /* ... SendTimeSeriesData ... */ }
-
-                // Example: Proactively report state occasionally
-                 if ((loop_counter % 120) == 0 && loop_counter > 0) { // Every 2 minutes
-                     LOG_PRINT(log_print::kINFO, APP_TAG, "Proactively reporting current state...");
-                     rapidjson::Document current_state_doc(rapidjson::kObjectType);
-                     auto& allocator = current_state_doc.GetAllocator();
-                     current_state_doc.AddMember("led_is_on", GetDeviceLedState(), allocator);
-                     current_state_doc.AddMember("uptime_seconds", (uint32_t)(loop_counter), allocator);
-                     current_state_doc.AddMember("opmode", rapidjson::StringRef(GetOperatingModeString()), allocator);
-                     if(!cloud_comm.ReportCurrentState(current_state_doc)) {
-                         LOG_PRINT(log_print::kWARN, APP_TAG, "Failed to queue proactive state report.");
-                     }
-                 }
-
-            } else {
-                LOG_PRINT(log_print::kDEBUG1, APP_TAG, "Wi-Fi connected, but waiting for MQTT (State: %d)...", static_cast<int>(cloud_comm.current_state_.load()));
-            }
-        } else {
-            LOG_PRINT(log_print::kWARN, APP_TAG, "Wi-Fi is disconnected. CloudComm::Process() paused.");
-            // Ensure Wi-Fi manager is trying to reconnect Wi-Fi...
-        }
-
-        // Other application logic...
-
-        vTaskDelay(pdMS_TO_TICKS(1000)); // Loop delay
-        loop_counter++;
-    }
+     // Return true on success, false on failure (e.g., unknown type, bad data)
+     LOG_PRINT(log_print::kDEBUG3, "Placeholder CreateStatusPacketJSON executed for type %u", packet_type);
+     return true; // Placeholder success
 }
------------------------------------------------------------------------------------
-// Inside your application's HandleControlCommand function:
-
-// (Includes, logging setup, other command handlers like lon24x7, opmode etc.)
-
-else if (strcmp(command_name, "lampcontrol") == 0) {
-    LOG_PRINT(log_print::kDEBUG1, APP_TAG, "Processing 'lampcontrol' command.");
-
-    // 1. Validate that the parameters are a JSON object
-    if (!params.IsObject()) {
-        LOG_PRINT(log_print::kERROR, APP_TAG, "Invalid params for 'lampcontrol': Expected JSON object.");
-        success = false;
-    } else {
-        // 2. Validate and Extract individual members
-        int desired_lset = -1; // Use invalid default
-        int desired_timeout = -1;
-        uint64_t desired_timestamp = 0;
-        bool params_ok = true;
-
-        // Check and get 'lset'
-        if (params.HasMember("lset") && params["lset"].IsInt()) {
-            desired_lset = params["lset"].GetInt();
-        } else {
-            LOG_PRINT(log_print::kWARN, APP_TAG, "'lampcontrol' missing or invalid 'lset'.");
-            params_ok = false;
-        }
-
-        // Check and get 'timeout'
-        if (params.HasMember("timeout") && params["timeout"].IsInt()) {
-            desired_timeout = params["timeout"].GetInt();
-        } else {
-            LOG_PRINT(log_print::kWARN, APP_TAG, "'lampcontrol' missing or invalid 'timeout'.");
-            params_ok = false;
-        }
-
-        // Check and get 'timestamp' (assuming it fits uint64_t)
-        if (params.HasMember("timestamp") && (params["timestamp"].IsUint64() || params["timestamp"].IsUint())) {
-             desired_timestamp = params["timestamp"].IsUint64() ? params["timestamp"].GetUint64() : params["timestamp"].GetUint();
-        } else {
-             LOG_PRINT(log_print::kWARN, APP_TAG, "'lampcontrol' missing or invalid 'timestamp'.");
-             params_ok = false;
-        }
-
-        // 3. Perform Action if parameters were valid
-        if (params_ok) {
-            LOG_PRINT(log_print::kINFO, APP_TAG, "Applying lamp control settings: lset=%d, timeout=%d, ts=%llu",
-                      desired_lset, desired_timeout, desired_timestamp);
-            // --- TODO: Call your actual function to apply these settings ---
-            // success = ApplyLampControlSettings(desired_lset, desired_timeout, desired_timestamp);
-            success = true; // Assume success for example
-            // ----------------------------------------------------------------
-
-            // 4. Prepare reported state update IF successful
-            if (success) {
-                 // Create a JSON object representing the *actual* state after applying
-                 rapidjson::Value lamp_control_report(rapidjson::kObjectType);
-                 // Replace Get... with functions fetching the actual current settings
-                 // lamp_control_report.AddMember("lset", GetActualLampLset(), allocator);
-                 // lamp_control_report.AddMember("timeout", GetActualLampTimeout(), allocator);
-                 // lamp_control_report.AddMember("timestamp", GetActualLampTimestamp(), allocator);
-
-                 // For simplicity in example, let's report back the desired values assuming they were applied
-                 lamp_control_report.AddMember("lset", desired_lset, allocator);
-                 lamp_control_report.AddMember("timeout", desired_timeout, allocator);
-                 lamp_control_report.AddMember("timestamp", desired_timestamp, allocator);
 
 
-                 // Add this object under the 'lampcontrol' key in the main reported doc
-                 reported_state_update.AddMember("lampcontrol", lamp_control_report, allocator);
-            }
-        } else {
-            success = false; // Mark as failed due to invalid parameters
-        }
-    }
-}
-// ... other command handlers ...
-
-// --- IMPORTANT: Call ReportCurrentState AFTER the if/else if block ---
-// (This part is outside the specific 'lampcontrol' block but after all commands checked)
-if (success && reported_state_update.MemberCount() > 0) {
-    LOG_PRINT(log_print::kINFO, APP_TAG, "Reporting state back to shadow after processing '%s'.", command_name);
-    if (!cloud_comm.ReportCurrentState(reported_state_update)) {
-        LOG_PRINT(log_print::kWARN, APP_TAG, "Failed to queue state report for command '%s'.", command_name);
-    }
-} else if (success) {
-    // Handle success cases where no specific state change needs reporting (report null ack)
-    LOG_PRINT(log_print::kINFO, APP_TAG, "Command '%s' processed successfully, reporting null acknowledgment.", command_name);
-    rapidjson::Document null_ack_doc(rapidjson::kObjectType);
-    null_ack_doc.AddMember(rapidjson::StringRef(command_name), rapidjson::Value(), null_ack_doc.GetAllocator());
-    if (!cloud_comm.ReportCurrentState(null_ack_doc)) { /* ... */ }
-}
-// --------------------------------------------------------------------
-
-return success; // Return overall status
+} // namespace visium
