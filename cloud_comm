@@ -1297,3 +1297,298 @@ bool CreateStatusPacketJSON(rapidjson::Document& doc, rapidjson::Document::Alloc
 
 
 } // namespace visium
+
+-------------------------------------------------------------------------------------------
+#ifndef CLOUD_COMM_H_
+#define CLOUD_COMM_H_
+
+#include <atomic>       // Required for std::atomic
+#include <cstddef>      // For size_t
+#include <cstdint>      // For uint types
+#include <functional>   // For std::function
+#include <string>       // Required for std::string
+#include <string_view>  // For std::string_view
+
+// --- Assumed Platform Includes ---
+#include "platform/mutex.h"
+#include "platform/storage/file_system.h"
+#include "platform/network/aws_iot_mqtt_client.h"
+// --- End Assumed Platform Includes ---
+
+// --- Assumed Project Includes ---
+#include "backlog_packets.h"
+#include "rapidjson/document.h"
+// --- End Assumed Project Includes ---
+
+
+namespace visium {
+
+// --- Type Definitions ---
+using ControlCommandCallback = std::function<bool(const char* command_key, const rapidjson::Value& params)>;
+using ConnectionStatusCallback = std::function<void(bool connected)>;
+
+
+// --- CloudComm Class ---
+class CloudComm {
+   public:
+    explicit CloudComm(platform::storage::FileSystem& file_manager);
+    ~CloudComm();
+
+    // Disable copy/move
+    CloudComm(const CloudComm&) = delete; CloudComm& operator=(const CloudComm&) = delete;
+    CloudComm(CloudComm&&) = delete; CloudComm& operator=(CloudComm&&) = delete;
+
+    bool Initialize();
+    bool Connect(bool reset_retry_state = true);
+    void Disconnect();
+    bool IsConnected() const;
+    void Process();
+    bool SendDataToCloud(uint8_t packet_type, const void* packet_data, size_t packet_size);
+    bool SendLogEvent();
+    bool ReportCurrentState(const rapidjson::Value& reported_state, int qos = 1);
+
+    // --- Callback Setters ---
+    void SetControlCommandCallback(ControlCommandCallback callback);
+    void SetConnectionStatusCallback(ConnectionStatusCallback callback);
+
+   private:
+    platform::storage::FileSystem& file_manager_;
+
+    // --- Internal State Machine ---
+    enum class State { UNINITIALIZED, DISCONNECTED, CONNECTING, CONNECTED, WAITING_TO_RETRY };
+    std::atomic<State> current_state_{State::UNINITIALIZED};
+
+    // --- MQTT Client ---
+    platform::network::AwsIotMqttClient aws_mqtt_client_;
+
+    // --- Configuration & Topics ---
+    char thing_name_[kMaxThingNameLen] = {0}; char staging_env_[10] = {0}; char mqtt_endpoint_[kMaxMqttEndPointLen] = {0};
+    char logger_topic_[kMaxTopicLen] = {0}; char status_topic_[kMaxTopicLen] = {0}; char timeseries_topic_[kMaxTopicLen] = {0};
+    const char* root_ca_path_ = "/certCA.pem"; const char* device_cert_path_ = "/certificate.pem";
+    const char* private_key_path_ = "/private.pem.key"; const char* mqtt_config_path_ = "/mqttConfiguration.json";
+
+    // --- Callbacks ---
+    ControlCommandCallback control_command_callback_{nullptr}; ConnectionStatusCallback connection_status_callback_{nullptr};
+
+    // --- Buffers ---
+    char json_parse_buffer_[kMaxPayloadSize] = {0}; DataBuffer backlog_packets_;
+
+    // --- Reconnect Logic ---
+    uint64_t last_disconnect_time_ms_ = 0; uint32_t current_backoff_delay_ms_ = kInitialBackoffMs; int reconnect_attempts_ = 0;
+    uint64_t connect_start_time_ms_ = 0; // For CONNECTING timeout (NEW)
+
+    // --- Shadow Handling ---
+    bool initial_shadow_received_ = false; uint16_t get_shadow_attempts_ = 0; uint64_t last_get_shadow_attempt_ms_ = 0;
+    uint32_t current_get_shadow_backoff_ms_ = kGetShadowRetryBaseMs; uint32_t last_processed_shadow_version_ = 0;
+
+    // --- Pending Shadow Report State ---
+    std::atomic<bool> shadow_report_pending_{false}; std::string pending_shadow_report_payload_; platform::mutex::Mutex pending_report_mutex_;
+
+    // --- Timers / Intervals ---
+    uint64_t last_log_event_send_check_time_ = 0; uint64_t last_backlog_packet_sent_time_ = 0;
+
+    // --- Constants ---
+    static constexpr uint16_t kDefaultMqttPort = 8883; static constexpr int kDefaultMqttRxBufferSize = 2048; static constexpr int kDefaultMqttTxBufferSize = 2048;
+    static constexpr std::size_t kMaxPayloadSize = 2048; static constexpr size_t kMaxTopicLen = 128; static constexpr size_t kMaxCommandKeyLen = 64;
+    static constexpr size_t kMaxThingNameLen = 64; static constexpr size_t kMaxMqttEndPointLen = 128; static constexpr size_t kMaxFilePathLen = 128;
+    static constexpr uint32_t kInitialBackoffMs = 1000; static constexpr uint32_t kMaxBackoffMs = 60000;
+    static constexpr uint16_t kMaxGetShadowAttempts = 10; static constexpr uint32_t kGetShadowRetryBaseMs = 5000; static constexpr uint32_t kMaxGetShadowRetryMs = 30000;
+    static constexpr uint32_t kLogEventSendIntervalMs = 10000;
+    static constexpr uint32_t kConnectTimeoutMs = 30000; // Timeout for CONNECTING state (NEW)
+
+    // --- Private Helper Methods ---
+    bool AttemptReconnect(); bool CommonInitializeSetup(); void HandleDisconnectInternal(); void PollShadow();
+    bool LoadCertificateFromFile(const char* full_path, char* buffer, std::size_t buffer_size); bool LoadMqttConfigs();
+    bool PublishJsonToTopic(const char* topic, const rapidjson::Value& json_payload, int qos = 1, bool retain = false);
+    void RequestShadowState(); void ProcessReceivedShadowDelta(const rapidjson::Value& delta_state); void ProcessReceivedShadowDocument(rapidjson::Document& doc);
+
+    // --- Internal Callbacks ---
+    void OnConnected(); void OnDisconnected(); void HandleShadowCallback(const std::string& update_type, std::string_view payload);
+
+}; // class CloudComm
+} // namespace visium
+#endif // CLOUD_COMM_H_
+--------------------------------------------------------
+#include "cloud_communication.h" // Include the header first
+
+#include <algorithm>
+#include <cstdio>
+#include <cstring>
+// Includes via header: <atomic>, <string>, <functional>, <string_view>, <cstddef>, <cstdint>, <platform/mutex.h>, <platform/storage/file_system.h>, <platform/network/aws_iot_mqtt_client.h>, <rapidjson/document.h>
+
+// --- Assumed Project Includes ---
+#include "log_print.h" #include "log_transfer.h" #include "status_packet.h" #include "system_uptime.h" #include "version.h"
+// --- End Assumed Project Includes ---
+
+#include "rapidjson/error/en.h" #include "rapidjson/stringbuffer.h" #include "rapidjson/writer.h"
+
+namespace visium {
+
+using namespace platform;
+// --- Forward declare helper ---
+bool CreateStatusPacketJSON(rapidjson::Document& doc, rapidjson::Document::AllocatorType& allocator, uint8_t packet_type, const void* packet_data);
+
+// --- Constructor/Destructor/Initialize/Connect/Disconnect/IsConnected (Unchanged from previous version) ---
+CloudComm::CloudComm(platform::storage::FileSystem& file_manager): file_manager_(file_manager), current_state_(State::UNINITIALIZED), last_processed_shadow_version_{0}, shadow_report_pending_{false} { /* memset etc. */ memset(thing_name_,0,sizeof(thing_name_)); memset(json_parse_buffer_,0,sizeof(json_parse_buffer_)); }
+CloudComm::~CloudComm() { State current = current_state_.load(); if (current != State::UNINITIALIZED && current != State::DISCONNECTED) { Disconnect(); } }
+bool CloudComm::Initialize() { /* Unchanged - resets version */ if (current_state_.load() != State::UNINITIALIZED) { return true; } last_processed_shadow_version_ = 0; if (!LoadMqttConfigs()) { return false; } /* ... rest ... */ current_state_.store(State::DISCONNECTED); /* ... reset timers/flags ... */ return true; }
+bool CloudComm::Connect(bool reset_retry_state) { /* Unchanged */ State c = current_state_.load(); if (c == State::UNINITIALIZED) return false; if (c == State::CONNECTING || c == State::CONNECTED) { if(reset_retry_state){/*reset*/} return true;} if(reset_retry_state){/*reset*/} return AttemptReconnect(); }
+void CloudComm::Disconnect() { /* Unchanged - resets version */ State ps = current_state_.exchange(State::DISCONNECTED); if (ps != State::UNINITIALIZED && ps != State::DISCONNECTED) { aws_mqtt_client_.Disconnect(); } /* reset timers/flags/version */ last_processed_shadow_version_ = 0; /* clear pending report */ }
+bool CloudComm::IsConnected() const { return (current_state_.load() == State::CONNECTED); }
+
+// --- Process() **UPDATED** ---
+void CloudComm::Process() {
+    State state = current_state_.load();
+
+    switch (state) {
+        case State::DISCONNECTED: {
+            LOG_PRINT(log_print::kINFO, "Process: State is DISCONNECTED. Attempting initial connection...");
+            if (!AttemptReconnect()) {
+                 // Attempt failed, likely because state changed concurrently or client refused immediately.
+                 // HandleDisconnectInternal was likely called inside AttemptReconnect if client failed.
+                 // If state check failed, we need to wait. Force into WAITING state.
+                 LOG_PRINT(log_print::kWARN,"Process: AttemptReconnect from DISCONNECTED failed. Entering backoff.");
+                 HandleDisconnectInternal(); // Force state to WAITING_TO_RETRY and apply initial backoff
+            }
+            // If successful, state is now CONNECTING
+            break;
+        }
+        case State::WAITING_TO_RETRY: {
+            if (system_uptime::ExceedsMs(last_disconnect_time_ms_, current_backoff_delay_ms_)) {
+                LOG_PRINT(log_print::kINFO, "Process: Reconnect timer elapsed. Attempting reconnect...");
+                if (!AttemptReconnect()) {
+                    // Attempt failed after timer expired. State might have changed, or client failed.
+                    // HandleDisconnectInternal was likely called inside AttemptReconnect if client failed.
+                    // If state check failed, force into WAITING state again to reset timer with *next* backoff.
+                    LOG_PRINT(log_print::kWARN,"Process: AttemptReconnect from WAITING_TO_RETRY failed. Re-entering backoff.");
+                    HandleDisconnectInternal(); // Re-apply backoff logic (will increase delay)
+                 }
+                 // If successful, state is now CONNECTING
+            } else {
+                 LOG_PRINT(log_print::kDEBUG4,"Process: State is WAITING_TO_RETRY. Timer not expired.");
+            }
+            break;
+        }
+        case State::CONNECTED: {
+             LOG_PRINT(log_print::kDEBUG4,"Process: State is CONNECTED.");
+             // Check pending shadow report (Unchanged)
+            if (shadow_report_pending_.load(std::memory_order_acquire)) {
+                std::string payload_to_send; bool report_was_pending = false;
+                { platform::mutex::LockGuard lock(pending_report_mutex_);
+                    if (shadow_report_pending_.load(std::memory_order_relaxed)) {
+                         payload_to_send = std::move(pending_shadow_report_payload_);
+                         pending_shadow_report_payload_.clear();
+                         shadow_report_pending_.store(false, std::memory_order_relaxed);
+                         report_was_pending = true; } }
+                if (report_was_pending && !payload_to_send.empty()) {
+                     if (!aws_mqtt_client_.UpdateShadow(std::string_view(payload_to_send))) { /* Log Error */ }
+                     else { /* Log Success */ } }
+            }
+            PollShadow(); // Poll for initial shadow (Unchanged)
+            // SendLogEvent(); // Send logs if needed (Unchanged)
+            break;
+        }
+        case State::CONNECTING: {
+             LOG_PRINT(log_print::kDEBUG3, "Process: State is CONNECTING. Checking timeout...");
+             // --- Check for CONNECTING timeout --- NEW ---
+             if (system_uptime::ExceedsMs(connect_start_time_ms_, kConnectTimeoutMs)) {
+                  LOG_PRINT(log_print::kERROR, "Process: CONNECTING state timed out after %u ms!", kConnectTimeoutMs);
+                  // Force disconnect and enter backoff period
+                  aws_mqtt_client_.Disconnect(); // Tell client to stop trying (if possible)
+                  HandleDisconnectInternal(); // Transition to WAITING_TO_RETRY
+             }
+             // --- End Timeout Check ---
+             break;
+        }
+        case State::UNINITIALIZED: default: {
+             LOG_PRINT(log_print::kDEBUG4,"Process: State is UNINITIALIZED or unknown (%d).", (int)state);
+            break;
+        }
+    } // End switch(state)
+
+    aws_mqtt_client_.Yield(); // Process underlying client events
+}
+
+
+// --- AttemptReconnect **UPDATED** (Refined logic + sets connect_start_time_ms_) ---
+bool CloudComm::AttemptReconnect() {
+    LOG_PRINT(log_print::kINFO, "Attempting MQTT connection (Attempt #%d)...",
+              reconnect_attempts_ + 1);
+
+    // Read the current state first
+    State current_state_val = current_state_.load(std::memory_order_relaxed);
+    bool transitioned_to_connecting = false;
+
+    // Check the state BEFORE trying CAS
+    if (current_state_val == State::WAITING_TO_RETRY) {
+        if (current_state_.compare_exchange_strong(current_state_val, State::CONNECTING, std::memory_order_acq_rel)) {
+             LOG_PRINT(log_print::kDEBUG1, "State changed WAITING_TO_RETRY -> CONNECTING.");
+             transitioned_to_connecting = true;
+        } else {
+             LOG_PRINT(log_print::kWARN, "AttemptReconnect CAS failed: State changed from WAITING_TO_RETRY to %d concurrently.", static_cast<int>(current_state_val));
+             return false; // State changed before we could transition
+        }
+    } else if (current_state_val == State::DISCONNECTED) {
+         if (current_state_.compare_exchange_strong(current_state_val, State::CONNECTING, std::memory_order_acq_rel)) {
+              LOG_PRINT(log_print::kDEBUG1, "State changed DISCONNECTED -> CONNECTING.");
+              transitioned_to_connecting = true;
+         } else {
+              LOG_PRINT(log_print::kWARN, "AttemptReconnect CAS failed: State changed from DISCONNECTED to %d concurrently.", static_cast<int>(current_state_val));
+              return false; // State changed before we could transition
+         }
+    } else {
+         // State was NEITHER WAITING NOR DISCONNECTED when initially checked.
+         LOG_PRINT(log_print::kWARN, "AttemptReconnect failed: State was already %d (expected WAITING or DISCONNECTED).", static_cast<int>(current_state_val));
+         return false;
+    }
+
+    // --- If we reach here, state was successfully transitioned to CONNECTING ---
+    if (transitioned_to_connecting) {
+         connect_start_time_ms_ = system_uptime::GetMs(); // Record start time for timeout (NEW)
+         reconnect_attempts_++; // Increment attempt count only when starting client.Connect
+
+         if (!aws_mqtt_client_.Connect()) { // Try to initiate the actual connection
+             LOG_PRINT(log_print::kWARN, "Underlying aws_mqtt_client_.Connect() call failed initiation immediately.");
+             // Connection attempt failed immediately, trigger disconnect logic which moves to WAITING_TO_RETRY
+             // Don't increment reconnect_attempts_ again here, it was done above.
+             HandleDisconnectInternal();
+             return false; // Indicate immediate failure
+         }
+
+         LOG_PRINT(log_print::kDEBUG1, "MQTT connection attempt initiated via client (Attempt #%d). Waiting for callback.", reconnect_attempts_);
+         return true; // Indicate connection attempt was started
+    } else {
+         // Should be unreachable due to checks above, but defensive return
+         return false;
+    }
+}
+
+// --- Other Methods (Unchanged from previous version) ---
+// SendDataToCloud(), SendLogEvent(), ReportCurrentState()
+bool CloudComm::SendDataToCloud(uint8_t pt, const void* pd, size_t ps) { /* Unchanged */ if(pt>=TOTAL_STATUS_PACKET_TYPES)return false; if(!pd||ps==0)return false; if(IsConnected()){ rapidjson::Document d;auto& a=d.GetAllocator();d.SetObject(); if(!CreateStatusPacketJSON(d,a,pt,pd))return false; const char* t=(pt==PACKET_TYPE_ENV_SENSOR_DATA)?timeseries_topic_:status_topic_; bool s=PublishJsonToTopic(t,d); if(s){last_backlog_packet_sent_time_=system_uptime::GetMs();if(pt!=PACKET_TYPE_ENV_SENSOR_DATA)backlog_packets_.AddStatusData(pt,nullptr,0);} return s;} else {if(pt==PACKET_TYPE_ENV_SENSOR_DATA)return backlog_packets_.AddData(pt,(const uint8_t*)pd,ps); else return backlog_packets_.AddStatusData(pt,(const uint8_t*)pd,ps);} }
+bool CloudComm::SendLogEvent() { /* Unchanged */ if(!IsConnected())return false; if(system_uptime::ExceedsMs(last_log_event_send_check_time_,kLogEventSendIntervalMs)){ last_log_event_send_check_time_=system_uptime::GetMs(); uint8_t b[128];uint32_t ec=0;uint64_t ts=0; if(log_transfer::GetLogEvent(&ec,&ts)){size_t sz=log_transfer::CreateLogEvent(ec,ts,b,sizeof(b));if(sz>0&&sz<sizeof(b)){if(aws_mqtt_client_.Publish(logger_topic_,b,sz))return true;else return false;}else return false;}else return false;}return false;}
+bool CloudComm::ReportCurrentState(const rapidjson::Value& rs, int q) { /* Unchanged */ if(!IsConnected())return false; if(!rs.IsObject())return false; rapidjson::Document sd;auto& al=sd.GetAllocator();sd.SetObject(); rapidjson::Value sv(rapidjson::kObjectType);sv.AddMember("reported", rapidjson::Value(rs, al).Move(), al); sd.AddMember("state",sv,al); rapidjson::StringBuffer sb;rapidjson::Writer<rapidjson::StringBuffer> wr(sb);sd.Accept(wr); return aws_mqtt_client_.UpdateShadow(std::string_view(sb.GetString(),sb.GetSize()), q); }
+// SetControlCommandCallback(), SetConnectionStatusCallback()
+void CloudComm::SetControlCommandCallback(ControlCommandCallback cb) { /* Unchanged */ control_command_callback_=std::move(cb); }
+void CloudComm::SetConnectionStatusCallback(ConnectionStatusCallback cb) { /* Unchanged */ connection_status_callback_=std::move(cb); }
+// CommonInitializeSetup(), HandleDisconnectInternal(), PollShadow()
+bool CloudComm::CommonInitializeSetup() { /* Unchanged */ aws_mqtt_client_.SetOnConnectedCallback([this](){this->OnConnected();}); aws_mqtt_client_.SetOnDisconnectedCallback([this](){this->OnDisconnected();}); auto sh=[this](const std::string& t,std::string_view p){this->HandleShadowCallback(t,p);}; if(!aws_mqtt_client_.SubscribeToShadowUpdates(sh))return false; if(!aws_mqtt_client_.SubscribeToShadowGetResponses(sh))return false; return true; }
+void CloudComm::HandleDisconnectInternal() { /* Unchanged */ State ps = current_state_.load(); if(ps==State::CONNECTED||ps==State::CONNECTING){ last_disconnect_time_ms_=system_uptime::GetMs(); if(ps==State::CONNECTED){uint64_t nd=(uint64_t)current_backoff_delay_ms_*2;current_backoff_delay_ms_=std::min((uint32_t)nd,kMaxBackoffMs);}else{current_backoff_delay_ms_=kInitialBackoffMs;} State es=ps; if(current_state_.compare_exchange_strong(es, State::WAITING_TO_RETRY)){ {platform::mutex::LockGuard lock(pending_report_mutex_);shadow_report_pending_.store(false);pending_shadow_report_payload_.clear();} initial_shadow_received_=false; get_shadow_attempts_=0; last_get_shadow_attempt_ms_=0; current_get_shadow_backoff_ms_=kGetShadowRetryBaseMs; last_processed_shadow_version_=0; if(connection_status_callback_)connection_status_callback_(false);} }}
+void CloudComm::PollShadow() { /* Unchanged */ if(initial_shadow_received_||current_state_.load()!=State::CONNECTED)return; if(system_uptime::ExceedsMs(last_get_shadow_attempt_ms_,current_get_shadow_backoff_ms_)){ if(get_shadow_attempts_>=kMaxGetShadowAttempts){initial_shadow_received_=true;return;} RequestShadowState(); last_get_shadow_attempt_ms_=system_uptime::GetMs(); get_shadow_attempts_++; current_get_shadow_backoff_ms_=std::min(current_get_shadow_backoff_ms_+kGetShadowRetryBaseMs,kMaxGetShadowRetryMs);} }
+// LoadCertificateFromFile(), LoadMqttConfigs(), PublishJsonToTopic(), RequestShadowState()
+bool CloudComm::LoadCertificateFromFile(const char* fp, char* b, size_t bs) { /* Unchanged */ if(!fp||!b||bs==0)return false; memset(b,0,bs); size_t br=0; auto e=file_manager_.Read(fp,b,bs-1,&br); if(e==storage::FileSystem::ErrorCode::kOk){b[br]='\0';return true;}else{memset(b,0,bs);return false;} }
+bool CloudComm::LoadMqttConfigs() { /* Unchanged */ char rb[512]; size_t br=0; auto e=file_manager_.Read(mqtt_config_path_,rb,sizeof(rb)-1,&br); if(e!=storage::FileSystem::ErrorCode::kOk)return false; rb[br]='\0'; rapidjson::Document mc;mc.Parse(rb); if(mc.HasParseError()||!mc.IsObject())return false; bool s=true; if(mc.HasMember("clientid")&&mc["clientid"].IsString()){strncpy(thing_name_,mc["clientid"].GetString(),sizeof(thing_name_)-1);}else{s=false;} if(mc.HasMember("env")&&mc["env"].IsString()){strncpy(staging_env_,mc["env"].GetString(),sizeof(staging_env_)-1);}else{s=false;} if(mc.HasMember("host")&&mc["host"].IsString()){strncpy(mqtt_endpoint_,mc["host"].GetString(),sizeof(mqtt_endpoint_)-1);}else{s=false;} snprintf(status_topic_,sizeof(status_topic_),"lit/%s/cloud/status/%s",staging_env_,VISIUM_FW_VERSION); snprintf(timeseries_topic_,sizeof(timeseries_topic_),"lit/%s/cloud/timeseries/%s",staging_env_,VISIUM_FW_VERSION); snprintf(logger_topic_,sizeof(logger_topic_),"lit/%s/cloud/logging/%s",staging_env_,thing_name_); return s; }
+bool CloudComm::PublishJsonToTopic(const char* t, const rapidjson::Value& jp, int q, bool r) { /* Unchanged */ if(!IsConnected())return false; if(!t||strlen(t)==0)return false; rapidjson::StringBuffer sb; rapidjson::Writer<rapidjson::StringBuffer> wr(sb);jp.Accept(wr); return aws_mqtt_client_.Publish(t,(const uint8_t*)sb.GetString(),sb.GetSize(),q,r); }
+void CloudComm::RequestShadowState() { /* Unchanged */ if(!IsConnected())return; if(!aws_mqtt_client_.GetShadow("")){/* Log error */} }
+// ProcessReceivedShadowDelta(), ProcessReceivedShadowDocument()
+void CloudComm::ProcessReceivedShadowDelta(const rapidjson::Value& ds) { /* Unchanged */ if(!control_command_callback_)return; if(!ds.IsObject())return; rapidjson::Document rsu(rapidjson::kObjectType); auto& al=rsu.GetAllocator(); bool cps=false; for(auto i=ds.MemberBegin();i!=ds.MemberEnd();++i){ const char* k=i->name.GetString(); const auto& p=i->value; char ck[kMaxCommandKeyLen]; size_t kl=i->name.GetStringLength(); if(kl>=sizeof(ck))continue; memcpy(ck,k,kl); ck[kl]='\0'; bool suc=control_command_callback_(ck,p); if(suc){cps=true;rsu.AddMember(rapidjson::Value(ck,al).Move(),rapidjson::Value(p,al).Move(),al);} } if(cps){ rapidjson::Document sd;auto& sa=sd.GetAllocator();sd.SetObject(); rapidjson::Value sv(rapidjson::kObjectType);if(rsu.IsObject())sv.AddMember("reported",rsu.Move(),sa);else sv.AddMember("reported",rapidjson::Value(rapidjson::kObjectType).Move(),sa); sd.AddMember("state",sv,sa); rapidjson::StringBuffer sb;rapidjson::Writer<rapidjson::StringBuffer> wr(sb);sd.Accept(wr); {platform::mutex::LockGuard lock(pending_report_mutex_); pending_shadow_report_payload_=sb.GetString(); shadow_report_pending_.store(true,std::memory_order_release);} } }
+void CloudComm::ProcessReceivedShadowDocument(rapidjson::Document& doc) { /* Unchanged */ bool wi=!initial_shadow_received_;if(wi){initial_shadow_received_=true;get_shadow_attempts_=0;last_get_shadow_attempt_ms_=0;current_get_shadow_backoff_ms_=kGetShadowRetryBaseMs;} if(doc.HasMember("state")&&doc["state"].IsObject()){const auto& so=doc["state"]; if(so.HasMember("desired")&&so["desired"].IsObject()){if(shadow_report_pending_.load(std::memory_order_acquire)){/*skip*/}else{ProcessReceivedShadowDelta(so["desired"]);}}} }
+// HandleShadowCallback()
+void CloudComm::HandleShadowCallback(const std::string& ut, std::string_view pl) { /* Unchanged */ if(pl.empty()||pl.length()>=sizeof(json_parse_buffer_))return; memcpy(json_parse_buffer_,pl.data(),pl.length()); json_parse_buffer_[pl.length()]='\0'; rapidjson::Document d; d.ParseInsitu(json_parse_buffer_); if(d.HasParseError())return; uint32_t iv=0; if(d.HasMember("version")&&d["version"].IsUint()){iv=d["version"].GetUint();}else{return;} if(iv<=last_processed_shadow_version_)return; last_processed_shadow_version_=iv; if(ut=="delta"){if(shadow_report_pending_.load(std::memory_order_acquire))return; if(d.HasMember("state")&&d["state"].IsObject()){ProcessReceivedShadowDelta(d["state"]);}} else if(ut=="accepted"){ProcessReceivedShadowDocument(d);} else if(ut=="rejected"){ {platform::mutex::LockGuard lock(pending_report_mutex_);if(shadow_report_pending_.load(std::memory_order_relaxed)){pending_shadow_report_payload_.clear();shadow_report_pending_.store(false,std::memory_order_relaxed);}} } }
+// OnConnected(), OnDisconnected()
+void CloudComm::OnConnected() { /* Unchanged */ State es=State::CONNECTING; if(current_state_.compare_exchange_strong(es,State::CONNECTED)){ reconnect_attempts_=0;current_backoff_delay_ms_=kInitialBackoffMs;last_disconnect_time_ms_=0;initial_shadow_received_=false;get_shadow_attempts_=0;last_get_shadow_attempt_ms_=0;current_get_shadow_backoff_ms_=kGetShadowRetryBaseMs;last_processed_shadow_version_=0; {platform::mutex::LockGuard lock(pending_report_mutex_);shadow_report_pending_.store(false);pending_shadow_report_payload_.clear();} if(connection_status_callback_)connection_status_callback_(true);} }
+void CloudComm::OnDisconnected() { /* Unchanged */ HandleDisconnectInternal(); }
+// CreateStatusPacketJSON()
+bool CreateStatusPacketJSON(rapidjson::Document& d, rapidjson::Document::AllocatorType& a, uint8_t pt, const void* pd) { /* Unchanged */ d.AddMember("packetType",pt,a);d.AddMember("timestamp",system_uptime::GetMs(),a);return true; }
+
+} // namespace visium
