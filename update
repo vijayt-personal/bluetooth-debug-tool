@@ -1,0 +1,871 @@
+/**
+ * @file core_update_module.h
+ * @brief Defines the interface for the CoreUpdateModule class.
+ * @version 1.3
+ * @date 2025-04-13
+ *
+ * This header provides a transport-agnostic interface for managing Over-The-Air
+ * (OTA) firmware updates. It uses generic types and status codes (via enum class)
+ * to abstract platform-specific details, allowing for reusable transport layer
+ * code. Version 1.3 uses enum class for status codes and std::array for the
+ * fixed-size internal header buffer.
+ *
+ * Copyright 2025 Google LLC
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+#ifndef CORE_UPDATE_MODULE_H_
+#define CORE_UPDATE_MODULE_H_
+
+#include <cstddef>  // For size_t
+#include <cstdint>  // For uint8_t, uint32_t
+#include <limits>   // For numeric_limits
+#include <array>    // For std::array
+
+// --- Generic Status Codes ---
+
+/**
+ * @enum CoreUpdateStatus
+ * @brief Defines status codes returned by CoreUpdateModule methods.
+ */
+enum class CoreUpdateStatus {
+  kOk = 0,                   ///< Operation completed successfully.
+  kFail = -1,                ///< Generic failure occurred.
+  kErrInvalidState = -2,     ///< Operation called in an invalid state.
+  kErrInvalidArg = -3,       ///< Invalid argument provided to a method.
+  kErrNoMem = -4,            ///< Memory allocation failed.
+  kErrNotFound = -5,         ///< Required resource not found (e.g., partition).
+  kErrValidateFailed = -6,   ///< Firmware validation failed.
+  kErrTimeout = -7,          ///< Operation timed out.
+  kErrBadHeaderMagic = -8,   ///< Firmware header magic number mismatch.
+  kErrWrongTarget = -9,      ///< Firmware target chip ID does not match device.
+  kErrInternal = -10,        ///< Internal error occurred.
+  kErrBufferOverflow = -11   ///< Provided data exceeds internal buffer capacity.
+};
+
+
+/**
+ * @brief Represents the size argument when the total firmware size is unknown.
+ *
+ * Pass this value to StartUpdate() if the total size is not known beforehand.
+ * The implementation will map this to the platform-specific equivalent
+ * (e.g., OTA_SIZE_UNKNOWN for ESP-IDF).
+ */
+constexpr size_t kCoreUpdateSizeUnknown = std::numeric_limits<size_t>::max();
+
+/**
+ * @class CoreUpdateModule
+ * @brief Manages the Over-The-Air (OTA) update process in a transport-agnostic
+ * manner.
+ *
+ * This class provides a generic interface for performing firmware updates. It
+ * handles the core logic of interacting with the platform's underlying OTA
+ * mechanism, including state management and basic firmware header validation.
+ * It uses a fixed-size std::array internal buffer to minimize dynamic memory
+ * allocation.
+ *
+ * Transport-specific modules (e.g., for BLE, MQTT, HTTPS) should use this
+ * class to feed firmware data and control the update process.
+ *
+ * The header file is designed to be platform-agnostic, using generic types
+ * (`void*`, standard integer types) and the CoreUpdateStatus enum class. The
+ * corresponding implementation file (`.cpp`) contains the platform-specific
+ * code (e.g., calls to ESP-IDF `esp_ota_*` functions).
+ *
+ * @note This class is not thread-safe by itself. If used from multiple threads,
+ * external synchronization is required.
+ */
+class CoreUpdateModule {
+ public:
+  /**
+   * @brief Defines the size of the internal fixed buffer for the header.
+   *
+   * This size should be large enough to accommodate the platform's firmware
+   * header and any immediately following structures needed for initial
+   * validation (e.g., ESP-IDF's header + segment header + app descriptor).
+   * A size of 256 bytes is generally sufficient for common platforms like ESP-IDF.
+   */
+  static constexpr size_t kHeaderBufferSize = 256;
+
+  /**
+   * @brief Constructor for CoreUpdateModule. Initializes the module state.
+   */
+  CoreUpdateModule();
+
+  /**
+   * @brief Destructor for CoreUpdateModule.
+   * Ensures any ongoing update is safely aborted if the object is destroyed.
+   */
+  ~CoreUpdateModule();
+
+  // Prevent copying and assignment
+  CoreUpdateModule(const CoreUpdateModule&) = delete;
+  CoreUpdateModule& operator=(const CoreUpdateModule&) = delete;
+
+  /**
+   * @brief Starts the OTA update process.
+   *
+   * Finds the next available OTA partition and initializes the platform's
+   * update mechanism. Transitions the module state to begin receiving data.
+   *
+   * @param total_size The total expected size of the firmware image in bytes.
+   * Use kCoreUpdateSizeUnknown if the size is not known
+   * beforehand. The actual size will be validated against
+   * the firmware header once received.
+   * @return CoreUpdateStatus::kOk on success.
+   * @return CoreUpdateStatus::kErrInvalidState if an update is already in progress.
+   * @return CoreUpdateStatus::kErrNotFound if no suitable OTA partition is found.
+   * @return Other CoreUpdateStatus error codes on platform-specific errors.
+   */
+  CoreUpdateStatus StartUpdate(size_t total_size = kCoreUpdateSizeUnknown);
+
+  /**
+   * @brief Processes a chunk of incoming firmware data.
+   *
+   * This method should be called by the transport layer as firmware data
+   * arrives. It handles buffering the initial header into a fixed-size internal
+   * std::array buffer, validating the header (magic number, target chip), and
+   * writing data to the OTA partition.
+   *
+   * @param data Pointer to the buffer containing the firmware data chunk.
+   * Must not be null if len > 0.
+   * @param len The length of the data chunk in bytes. Must not be 0.
+   * @return CoreUpdateStatus::kOk on success (data processed or buffered).
+   * @return CoreUpdateStatus::kErrInvalidState if called before StartUpdate() or after
+   * FinishUpdate()/AbortUpdate().
+   * @return CoreUpdateStatus::kErrInvalidArg if data is null or len is 0.
+   * @return CoreUpdateStatus::kErrBufferOverflow if the initial data exceeds the
+   * internal header buffer capacity before validation can occur.
+   * @return CoreUpdateStatus::kErrBadHeaderMagic if header validation fails (magic number).
+   * @return CoreUpdateStatus::kErrWrongTarget if header validation fails (chip ID).
+   * @return Other CoreUpdateStatus error codes on write errors or internal issues.
+   */
+  CoreUpdateStatus ProcessData(const uint8_t* data, size_t len);
+
+  /**
+   * @brief Finishes the OTA update process.
+   *
+   * This method should be called after all firmware data has been successfully
+   * processed via ProcessData(). It performs final validation on the written
+   * firmware (e.g., checksums, signatures, depending on platform support) and
+   * configures the bootloader to load the new firmware on the next reboot.
+   *
+   * @note A manual device restart is required after this function returns
+   * successfully to boot into the newly updated firmware.
+   *
+   * @return CoreUpdateStatus::kOk on successful finalization and validation.
+   * @return CoreUpdateStatus::kErrInvalidState if not all data has been received or if
+   * called in an incorrect state.
+   * @return CoreUpdateStatus::kErrValidateFailed if the final firmware validation fails.
+   * @return Other CoreUpdateStatus error codes on platform-specific errors.
+   */
+  CoreUpdateStatus FinishUpdate();
+
+  /**
+   * @brief Aborts the ongoing OTA update process.
+   *
+   * If an update is in progress, this method cleans up any resources used by
+   * the platform's OTA mechanism and resets the module's state to idle.
+   * If no update is in progress, it does nothing and returns success.
+   *
+   * @return CoreUpdateStatus::kOk on success or if no update was in progress.
+   * @return CoreUpdateStatus::kFail if the platform-specific abort operation fails.
+   */
+  CoreUpdateStatus AbortUpdate();
+
+  /**
+   * @brief Checks if an OTA update is currently in progress.
+   *
+   * @return true If an update process is active (started but not finished or
+   * aborted).
+   * @return false Otherwise.
+   */
+  bool IsInProgress() const;
+
+  /**
+   * @brief Gets the current state of the update process.
+   *
+   * @return An integer representing the current UpdateState. See the
+   * implementation file for the specific enum definition. This is
+   * primarily for debugging.
+   * @see UpdateState
+   */
+  int GetCurrentState() const; // Keep returning int for simple state debugging? Or return UpdateState? Let's keep int for now.
+
+  /**
+   * @brief Gets the total number of bytes processed so far.
+   *
+   * This includes header bytes and firmware data written to the partition.
+   *
+   * @return size_t The number of bytes processed.
+   */
+  size_t GetBytesProcessed() const;
+
+  /**
+   * @brief Gets the expected total image size based on the validated header.
+   *
+   * Returns 0 if the header has not yet been received or validated, or if
+   * the size could not be determined from the header/app descriptor.
+   *
+   * @return size_t The expected image size in bytes.
+   */
+  size_t GetExpectedImageSize() const;
+
+ private:
+  /**
+   * @enum UpdateState
+   * @brief Internal states of the OTA update process.
+   */
+  enum class UpdateState {
+    kIdle,              ///< No update process active.
+    kStarted,           ///< StartUpdate called, waiting for initial data.
+    kReceivingHeader,   ///< Receiving initial bytes into the fixed buffer.
+    kValidatingHeader,  ///< Enough data received, validating header.
+    kReceivingData,     ///< Header validated, receiving firmware body.
+    kFinishing,         ///< All data received, FinishUpdate called.
+    kAborted,           ///< Update explicitly aborted via AbortUpdate.
+    kError              ///< An unrecoverable error occurred.
+  };
+
+  /**
+   * @brief Internal helper function to perform platform-specific cleanup.
+   *
+   * Resets state variables, clears buffers, and releases platform resources
+   * associated with the update handle and partition. Called on finish, abort,
+   * error, or destruction.
+   *
+   * @param abort_ota If true, attempt to call the platform's OTA abort function.
+   */
+  void Cleanup(bool abort_ota);
+
+  /**
+   * @brief Internal helper to map platform-specific error codes to generic ones.
+   * @param platform_err The platform-specific error code (e.g., esp_err_t).
+   * @return CoreUpdateStatus The corresponding generic status code.
+   */
+  static CoreUpdateStatus MapError(int platform_err); // Now returns CoreUpdateStatus
+
+  /**
+   * @brief Internal helper to validate the received firmware header.
+   *
+   * This function is platform-specific and implemented in the .cpp file.
+   * It checks magic numbers, target chip ID, etc., using the data stored
+   * in `header_buffer_data_`.
+   *
+   * @return CoreUpdateStatus::kOk if the header is valid.
+   * @return CoreUpdateStatus::kErrBadHeaderMagic if magic number is wrong.
+   * @return CoreUpdateStatus::kErrWrongTarget if the chip ID doesn't match.
+   * @return Other CoreUpdateStatus error codes for other validation issues.
+   */
+  CoreUpdateStatus ValidateHeader(); // Now returns CoreUpdateStatus
+
+  /**
+   * @brief Internal helper to write data using the platform's OTA function.
+   *
+   * Handles casting the opaque handle and calling the platform write function.
+   *
+   * @param data Pointer to the data buffer.
+   * @param len Length of the data in bytes.
+   * @return CoreUpdateStatus::kOk on success.
+   * @return Mapped CoreUpdateStatus error code on failure.
+   */
+  CoreUpdateStatus WriteDataInternal(const uint8_t* data, size_t len); // Now returns CoreUpdateStatus
+
+  // --- Member Variables ---
+
+  UpdateState current_state_;  ///< Current state of the update machine.
+
+  void* update_handle_;      ///< Opaque handle for the platform's OTA operation.
+  void* update_partition_;   ///< Opaque pointer to platform's partition info.
+
+  /// @brief Fixed-size buffer (std::array) to store the initial firmware header bytes.
+  std::array<uint8_t, kHeaderBufferSize> header_buffer_data_;
+  /// @brief Current number of bytes stored in header_buffer_data_.
+  size_t header_buffer_len_;
+
+  /// Size of the header structure needed for validation by the platform. Set in .cpp.
+  size_t platform_validation_header_size_;
+
+  /// Total expected image size determined from the validated header.
+  size_t expected_image_size_;
+
+  /// Number of bytes processed (header + data written).
+  size_t bytes_processed_;
+
+  /// Total size initially provided to StartUpdate (can be kCoreUpdateSizeUnknown).
+  size_t initial_total_size_arg_;
+};
+
+#endif  // CORE_UPDATE_MODULE_H_
+
+// ========================================================================== //
+// ===================== Implementation (core_update_module.cpp) ============ //
+// ========================================================================== //
+
+/**
+ * @file core_update_module.cpp
+ * @brief Implements the CoreUpdateModule class for the ESP-IDF platform.
+ * @version 1.3
+ * @date 2025-04-13
+ *
+ * This file contains the ESP-IDF specific implementation details for the
+ * generic OTA update interface defined in core_update_module.h. It uses
+ * ESP-IDF SDK functions (esp_ota_*, esp_partition_*, etc.) to perform the
+ * actual firmware update operations. Version 1.3 uses enum class for status
+ * codes and std::array for the fixed-size internal header buffer.
+ *
+ * Copyright 2025 Google LLC
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+// Include own header first
+#include "core_update_module.h"
+
+// C system headers
+#include <cstring> // For memcpy
+
+// C++ system headers
+#include <algorithm> // For std::min
+// <array> is included via core_update_module.h
+
+// Other libraries headers
+
+// Project headers
+
+// --- ESP-IDF Specific Includes ---
+#include "esp_log.h"
+#include "esp_ota_ops.h"
+#include "esp_partition.h"
+#include "esp_app_format.h"  // For esp_image_header_t, esp_app_desc_t, magic numbers
+#include "esp_chip_info.h"   // For esp_chip_info()
+#include "freertos/FreeRTOS.h" // Required by esp_ota_ops.h indirectly sometimes
+#include "freertos/task.h"     // Required by esp_ota_ops.h indirectly sometimes
+// --- End ESP-IDF Specific Includes ---
+
+// Define TAG for logging (Platform specific)
+static const char* kTag = "CoreUpdateModule";
+
+// --- Platform-Specific Definitions ---
+// Size needed to read the basic header and app descriptor for validation (ESP-IDF specific)
+constexpr size_t kEspIdfAppDescriptorOffset = sizeof(esp_image_header_t) + sizeof(esp_image_segment_header_t);
+constexpr size_t kEspIdfValidationDataSize = kEspIdfAppDescriptorOffset + sizeof(esp_app_desc_t);
+
+// Compile-time check to ensure the fixed buffer is large enough
+static_assert(CoreUpdateModule::kHeaderBufferSize >= kEspIdfValidationDataSize,
+              "CoreUpdateModule::kHeaderBufferSize is too small for ESP-IDF validation data!");
+
+// --- End Platform-Specific Definitions ---
+
+// --- Helper to map esp_err_t to generic codes ---
+// Static member function definition
+CoreUpdateStatus CoreUpdateModule::MapError(int err) { // Now returns CoreUpdateStatus
+  // Cast err back to esp_err_t for comparison (Platform specific)
+  esp_err_t esp_err = static_cast<esp_err_t>(err);
+  switch (esp_err) {
+    case ESP_OK:
+      return CoreUpdateStatus::kOk;
+    case ESP_ERR_INVALID_STATE:
+      return CoreUpdateStatus::kErrInvalidState;
+    case ESP_ERR_INVALID_ARG:
+      return CoreUpdateStatus::kErrInvalidArg;
+    case ESP_ERR_NO_MEM:
+      return CoreUpdateStatus::kErrNoMem;
+    case ESP_ERR_NOT_FOUND:
+      return CoreUpdateStatus::kErrNotFound;
+    case ESP_ERR_OTA_VALIDATE_FAILED:
+      return CoreUpdateStatus::kErrValidateFailed;
+    case ESP_ERR_TIMEOUT:
+      return CoreUpdateStatus::kErrTimeout;
+    // Add other specific ESP_ERR mappings here if needed
+    default:
+      // Log the unmapped error for debugging
+      ESP_LOGE(kTag, "Unmapped ESP-IDF error: %s (0x%x)", esp_err_to_name(esp_err), esp_err);
+      return CoreUpdateStatus::kFail;  // Generic failure for others
+  }
+}
+
+// --- Constructor ---
+CoreUpdateModule::CoreUpdateModule()
+    : current_state_(UpdateState::kIdle),
+      update_handle_(nullptr),
+      update_partition_(nullptr),
+      // header_buffer_data_ is implicitly initialized (std::array member)
+      header_buffer_len_(0),
+      platform_validation_header_size_(kEspIdfValidationDataSize), // ESP-IDF specific size needed
+      expected_image_size_(0),
+      bytes_processed_(0),
+      initial_total_size_arg_(0)
+       {
+  ESP_LOGI(kTag, "CoreUpdateModule initialized (std::array buffer).");
+  // std::array is allocated as part of the object, no heap allocation here.
+}
+
+// --- Destructor ---
+CoreUpdateModule::~CoreUpdateModule() {
+  ESP_LOGD(kTag, "CoreUpdateModule destructor called.");
+  // Abort any ongoing OTA operation and clean up resources
+  Cleanup(true); // true = attempt platform abort
+  // No dynamic deallocation needed for header_buffer_data_
+}
+
+// --- StartUpdate ---
+CoreUpdateStatus CoreUpdateModule::StartUpdate(size_t total_size) { // Return CoreUpdateStatus
+  if (current_state_ != UpdateState::kIdle) {
+    ESP_LOGE(kTag, "StartUpdate failed: Invalid state (%d). Expected kIdle.",
+             static_cast<int>(current_state_));
+    return CoreUpdateStatus::kErrInvalidState;
+  }
+
+  // Map the generic 'unknown size' representation to ESP-IDF's OTA_SIZE_UNKNOWN
+  size_t ota_size = (total_size == kCoreUpdateSizeUnknown)
+                        ? OTA_SIZE_UNKNOWN
+                        : total_size;
+  ESP_LOGI(kTag, "Starting OTA update process. Initial expected size: %zu bytes.",
+           ota_size);
+  initial_total_size_arg_ = total_size; // Store for potential later use
+
+  // --- ESP-IDF Specific Logic ---
+  const esp_partition_t* partition = esp_ota_get_next_update_partition(nullptr);
+  if (partition == nullptr) {
+    ESP_LOGE(kTag, "StartUpdate failed: No suitable OTA partition found.");
+    current_state_ = UpdateState::kError; // Set error state
+    return CoreUpdateStatus::kErrNotFound;
+  }
+  ESP_LOGI(kTag, "Found update partition: type %d, subtype %d, offset 0x%lx, size 0x%lx",
+           partition->type, partition->subtype, partition->address,
+           partition->size);
+
+  // Store the partition pointer (casting to void*)
+  update_partition_ = const_cast<void*>(static_cast<const void*>(partition));
+
+  esp_ota_handle_t ota_handle = 0;
+  esp_err_t err = esp_ota_begin(partition, ota_size, &ota_handle);
+  if (err != ESP_OK) {
+    ESP_LOGE(kTag, "esp_ota_begin failed: %s (0x%x)", esp_err_to_name(err), err);
+    update_partition_ = nullptr;  // Reset partition info on failure
+    current_state_ = UpdateState::kError; // Set error state
+    return MapError(err);
+  }
+  // --- End ESP-IDF Specific Logic ---
+
+  // Store the handle (casting to void*)
+  update_handle_ = reinterpret_cast<void*>(ota_handle);
+
+  // Reset state variables for the new update
+  bytes_processed_ = 0;
+  expected_image_size_ = 0;
+  header_buffer_len_ = 0; // Clear buffer length
+  // std::array data doesn't need explicit clearing, just track length
+
+  current_state_ = UpdateState::kStarted; // Transition to Started state
+  ESP_LOGI(kTag, "esp_ota_begin succeeded. State -> kStarted.");
+  return CoreUpdateStatus::kOk;
+}
+
+// --- ProcessData ---
+CoreUpdateStatus CoreUpdateModule::ProcessData(const uint8_t* data, size_t len) { // Return CoreUpdateStatus
+   // Basic argument checks
+   if (data == nullptr && len > 0) {
+        ESP_LOGE(kTag, "ProcessData failed: Data pointer is NULL but length is %zu.", len);
+        return CoreUpdateStatus::kErrInvalidArg;
+    }
+    if (len == 0) {
+        ESP_LOGW(kTag, "ProcessData called with zero length.");
+        return CoreUpdateStatus::kOk;
+    }
+
+  // State machine logic
+  switch (current_state_) {
+    case UpdateState::kStarted:
+    case UpdateState::kReceivingHeader: {
+      current_state_ = UpdateState::kReceivingHeader; // Ensure state is set
+
+      // Determine how much more data is needed for validation
+      size_t needed_for_validation = (header_buffer_len_ < platform_validation_header_size_)
+                                        ? (platform_validation_header_size_ - header_buffer_len_)
+                                        : 0;
+
+      // Append data to fixed header buffer only if needed for validation
+      size_t to_buffer = std::min(len, needed_for_validation);
+      if (to_buffer > 0) {
+          // Check for buffer overflow before copying
+          if (header_buffer_len_ + to_buffer > header_buffer_data_.size()) {
+              ESP_LOGE(kTag, "Header buffer overflow: current %zu + needed %zu > capacity %zu",
+                       header_buffer_len_, to_buffer, header_buffer_data_.size());
+              current_state_ = UpdateState::kError;
+              Cleanup(true); // Attempt cleanup
+              return CoreUpdateStatus::kErrBufferOverflow;
+          }
+          // Use .data() method of std::array to get raw pointer for memcpy
+          memcpy(header_buffer_data_.data() + header_buffer_len_, data, to_buffer);
+          header_buffer_len_ += to_buffer;
+          ESP_LOGD(kTag, "Buffered %zu header/app_desc bytes (total %zu / %zu)",
+                   to_buffer, header_buffer_len_, platform_validation_header_size_);
+      }
+
+      // Check if enough data for validation is complete
+      if (header_buffer_len_ >= platform_validation_header_size_) {
+        ESP_LOGI(kTag, "Sufficient data for validation received. State -> kValidatingHeader");
+        current_state_ = UpdateState::kValidatingHeader;
+
+        // Validate the header immediately
+        CoreUpdateStatus validation_result = ValidateHeader(); // Returns CoreUpdateStatus
+        if (validation_result != CoreUpdateStatus::kOk) {
+          ESP_LOGE(kTag, "Header validation failed (%d). Aborting.", static_cast<int>(validation_result));
+          current_state_ = UpdateState::kError; // Set error state explicitly
+          Cleanup(true); // Abort OTA and cleanup
+          return validation_result; // Return specific validation error
+        }
+
+        // Header is valid, write buffered header (+ app_desc) to flash
+        ESP_LOGI(kTag, "Header validation successful. Writing buffered %zu bytes.", header_buffer_len_);
+        // Pass pointer from .data() and current length
+        CoreUpdateStatus write_result = WriteDataInternal(header_buffer_data_.data(), header_buffer_len_); // Returns CoreUpdateStatus
+        if (write_result != CoreUpdateStatus::kOk) {
+          ESP_LOGE(kTag, "Failed to write validated header/app_desc (%d). Aborting.", static_cast<int>(write_result));
+          current_state_ = UpdateState::kError;
+          Cleanup(true); // Abort OTA and cleanup
+          return write_result;
+        }
+        bytes_processed_ += header_buffer_len_; // Account for written buffered bytes
+
+        // Transition to receiving data state
+        ESP_LOGI(kTag, "State -> kReceivingData");
+        current_state_ = UpdateState::kReceivingData;
+
+        // Process any remaining data from the current chunk (data not buffered)
+        size_t remaining_len = len - to_buffer;
+        if (remaining_len > 0) {
+          ESP_LOGD(kTag, "Processing %zu remaining bytes from chunk.", remaining_len);
+           CoreUpdateStatus remaining_write_result = WriteDataInternal(data + to_buffer, remaining_len); // Returns CoreUpdateStatus
+           if (remaining_write_result != CoreUpdateStatus::kOk) {
+               ESP_LOGE(kTag, "Failed to write remaining data (%d). Aborting.", static_cast<int>(remaining_write_result));
+               current_state_ = UpdateState::kError;
+               Cleanup(true); // Abort OTA and cleanup
+               return remaining_write_result;
+           }
+           bytes_processed_ += remaining_len;
+        }
+         // Buffer no longer needed, clear length
+         header_buffer_len_ = 0;
+      }
+      // If not enough data for validation yet, stay in kReceivingHeader
+      return CoreUpdateStatus::kOk;
+
+    } // End case kReceivingHeader
+
+    case UpdateState::kReceivingData: {
+      // Header already validated and written, just write incoming data
+      CoreUpdateStatus write_result = WriteDataInternal(data, len); // Returns CoreUpdateStatus
+      if (write_result != CoreUpdateStatus::kOk) {
+         ESP_LOGE(kTag, "Failed to write data chunk (%d). Aborting.", static_cast<int>(write_result));
+         current_state_ = UpdateState::kError;
+         Cleanup(true); // Abort OTA and cleanup
+         return write_result;
+      }
+      bytes_processed_ += len;
+       // Optional: Log progress periodically
+       if (expected_image_size_ > 0 && bytes_processed_ >= expected_image_size_) {
+            ESP_LOGI(kTag, "Received expected bytes: %zu / %zu", bytes_processed_, expected_image_size_);
+       } else if (expected_image_size_ > 0 && (bytes_processed_ % (64 * 1024) < len)) { // Log roughly every 64KB
+           ESP_LOGI(kTag, "Progress: %zu / %zu bytes written (%.1f%%)",
+                    bytes_processed_, expected_image_size_,
+                    (100.0 * bytes_processed_) / expected_image_size_);
+       } else if (bytes_processed_ % (64 * 1024) < len) { // Log if size unknown
+            ESP_LOGI(kTag, "Progress: %zu bytes written", bytes_processed_);
+       }
+      return CoreUpdateStatus::kOk;
+
+    } // End case kReceivingData
+
+    case UpdateState::kIdle:
+    case UpdateState::kFinishing:
+    case UpdateState::kAborted:
+    case UpdateState::kError:
+    default:
+      ESP_LOGE(kTag, "ProcessData failed: Invalid state (%d).",
+               static_cast<int>(current_state_));
+      return CoreUpdateStatus::kErrInvalidState;
+  } // End switch(current_state_)
+}
+
+// --- FinishUpdate ---
+CoreUpdateStatus CoreUpdateModule::FinishUpdate() { // Return CoreUpdateStatus
+  // Can only finish if we were receiving data
+  if (current_state_ != UpdateState::kReceivingData) {
+    ESP_LOGE(kTag, "FinishUpdate failed: Invalid state (%d). Expected kReceivingData.",
+             static_cast<int>(current_state_));
+     if (current_state_ == kIdle || current_state_ == kAborted || current_state_ == kError) {
+         return CoreUpdateStatus::kErrInvalidState;
+     }
+     if (current_state_ == kFinishing) {
+         ESP_LOGW(kTag, "FinishUpdate called multiple times?");
+         return CoreUpdateStatus::kErrInvalidState;
+     }
+     return CoreUpdateStatus::kErrInvalidState;
+  }
+
+  // Sanity check internal pointers
+  if (update_handle_ == nullptr || update_partition_ == nullptr) {
+    ESP_LOGE(kTag, "FinishUpdate failed: Internal handle or partition is NULL.");
+    current_state_ = UpdateState::kError;
+    Cleanup(true); // Attempt cleanup
+    return CoreUpdateStatus::kErrInternal;
+  }
+
+  // Check if expected size (if known) matches processed size
+  if (expected_image_size_ > 0 && bytes_processed_ != expected_image_size_) {
+      ESP_LOGW(kTag, "Processed bytes (%zu) != Expected size (%zu). Proceeding with final validation.",
+               bytes_processed_, expected_image_size_);
+       // Let esp_ota_end perform the definitive validation
+  }
+   if (expected_image_size_ == 0) {
+       ESP_LOGW(kTag, "Finishing update without validated header size information.");
+   }
+
+
+  ESP_LOGI(kTag, "Finishing OTA update. Total bytes processed: %zu", bytes_processed_);
+  current_state_ = UpdateState::kFinishing; // Mark as finishing
+
+  // --- ESP-IDF Specific Logic ---
+  esp_ota_handle_t ota_handle = reinterpret_cast<esp_ota_handle_t>(update_handle_);
+  const esp_partition_t* partition =
+      static_cast<const esp_partition_t*>(update_partition_);
+
+  esp_err_t err = esp_ota_end(ota_handle);
+  update_handle_ = nullptr; // Handle is invalid after esp_ota_end
+
+  if (err != ESP_OK) {
+    ESP_LOGE(kTag, "esp_ota_end failed: %s (0x%x).", esp_err_to_name(err), err);
+    if (err == ESP_ERR_OTA_VALIDATE_FAILED) {
+      ESP_LOGE(kTag, "Image validation failed (checksum/signature/size mismatch?).");
+    }
+    current_state_ = UpdateState::kError; // Set error state
+    Cleanup(false); // Cleanup state vars, OTA already ended/failed
+    return MapError(err);
+  }
+
+  // Set the boot partition to the newly updated partition
+  err = esp_ota_set_boot_partition(partition);
+  if (err != ESP_OK) {
+    ESP_LOGE(kTag, "esp_ota_set_boot_partition failed: %s (0x%x)",
+             esp_err_to_name(err), err);
+    current_state_ = UpdateState::kError; // Set error state
+    Cleanup(false); // Cleanup state vars
+    return MapError(err);
+  }
+  // --- End ESP-IDF Specific Logic ---
+
+  // Update finished successfully
+  ESP_LOGI(kTag, "OTA update successful. Set boot partition. Please restart the device.");
+  current_state_ = UpdateState::kIdle; // Transition back to Idle
+  Cleanup(false); // Perform final cleanup of state variables
+
+  return CoreUpdateStatus::kOk;
+}
+
+// --- AbortUpdate ---
+CoreUpdateStatus CoreUpdateModule::AbortUpdate() { // Return CoreUpdateStatus
+  // Check if already in a terminal state
+  if (current_state_ == UpdateState::kIdle ||
+      current_state_ == UpdateState::kAborted) {
+    ESP_LOGD(kTag, "AbortUpdate called but no active update was in progress or already aborted.");
+    return CoreUpdateStatus::kOk;
+  }
+  if (current_state_ == UpdateState::kError) {
+     ESP_LOGW(kTag, "AbortUpdate called while in Error state. Ensuring cleanup and setting state to Aborted.");
+  } else {
+     ESP_LOGW(kTag, "Aborting OTA update process from state %d.", static_cast<int>(current_state_));
+  }
+
+  CoreUpdateStatus result = CoreUpdateStatus::kOk; // Default success
+
+  // --- ESP-IDF Specific Logic ---
+  if (update_handle_ != nullptr) {
+    esp_ota_handle_t ota_handle = reinterpret_cast<esp_ota_handle_t>(update_handle_);
+    esp_err_t err = esp_ota_abort(ota_handle);
+    update_handle_ = nullptr; // Mark handle as invalid after abort attempt
+    if (err != ESP_OK) {
+      ESP_LOGE(kTag, "esp_ota_abort failed: %s (0x%x). Continuing cleanup.",
+               esp_err_to_name(err), err);
+      result = MapError(err); // Report the abort error, but still cleanup
+    } else {
+      ESP_LOGI(kTag, "esp_ota_abort succeeded.");
+    }
+  } else {
+    ESP_LOGW(kTag, "AbortUpdate called when OTA handle was already invalid/null.");
+  }
+  // --- End ESP-IDF Specific Logic ---
+
+  current_state_ = UpdateState::kAborted; // Set state to Aborted *before* cleanup
+  Cleanup(false); // Perform cleanup (don't call abort again)
+  return result;
+}
+
+// --- IsInProgress ---
+bool CoreUpdateModule::IsInProgress() const {
+  return current_state_ != UpdateState::kIdle &&
+         current_state_ != UpdateState::kAborted &&
+         current_state_ != UpdateState::kError;
+}
+
+// --- GetCurrentState ---
+int CoreUpdateModule::GetCurrentState() const {
+  // Return the underlying integer value of the internal state enum
+  return static_cast<int>(current_state_);
+}
+
+// --- GetBytesProcessed ---
+size_t CoreUpdateModule::GetBytesProcessed() const {
+    return bytes_processed_;
+}
+
+// --- GetExpectedImageSize ---
+size_t CoreUpdateModule::GetExpectedImageSize() const {
+    return expected_image_size_;
+}
+
+
+// --- ValidateHeader (Private Helper - Platform Specific) ---
+CoreUpdateStatus CoreUpdateModule::ValidateHeader() { // Return CoreUpdateStatus
+  // Check if enough data has actually been buffered for validation
+  if (header_buffer_len_ < platform_validation_header_size_) {
+    ESP_LOGE(kTag, "ValidateHeader called with insufficient data (%zu / %zu bytes)",
+             header_buffer_len_, platform_validation_header_size_);
+    return CoreUpdateStatus::kErrInternal;
+  }
+
+  // --- ESP-IDF Specific Validation ---
+  // Use .data() method of std::array to get pointer
+  const esp_image_header_t* header =
+      reinterpret_cast<const esp_image_header_t*>(header_buffer_data_.data());
+
+  // 1. Check Magic Number
+  if (header->magic != ESP_IMAGE_HEADER_MAGIC) {
+    ESP_LOGE(kTag, "Header validation failed: Invalid magic number (0x%x != 0x%x)",
+             (unsigned int)header->magic, (unsigned int)ESP_IMAGE_HEADER_MAGIC);
+    return CoreUpdateStatus::kErrBadHeaderMagic;
+  }
+  ESP_LOGI(kTag, "Header magic number OK (0x%x)", (unsigned int)header->magic);
+
+  // 2. Check Target Chip ID
+  esp_chip_info_t chip_info;
+  esp_chip_info(&chip_info);
+  ESP_LOGI(kTag, "Device Chip ID: %d, Revision: %d", chip_info.model, chip_info.revision);
+  ESP_LOGI(kTag, "Firmware Header Chip ID: %d", header->chip_id);
+
+  if (header->chip_id != chip_info.model) {
+    ESP_LOGE(kTag, "Header validation failed: Chip ID mismatch (Header: %d, Device: %d)",
+             header->chip_id, chip_info.model);
+    return CoreUpdateStatus::kErrWrongTarget;
+  }
+  ESP_LOGI(kTag, "Header chip ID matches device.");
+
+  // 3. Attempt to read Expected Image Size from App Descriptor
+  expected_image_size_ = 0; // Reset before check
+  // Use .data() method of std::array to get pointer
+  const esp_app_desc_t* app_desc = reinterpret_cast<const esp_app_desc_t*>(
+      header_buffer_data_.data() + kEspIdfAppDescriptorOffset
+  );
+
+  if (app_desc->magic_word == ESP_APP_DESC_MAGIC_WORD) {
+       expected_image_size_ = app_desc->app_size;
+       ESP_LOGI(kTag, "Found app descriptor. Expected image size: %zu", expected_image_size_);
+       if (initial_total_size_arg_ != kCoreUpdateSizeUnknown &&
+           initial_total_size_arg_ != expected_image_size_) {
+            ESP_LOGW(kTag, "Initial size arg (%zu) differs from app_desc size (%zu). Using app_desc size.",
+                     initial_total_size_arg_, expected_image_size_);
+       }
+       // Basic sanity check on reported size
+       if (expected_image_size_ == 0 || expected_image_size_ > 16 * 1024 * 1024) { // e.g. > 16MB
+            ESP_LOGE(kTag, "App descriptor size %zu seems invalid.", expected_image_size_);
+            return CoreUpdateStatus::kErrValidateFailed;
+       }
+
+  } else {
+       ESP_LOGW(kTag, "App descriptor magic word mismatch (0x%08lx != 0x%08lx). Cannot determine size from app descriptor.",
+                (unsigned long)app_desc->magic_word, (unsigned long)ESP_APP_DESC_MAGIC_WORD);
+       // Keep expected_image_size_ as 0
+  }
+  // --- End ESP-IDF Specific Validation ---
+
+  return CoreUpdateStatus::kOk;
+}
+
+
+// --- WriteDataInternal (Private Helper - Platform Specific) ---
+CoreUpdateStatus CoreUpdateModule::WriteDataInternal(const uint8_t* data, size_t len) { // Return CoreUpdateStatus
+     if (update_handle_ == nullptr) {
+         ESP_LOGE(kTag, "WriteDataInternal failed: Internal update handle is NULL.");
+         return CoreUpdateStatus::kErrInternal;
+    }
+     if (data == nullptr || len == 0) {
+         ESP_LOGE(kTag, "WriteDataInternal failed: Invalid arguments (data=%p, len=%zu).",
+                  static_cast<const void*>(data), len); // Use %p for pointer
+         return CoreUpdateStatus::kErrInvalidArg;
+     }
+
+    // --- ESP-IDF Specific Logic ---
+    esp_ota_handle_t ota_handle = reinterpret_cast<esp_ota_handle_t>(update_handle_);
+    esp_err_t err = esp_ota_write(ota_handle, data, len);
+    // --- End ESP-IDF Specific Logic ---
+
+    if (err != ESP_OK) {
+        ESP_LOGE(kTag, "esp_ota_write failed: %s (0x%x)", esp_err_to_name(err), err);
+        return MapError(err);
+    }
+    return CoreUpdateStatus::kOk;
+}
+
+
+// --- cleanup (Private Helper) ---
+void CoreUpdateModule::Cleanup(bool abort_ota) {
+  ESP_LOGD(kTag, "Cleanup called. Abort flag: %d, Current State: %d",
+           abort_ota, static_cast<int>(current_state_));
+
+  // --- ESP-IDF Specific Cleanup ---
+  if (abort_ota && update_handle_ != nullptr) {
+    ESP_LOGW(kTag, "Attempting platform OTA abort during cleanup.");
+    esp_ota_handle_t ota_handle = reinterpret_cast<esp_ota_handle_t>(update_handle_);
+    esp_err_t abort_err = esp_ota_abort(ota_handle);
+    update_handle_ = nullptr; // Handle is invalidated by esp_ota_abort
+    if (abort_err != ESP_OK) {
+      ESP_LOGE(kTag, "esp_ota_abort failed during cleanup: %s (0x%x).",
+               esp_err_to_name(abort_err), abort_err);
+    } else {
+        ESP_LOGI(kTag, "Platform OTA abort successful during cleanup.");
+    }
+  }
+  // --- End ESP-IDF Specific Cleanup ---
+
+  // Reset internal state variables
+  update_handle_ = nullptr; // Ensure handle is null after cleanup/abort attempt
+  update_partition_ = nullptr;
+  bytes_processed_ = 0;
+  expected_image_size_ = 0;
+  initial_total_size_arg_ = 0;
+  header_buffer_len_ = 0; // Reset buffer length
+  // std::array data doesn't need explicit clearing, only the length tracker
+
+  // Caller is responsible for setting the final state (kIdle, kAborted, kError)
+  ESP_LOGD(kTag, "Internal variables cleaned up. State remains %d.", static_cast<int>(current_state_));
+}
