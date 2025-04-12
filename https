@@ -1,0 +1,747 @@
+/**
+ * @file http_client.h
+ * @brief Defines a generic C++ HTTP/S client wrapper interface.
+ * @version 1.1
+ * @date 2025-04-13
+ *
+ * Provides a reusable class interface for making HTTP and HTTPS requests
+ * (GET, POST, PUT, DELETE) with support for headers, simple request bodies,
+ * response streaming, persistent connections (Keep-Alive), and TLS configuration.
+ * This header file is platform-agnostic. The implementation details are
+ * platform-specific (e.g., using ESP-IDF esp_http_client).
+ *
+ * Copyright 2025 Google LLC
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+#ifndef HTTP_CLIENT_H_
+#define HTTP_CLIENT_H_
+
+#include <string>
+#include <vector>
+#include <map>
+#include <functional>
+#include <memory> // For std::unique_ptr (though not used currently)
+#include <cstdint>
+#include <cstddef>
+
+/**
+ * @enum HttpMethod
+ * @brief Standard HTTP request methods.
+ */
+enum class HttpMethod {
+    kGet,
+    kPost,
+    kPut,
+    kDelete,
+    kPatch,
+    kHead,
+    kOptions
+    // Add others if needed
+};
+
+/**
+ * @enum HttpClientStatus
+ * @brief Status codes returned by the HttpClient methods.
+ */
+enum class HttpClientStatus {
+    kOk = 0,                 ///< Operation completed successfully.
+    kFail = -1,              ///< Generic failure occurred.
+    kTimeout = -2,           ///< Operation timed out.
+    kConnectionError = -3,   ///< Failed to establish connection.
+    kSslError = -4,          ///< TLS/SSL handshake or certificate error.
+    kHttpError = -5,         ///< HTTP protocol level error (non-2xx status code).
+    kInvalidArgument = -6,   ///< Invalid argument provided.
+    kInternalError = -7,     ///< Internal client error.
+    kSendError = -8,         ///< Error sending request data.
+    kRecvError = -9,         ///< Error receiving response data.
+    kOutOfMemory = -10,      ///< Memory allocation failed.
+    kCallbackError = -11,    ///< Error occurred within a user-provided callback or callback stopped processing.
+    kParseError = -12        ///< Error parsing URL or other data.
+};
+
+/**
+ * @typedef ResponseBodyCallback
+ * @brief Callback function type for handling incoming response body data chunks.
+ * @param data Pointer to the data chunk.
+ * @param len Length of the data chunk.
+ * @return true to continue receiving data, false to stop the transfer.
+ */
+using ResponseBodyCallback = std::function<bool(const char* data, size_t len)>;
+
+/**
+ * @struct HttpRequest
+ * @brief Structure representing an HTTP request.
+ */
+struct HttpRequest {
+    HttpMethod method = HttpMethod::kGet; ///< HTTP method.
+    std::string url;                      ///< Full URL (e.g., "https://example.com:443/path"). Must include scheme.
+    std::map<std::string, std::string> headers; ///< Request headers.
+    std::string body;                     ///< Request body (for POST, PUT, PATCH).
+                                          ///< @note Streaming request body upload is not directly supported via callback in this version.
+
+    // @TODO: Add support for streaming request body via callback or other mechanism.
+};
+
+/**
+ * @struct HttpResponse
+ * @brief Structure representing an HTTP response.
+ */
+struct HttpResponse {
+    HttpClientStatus status = HttpClientStatus::kFail; ///< Overall status of the request execution.
+    int http_status_code = 0;                 ///< HTTP status code returned by the server (e.g., 200, 404).
+    std::map<std::string, std::string> headers; ///< Response headers.
+    std::string body;                         ///< Response body. Populated only if no response_body_callback is provided in Execute.
+                                              ///< @warning Can consume significant memory for large responses. Use callback for large files.
+    long long content_length = -1;            ///< Content-Length from response headers, or -1 if unknown.
+};
+
+/**
+ * @struct HttpClientConfig
+ * @brief Configuration options for the HttpClient.
+ */
+struct HttpClientConfig {
+    const char* server_cert_pem = nullptr; ///< Server Root CA certificate (PEM format) for verification. NULL = skip verification (INSECURE).
+    const char* client_cert_pem = nullptr; ///< Client certificate (PEM format) for mutual TLS. NULL = disabled.
+    const char* client_key_pem = nullptr;  ///< Client private key (PEM format) for mutual TLS. NULL = disabled.
+    bool skip_cert_common_name_check = false; ///< If true, skip CN validation (INSECURE when server_cert_pem is set).
+    bool use_global_platform_ca_store = false; ///< Use the platform's global CA store (e.g., ESP-IDF's).
+    int timeout_ms = 15000;                ///< Connection/request timeout in milliseconds.
+    bool keep_alive_enable = true;         ///< Enable HTTP Keep-Alive.
+    int keep_alive_idle_s = 5;             ///< Keep-Alive idle time (seconds).
+    int keep_alive_interval_s = 5;         ///< Keep-Alive interval (seconds).
+    int keep_alive_count = 3;              ///< Keep-Alive retry count.
+    int buffer_size_rx = 0;                ///< Receive buffer size (0 = platform default).
+    int buffer_size_tx = 0;                ///< Transmit buffer size (0 = platform default).
+    // @TODO: Add options for proxy, authentication, etc.
+};
+
+/**
+ * @class HttpClient
+ * @brief A C++ wrapper providing a generic interface for HTTP/S communication.
+ *
+ * Provides methods to execute HTTP/S requests and handles configuration,
+ * persistent connections (Keep-Alive), and response streaming. The implementation
+ * uses a platform-specific backend (e.g., ESP-IDF esp_http_client).
+ */
+class HttpClient {
+ public:
+  /**
+   * @brief Constructor.
+   * @param config Configuration settings for the client.
+   */
+  explicit HttpClient(const HttpClientConfig& config = HttpClientConfig());
+
+  /**
+   * @brief Destructor. Cleans up any open connections.
+   */
+  ~HttpClient();
+
+  // Prevent copying and assignment
+  HttpClient(const HttpClient&) = delete;
+  HttpClient& operator=(const HttpClient&) = delete;
+
+  /**
+   * @brief Executes an HTTP/S request.
+   *
+   * Configures and performs the request based on the HttpRequest details.
+   * Handles connection management (attempts reuse if possible based on scheme,
+   * host, and port).
+   *
+   * @param request The HttpRequest object detailing the request.
+   * @param response_body_callback Optional callback function to handle response
+   * body chunks directly (for streaming). If nullptr, the response body will be
+   * buffered into HttpResponse::body.
+   * @return HttpResponse object containing the result. Check response.status first.
+   */
+  HttpResponse Execute(const HttpRequest& request,
+                       ResponseBodyCallback response_body_callback = nullptr);
+
+  /**
+   * @brief Closes the underlying persistent connection, if open.
+   * Useful if the client instance will no longer be used soon or to force
+   * a new connection on the next request.
+   */
+  void CloseConnection();
+
+ private:
+   /**
+    * @struct RequestContext
+    * @brief Internal struct to pass data to the platform's event handler.
+    */
+   struct RequestContext {
+       HttpResponse* response = nullptr;
+       ResponseBodyCallback callback = nullptr;
+       HttpClientStatus* last_error = nullptr;
+       bool stop_processing = false; // Flag to signal callback wants to stop
+   };
+
+   /**
+    * @struct ParsedUrl
+    * @brief Holds components of a parsed URL for connection reuse checks.
+    */
+   struct ParsedUrl {
+       std::string scheme;
+       std::string host;
+       int port = 0;
+       std::string path; // Includes query/fragment for simplicity here
+       bool is_valid = false;
+   };
+
+  /**
+   * @brief Configures the platform-specific client handle based on the request and stored config.
+   * Creates a new handle if necessary or reconfigures an existing one.
+   * @param request The current HTTP request.
+   * @param parsed_url The parsed components of the request URL.
+   * @return int Platform-specific error code (e.g., esp_err_t). 0 on success.
+   */
+  int ConfigurePlatformClient(const HttpRequest& request, const ParsedUrl& parsed_url);
+
+   /**
+    * @brief Checks if the current client handle is suitable for the new request URL.
+    * Used for persistent connection logic. Compares scheme, host, and port.
+    * @param parsed_url The parsed components of the new request URL.
+    * @return true if the handle can be reused, false otherwise.
+    */
+   bool CanReuseConnection(const ParsedUrl& parsed_url) const;
+
+   /**
+    * @brief Parses a URL string into its basic components.
+    * @param url The URL string to parse.
+    * @return ParsedUrl structure. Check parsed_url.is_valid.
+    */
+   static ParsedUrl ParseUrl(const std::string& url);
+
+  /**
+   * @brief Maps platform-specific error codes to HttpClientStatus.
+   * @param platform_err The platform-specific error code (e.g., esp_err_t as int).
+   * @return HttpClientStatus The corresponding status code.
+   */
+  static HttpClientStatus MapPlatformError(int platform_err);
+
+  // --- Member Variables ---
+  HttpClientConfig config_;            ///< Client configuration.
+  void* platform_client_handle_ = nullptr; ///< Opaque handle for the platform's HTTP client.
+  // Store components of the current connection for reuse checks
+  std::string current_scheme_;
+  std::string current_host_;
+  int current_port_ = 0;
+
+  RequestContext current_request_context_; ///< Context for the ongoing request passed to event handler.
+};
+
+#endif // HTTP_CLIENT_H_
+
+
+// ========================================================================== //
+// =================== Implementation (http_client.cpp) =================== //
+// ========================================================================== //
+
+/**
+ * @file http_client.cpp
+ * @brief Implements the generic C++ HTTP/S client wrapper using ESP-IDF.
+ * @version 1.1
+ * @date 2025-04-13
+ *
+ * Uses ESP-IDF esp_http_client component as the backend.
+ *
+ * Copyright 2025 Google LLC
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#include "http_client.h"
+
+// --- ESP-IDF Specific Includes ---
+#include <esp_log.h>
+#include <esp_http_client.h>
+#include <esp_tls.h> // For esp_tls_get_and_init_global_ca_store if used
+#include <algorithm> // For std::min, std::transform
+#include <cctype>    // For std::tolower
+// --- End ESP-IDF Specific Includes ---
+
+
+// Define TAG for logging
+static const char* kTag = "HttpClient";
+
+// --- Forward Declarations for Static Functions ---
+static esp_err_t HttpEventHandlerStatic(esp_http_client_event_t* evt);
+
+// --- Constructor ---
+HttpClient::HttpClient(const HttpClientConfig& config)
+ : config_(config),
+   platform_client_handle_(nullptr),
+   current_port_(0)
+{
+  ESP_LOGI(kTag, "HttpClient instance created.");
+  // Note: Global CA store initialization might be better done once globally
+  // if config_.use_global_platform_ca_store is true.
+}
+
+// --- Destructor ---
+HttpClient::~HttpClient() {
+  ESP_LOGI(kTag, "HttpClient instance destroyed.");
+  CloseConnection(); // Ensure connection is closed and handle cleaned up
+}
+
+// --- CloseConnection ---
+void HttpClient::CloseConnection() {
+    // Cast void* back to platform type
+    esp_http_client_handle_t handle = static_cast<esp_http_client_handle_t>(platform_client_handle_);
+    if (handle != nullptr) {
+        ESP_LOGI(kTag, "Closing connection and cleaning up client handle for %s://%s:%d",
+                 current_scheme_.c_str(), current_host_.c_str(), current_port_);
+        esp_http_client_close(handle);
+        esp_err_t cleanup_err = esp_http_client_cleanup(handle);
+         if (cleanup_err != ESP_OK) {
+            ESP_LOGE(kTag, "esp_http_client_cleanup failed: %s", esp_err_to_name(cleanup_err));
+         }
+        platform_client_handle_ = nullptr;
+        current_scheme_ = "";
+        current_host_ = "";
+        current_port_ = 0;
+    }
+}
+
+// --- ParseUrl (Static Helper) ---
+HttpClient::ParsedUrl HttpClient::ParseUrl(const std::string& url) {
+    ParsedUrl result;
+    result.is_valid = false; // Default to invalid
+
+    size_t scheme_end = url.find("://");
+    if (scheme_end == std::string::npos) {
+        ESP_LOGE(kTag, "URL Parsing failed: Scheme separator '://' not found.");
+        return result;
+    }
+    result.scheme = url.substr(0, scheme_end);
+    std::transform(result.scheme.begin(), result.scheme.end(), result.scheme.begin(), ::tolower); // Normalize scheme
+
+    size_t host_start = scheme_end + 3;
+    size_t path_start = url.find('/', host_start);
+    size_t port_delim = url.find(':', host_start);
+
+    std::string host_port_part;
+    if (path_start == std::string::npos) {
+        host_port_part = url.substr(host_start);
+        result.path = "/"; // Default path if none specified
+    } else {
+        host_port_part = url.substr(host_start, path_start - host_start);
+        result.path = url.substr(path_start);
+    }
+
+    if (port_delim != std::string::npos && (path_start == std::string::npos || port_delim < path_start)) {
+        // Port is specified
+        result.host = host_port_part.substr(0, port_delim - host_start);
+        try {
+            result.port = std::stoi(host_port_part.substr(port_delim - host_start + 1));
+        } catch (const std::exception& e) {
+            ESP_LOGE(kTag, "URL Parsing failed: Invalid port number. %s", e.what());
+            return result; // Invalid port
+        }
+    } else {
+        // Port not specified, use default
+        result.host = host_port_part;
+        if (result.scheme == "https") {
+            result.port = 443;
+        } else if (result.scheme == "http") {
+            result.port = 80;
+        } else {
+             ESP_LOGE(kTag, "URL Parsing failed: Cannot determine default port for scheme '%s'", result.scheme.c_str());
+            return result; // Unknown scheme default port
+        }
+    }
+
+    if (result.host.empty()) {
+         ESP_LOGE(kTag, "URL Parsing failed: Host is empty.");
+        return result;
+    }
+
+    result.is_valid = true;
+    ESP_LOGD(kTag, "Parsed URL: Scheme=%s, Host=%s, Port=%d, Path=%s",
+             result.scheme.c_str(), result.host.c_str(), result.port, result.path.c_str());
+    return result;
+}
+
+
+// --- CanReuseConnection ---
+bool HttpClient::CanReuseConnection(const ParsedUrl& parsed_url) const {
+    if (!config_.keep_alive_enable || platform_client_handle_ == nullptr || !parsed_url.is_valid) {
+        return false;
+    }
+    // Check if scheme, host, and port match the current handle's details
+    return parsed_url.scheme == current_scheme_ &&
+           parsed_url.host == current_host_ &&
+           parsed_url.port == current_port_;
+}
+
+
+// --- ConfigurePlatformClient ---
+int HttpClient::ConfigurePlatformClient(const HttpRequest& request, const ParsedUrl& parsed_url) {
+    // Cast void* back to platform type
+    esp_http_client_handle_t handle = static_cast<esp_http_client_handle_t>(platform_client_handle_);
+
+    // Check if we need a new handle
+    if (!CanReuseConnection(parsed_url)) {
+        CloseConnection(); // Close existing connection if not reusable
+        handle = nullptr; // Ensure handle is null so we create a new one
+    }
+
+    esp_http_client_config_t esp_config = {}; // Zero initialize
+    esp_config.url = request.url.c_str(); // Still needed for initial setup
+    esp_config.host = parsed_url.host.c_str();
+    esp_config.port = parsed_url.port;
+    esp_config.path = parsed_url.path.c_str();
+    esp_config.transport_type = (parsed_url.scheme == "https") ? HTTP_TRANSPORT_OVER_SSL : HTTP_TRANSPORT_OVER_TCP;
+    esp_config.event_handler = HttpEventHandlerStatic; // Static handler defined in this file
+    esp_config.user_data = &current_request_context_; // Pass context pointer
+    esp_config.timeout_ms = config_.timeout_ms;
+    // TLS settings
+    esp_config.cert_pem = config_.server_cert_pem;
+    esp_config.client_cert_pem = config_.client_cert_pem;
+    esp_config.client_key_pem = config_.client_key_pem;
+    esp_config.use_global_ca_store = config_.use_global_platform_ca_store;
+    esp_config.skip_cert_common_name_check = config_.skip_cert_common_name_check;
+    // Keep-Alive settings
+    esp_config.keep_alive_enable = config_.keep_alive_enable;
+    esp_config.keep_alive_idle = config_.keep_alive_idle_s;
+    esp_config.keep_alive_interval = config_.keep_alive_interval_s;
+    esp_config.keep_alive_cnt = config_.keep_alive_count;
+    // Buffer sizes
+    esp_config.buffer_size = config_.buffer_size_rx;
+    esp_config.buffer_size_tx = config_.buffer_size_tx;
+    // Method (set later based on request.method)
+
+    esp_err_t err = ESP_OK;
+    if (handle == nullptr) {
+        ESP_LOGI(kTag, "Initializing new esp_http_client handle for %s://%s:%d",
+                 parsed_url.scheme.c_str(), parsed_url.host.c_str(), parsed_url.port);
+        handle = esp_http_client_init(&esp_config);
+        if (handle == nullptr) {
+            ESP_LOGE(kTag, "esp_http_client_init failed");
+            return ESP_FAIL; // Return platform error
+        }
+        // Store details of the new connection
+        platform_client_handle_ = handle; // Store opaque handle
+        current_scheme_ = parsed_url.scheme;
+        current_host_ = parsed_url.host;
+        current_port_ = parsed_url.port;
+    } else {
+        ESP_LOGI(kTag, "Reusing existing esp_http_client handle for %s://%s:%d",
+                 parsed_url.scheme.c_str(), parsed_url.host.c_str(), parsed_url.port);
+        // Handle might need reconfiguration if certain aspects changed, but
+        // CanReuseConnection should ensure basic compatibility.
+        // We might need to update path specifically if reusing handle.
+        // esp_http_client_set_url also updates host/port/path/scheme implicitly.
+        // Let's just set the URL again for simplicity, although it might reset some state.
+         err = esp_http_client_set_url(handle, request.url.c_str());
+         if (err != ESP_OK) {
+             ESP_LOGE(kTag, "esp_http_client_set_url failed during reconfiguration: %s", esp_err_to_name(err));
+             CloseConnection(); // Clean up handle
+             return err;
+         }
+    }
+
+    // Set HTTP Method
+    http_method method_platform; // Platform specific type
+    switch (request.method) {
+        case HttpMethod::kGet:    method_platform = HTTP_METHOD_GET; break;
+        case HttpMethod::kPost:   method_platform = HTTP_METHOD_POST; break;
+        case HttpMethod::kPut:    method_platform = HTTP_METHOD_PUT; break;
+        case HttpMethod::kDelete: method_platform = HTTP_METHOD_DELETE; break;
+        case HttpMethod::kPatch:  method_platform = HTTP_METHOD_PATCH; break;
+        case HttpMethod::kHead:   method_platform = HTTP_METHOD_HEAD; break;
+        case HttpMethod::kOptions:method_platform = HTTP_METHOD_OPTIONS; break;
+        default:
+            ESP_LOGE(kTag, "Unsupported HTTP method: %d", static_cast<int>(request.method));
+            CloseConnection();
+            return ESP_ERR_INVALID_ARG; // Return platform error
+    }
+    err = esp_http_client_set_method(handle, method_platform);
+    if (err != ESP_OK) {
+         ESP_LOGE(kTag, "Failed to set HTTP method: %s", esp_err_to_name(err));
+         CloseConnection();
+         return err;
+    }
+
+    // Set Request Body (if applicable and not streaming upload)
+    if (!request.body.empty()) {
+        if (request.method == HttpMethod::kPost || request.method == HttpMethod::kPatch || request.method == HttpMethod::kPut) {
+             err = esp_http_client_set_post_field(handle, request.body.c_str(), request.body.length());
+             if (err != ESP_OK) {
+                 ESP_LOGE(kTag, "Failed to set request body: %s", esp_err_to_name(err));
+                 CloseConnection();
+                 return err;
+             }
+        } else {
+            ESP_LOGW(kTag, "Request body provided for non-POST/PUT/PATCH method (%d), ignoring.", static_cast<int>(request.method));
+        }
+    }
+
+    // Set Request Headers
+    // It's safer to clear old headers if the handle is reused. ESP-IDF client doesn't
+    // have a clear function, so we rely on setting new ones (potential issue if
+    // default headers from init interfere, but usually okay).
+    for (const auto& header : request.headers) {
+        err = esp_http_client_set_header(handle, header.first.c_str(), header.second.c_str());
+        if (err != ESP_OK) {
+            ESP_LOGE(kTag, "Failed to set header '%s': %s", header.first.c_str(), esp_err_to_name(err));
+            CloseConnection();
+            return err;
+        }
+    }
+    // Ensure Content-Type is set if body exists and not already provided
+    if (!request.body.empty() && request.headers.find("Content-Type") == request.headers.end()) {
+         ESP_LOGD(kTag, "Setting default Content-Type to application/octet-stream");
+         err = esp_http_client_set_header(handle, "Content-Type", "application/octet-stream");
+          if (err != ESP_OK) {
+             ESP_LOGE(kTag, "Failed to set default Content-Type header: %s", esp_err_to_name(err));
+             CloseConnection();
+             return err;
+         }
+    }
+
+
+    return ESP_OK; // Return platform success code
+}
+
+// --- Execute ---
+HttpResponse HttpClient::Execute(const HttpRequest& request,
+                                 ResponseBodyCallback response_body_callback) {
+  HttpResponse response; // Initialize response object for this request
+  response.status = HttpClientStatus::kFail; // Default to failure
+
+  // 1. Parse URL
+  ParsedUrl parsed_url = ParseUrl(request.url);
+  if (!parsed_url.is_valid) {
+      ESP_LOGE(kTag, "Invalid URL provided: %s", request.url.c_str());
+      response.status = HttpClientStatus::kInvalidArgument;
+      return response;
+  }
+
+  // 2. Prepare context for event handler
+  current_request_context_.response = &response;
+  current_request_context_.callback = response_body_callback;
+  current_request_context_.last_error = &response.status; // Event handler can update status
+  current_request_context_.stop_processing = false; // Reset stop flag
+
+  // 3. Configure the underlying ESP client handle (reuse or create new)
+  int config_err_int = ConfigurePlatformClient(request, parsed_url); // Returns platform error code
+  if (config_err_int != 0) { // Check platform error code
+      ESP_LOGE(kTag, "Failed to configure ESP HTTP client (Error: %d)", config_err_int);
+      response.status = MapPlatformError(config_err_int); // Map platform error
+      // CloseConnection was likely called within ConfigurePlatformClient on error
+      return response;
+  }
+
+  // 4. Perform the HTTP request (this is blocking)
+  ESP_LOGI(kTag, "Executing HTTP request to %s...", request.url.c_str());
+  // Cast void* back to platform type
+  esp_http_client_handle_t handle = static_cast<esp_http_client_handle_t>(platform_client_handle_);
+  esp_err_t perform_err = esp_http_client_perform(handle);
+
+  // --- 5. Process Results after Perform ---
+  if (perform_err == ESP_OK) {
+      // Request executed without transport/connection errors
+      response.http_status_code = esp_http_client_get_status_code(handle);
+      response.content_length = esp_http_client_get_content_length(handle);
+      ESP_LOGI(kTag, "Request finished. HTTP Status = %d, Content-Length = %lld",
+               response.http_status_code, response.content_length);
+
+      // Check if callback requested early termination
+      if (current_request_context_.stop_processing) {
+           ESP_LOGW(kTag, "Request processing stopped early by response callback.");
+           response.status = HttpClientStatus::kCallbackError;
+      }
+      // Check if event handler set an error status despite perform returning OK
+      else if (response.status != HttpClientStatus::kFail && response.status != HttpClientStatus::kOk) {
+           ESP_LOGW(kTag, "HTTP perform OK, but event handler set error status: %d", static_cast<int>(response.status));
+           // Keep the error status set by the handler
+      }
+      // Determine final status based on HTTP code if no other error occurred
+      else if (response.http_status_code >= 200 && response.http_status_code < 300) {
+          response.status = HttpClientStatus::kOk;
+      } else {
+          ESP_LOGW(kTag, "HTTP request failed with status code: %d", response.http_status_code);
+          response.status = HttpClientStatus::kHttpError;
+      }
+
+  } else if (perform_err == ESP_ERR_HTTP_EAGAIN) {
+        ESP_LOGW(kTag, "HTTP client perform returned EAGAIN. Timeout?");
+        response.status = HttpClientStatus::kTimeout;
+  } else {
+      ESP_LOGE(kTag, "HTTP client perform failed: %s (0x%x)", esp_err_to_name(perform_err), perform_err);
+      // Use error set by event handler if available, otherwise map perform_err
+      if (response.status == HttpClientStatus::kFail || response.status == HttpClientStatus::kOk) {
+          response.status = MapPlatformError(perform_err);
+      }
+  }
+
+  // 6. Handle Connection Closure/Keep-Alive
+  if (!config_.keep_alive_enable || response.status != HttpClientStatus::kOk) {
+       CloseConnection(); // Close connection fully on error or if keep-alive disabled
+  } else {
+       // For keep-alive success: close logical request, leave handle open
+       esp_err_t close_err = esp_http_client_close(handle);
+       if (close_err != ESP_OK) {
+            ESP_LOGW(kTag, "esp_http_client_close failed after successful request: %s", esp_err_to_name(close_err));
+            // If close fails, maybe we should clean up fully anyway?
+            CloseConnection();
+       } else {
+           ESP_LOGD(kTag, "Keeping connection alive for potential reuse.");
+       }
+  }
+
+
+  return response;
+}
+
+
+// --- Static Event Handler (ESP-IDF Specific) ---
+static esp_err_t HttpEventHandlerStatic(esp_http_client_event_t* evt) {
+  // Retrieve the context associated with this request
+  HttpClient::RequestContext* context = static_cast<HttpClient::RequestContext*>(evt->user_data);
+  if (context == nullptr || context->response == nullptr || context->last_error == nullptr) {
+      ESP_LOGE(kTag, "HTTP Event Handler: Invalid context!");
+      return ESP_FAIL;
+  }
+
+  // Process events using the context
+  HttpResponse* response = context->response;
+  HttpClientStatus* last_error = context->last_error;
+
+  switch (evt->event_id) {
+      case HTTP_EVENT_ERROR:
+          ESP_LOGE(kTag, "HTTP Client Error event.");
+          // More specific error might be available in evt->error_handle
+          if (evt->error_handle) {
+               // Example: Check for TLS errors
+               if (evt->error_handle->error_type == HTTP_ERROR_TYPE_ESP_TLS) {
+                    ESP_LOGE(kTag, "TLS Error: 0x%x", evt->error_handle->esp_tls_last_esp_err);
+                    *last_error = HttpClientStatus::kSslError;
+               } else if (evt->error_handle->error_type == HTTP_ERROR_TYPE_TCP_TRANSPORT) {
+                    ESP_LOGE(kTag, "TCP Transport Error: errno %d", evt->error_handle->esp_transport_sock_errno);
+                    *last_error = HttpClientStatus::kConnectionError;
+               } else {
+                    *last_error = HttpClientStatus::kConnectionError; // Default connection error
+               }
+          } else {
+               *last_error = HttpClientStatus::kConnectionError;
+          }
+
+          break;
+      case HTTP_EVENT_ON_CONNECTED:
+          ESP_LOGI(kTag, "HTTP_EVENT_ON_CONNECTED");
+          break;
+      case HTTP_EVENT_HEADERS_SENT:
+          ESP_LOGI(kTag, "HTTP_EVENT_HEADERS_SENT");
+          break;
+      case HTTP_EVENT_ON_HEADER:
+          ESP_LOGD(kTag, "HTTP_EVENT_ON_HEADER, key=%s, value=%s", evt->header_key, evt->header_value);
+          if (evt->header_key && evt->header_value) {
+              // Store headers in the response map
+              response->headers[evt->header_key] = evt->header_value;
+          }
+          break;
+      case HTTP_EVENT_ON_DATA:
+          ESP_LOGD(kTag, "HTTP_EVENT_ON_DATA, len=%d", evt->data_len);
+          if (evt->data_len > 0 && !context->stop_processing) {
+              if (context->callback) {
+                  // Use streaming callback
+                  bool continue_processing = context->callback(
+                      static_cast<const char*>(evt->data), evt->data_len);
+                  if (!continue_processing) {
+                      ESP_LOGW(kTag, "Response callback requested stop.");
+                      context->stop_processing = true;
+                      // Returning ESP_FAIL stops esp_http_client_perform
+                      return ESP_FAIL;
+                  }
+              } else {
+                  // Buffer response body if no callback provided
+                  try {
+                      response->body.append(static_cast<const char*>(evt->data), evt->data_len);
+                  } catch (const std::bad_alloc& e) {
+                      ESP_LOGE(kTag, "Failed to allocate memory for response body: %s", e.what());
+                      *last_error = HttpClientStatus::kOutOfMemory;
+                      context->stop_processing = true;
+                      return ESP_FAIL; // Stop processing
+                  } catch (const std::length_error& e) {
+                       ESP_LOGE(kTag, "Response body exceeded maximum size: %s", e.what());
+                      *last_error = HttpClientStatus::kOutOfMemory; // Or a specific "too large" error
+                      context->stop_processing = true;
+                      return ESP_FAIL; // Stop processing
+                  }
+              }
+          }
+          break;
+      case HTTP_EVENT_ON_FINISH:
+          ESP_LOGI(kTag, "HTTP_EVENT_ON_FINISH");
+          // Handled after esp_http_client_perform returns
+          break;
+      case HTTP_EVENT_DISCONNECTED:
+          ESP_LOGI(kTag, "HTTP_EVENT_DISCONNECTED");
+          // If this happens unexpectedly, esp_http_client_perform will likely return an error.
+          break;
+      default:
+           ESP_LOGD(kTag, "Unhandled HTTP Event ID: %d", evt->event_id);
+          break;
+  }
+  return ESP_OK;
+}
+
+
+// --- MapPlatformError (Static Helper) ---
+HttpClientStatus HttpClient::MapPlatformError(int platform_err) {
+    esp_err_t err = static_cast<esp_err_t>(platform_err); // Cast to platform specific type
+    switch (err) {
+        case ESP_OK:
+            return HttpClientStatus::kOk;
+        case ESP_ERR_HTTP_CONNECT:
+        case ESP_ERR_ESP_TLS_FAILED_CONNECT:
+        case ESP_ERR_ESP_TLS_CONNECTION_TIMEOUT:
+        // Add more TCP/socket level errors if needed
+            return HttpClientStatus::kConnectionError;
+        case ESP_ERR_HTTP_TIMEOUT:
+            return HttpClientStatus::kTimeout;
+        case ESP_ERR_ESP_TLS_HANDSHAKE_FAILED:
+        case ESP_ERR_ESP_TLS_INVALID_CERT:
+        case ESP_ERR_ESP_TLS_X509_UNKNOWN_SIG_ALG:
+        case ESP_ERR_ESP_TLS_CERT_VERIFY_FAILED:
+        // Add more specific TLS errors
+            return HttpClientStatus::kSslError;
+        case ESP_ERR_HTTP_WRITE_DATA:
+            return HttpClientStatus::kSendError;
+        case ESP_ERR_HTTP_FETCH_HEADER:
+        case ESP_ERR_HTTP_INVALID_RESPONSE: // Treat invalid response as receive error?
+            return HttpClientStatus::kRecvError; // Or maybe kHttpError?
+        case ESP_ERR_HTTP_READ_DATA:
+            return HttpClientStatus::kRecvError;
+        case ESP_ERR_NO_MEM:
+            return HttpClientStatus::kOutOfMemory;
+         case ESP_ERR_INVALID_ARG:
+             return HttpClientStatus::kInvalidArgument;
+         case ESP_FAIL: // Map generic ESP_FAIL
+             return HttpClientStatus::kFail;
+        // Add more mappings as needed
+        default:
+            ESP_LOGW(kTag, "Mapping unknown platform error (0x%x) to kFail", err);
+            return HttpClientStatus::kFail;
+    }
+}
