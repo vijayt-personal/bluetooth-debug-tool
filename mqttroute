@@ -1,0 +1,551 @@
+#include "aws_iot_mqtt_client.hpp" // Our header first
+
+#include <cstring>
+#include <cstdio>
+#include <algorithm>
+
+// --- ESP-IDF specific includes ---
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/semphr.h" // For mutex if enabled
+#include "esp_log.h"
+#include "esp_event.h"
+#include "mqtt_client.h"
+#include "esp_tls.h"
+// --- End ESP-IDF Includes ---
+
+static const char* TAG = "AwsIotMqttClient";
+
+namespace AwsIot {
+
+// --- Conditional Locking Implementation ---
+#ifdef AWS_IOT_CLIENT_THREAD_SAFE
+    #include <mutex>
+    using GuardLock = std::lock_guard<std::mutex>;
+    #define LOCK_INFO "(Thread Safe)"
+#else
+    struct NullLock { template <typename T> NullLock(T&) {} };
+    using GuardLock = NullLock;
+    #warning "AWS IoT MQTT Client Thread Safety Disabled via Kconfig! Ensure single-threaded access or external locking."
+    #define LOCK_INFO "(Thread Safety DISABLED)"
+#endif
+// --- End Conditional Locking ---
+
+
+// Helper macro for casting the opaque handle
+#define GET_MQTT_HANDLE(member_handle_ptr) (static_cast<esp_mqtt_client_handle_t>(member_handle_ptr))
+
+// --- Static callback function definition ---
+static void MqttEventHandlerStatic(void* handler_args, esp_event_base_t base, int32_t event_id, void* event_data);
+
+
+// --- Constructor / Destructor ---
+AwsIotMqttClient::AwsIotMqttClient() {
+    ESP_LOGI(TAG, "Constructor %s", LOCK_INFO);
+    memset(&config_, 0, sizeof(config_));
+    client_handle_ = nullptr;
+    for (auto& sub : subscriptions_) {
+        sub.active = false;
+        sub.pending_subscribe = false;
+    }
+}
+
+AwsIotMqttClient::~AwsIotMqttClient() {
+    ESP_LOGI(TAG, "Destructor called %s", LOCK_INFO);
+    Disconnect();
+}
+
+
+// --- Initialization and Connection ---
+
+bool AwsIotMqttClient::Initialize(const MqttConfig& config) {
+    GuardLock lock(mutex_); // LOCK (Conditional)
+    if (initialized_) { ESP_LOGW(TAG, "Already initialized."); return true; }
+    if (config.aws_endpoint.empty() || config.client_id.empty() || config.thing_name.empty() ||
+        config.root_ca_pem[0] == '\0' || config.device_cert_pem[0] == '\0' || config.private_key_pem[0] == '\0') {
+        ESP_LOGE(TAG, "Init failed: Missing config/certs."); return false;
+    }
+    config_ = config;
+    initialized_ = true;
+    disconnect_requested_ = false;
+    ESP_LOGI(TAG, "Client initialized for %s", config_.client_id.c_str());
+    ESP_LOGI(TAG, "Config size: %d bytes", (int)sizeof(config_));
+    return true;
+} // UNLOCK (RAII)
+
+bool AwsIotMqttClient::InitializeMqttClient() {
+    // Assumes mutex_ is locked
+    if (client_handle_) { CleanupMqttClient(); }
+    esp_mqtt_client_config_t mqtt_cfg = {};
+    if (config_.root_ca_pem[0] == '\0' || config_.device_cert_pem[0] == '\0' || config_.private_key_pem[0] == '\0') { ESP_LOGE(TAG, "Internal cert data empty!"); return false; }
+    std::string uri = "mqtts://" + config_.aws_endpoint + ":" + std::to_string(config_.port);
+    mqtt_cfg.broker.address.uri = uri.c_str();
+    mqtt_cfg.broker.verification.certificate = config_.root_ca_pem;
+    mqtt_cfg.credentials.authentication.certificate = config_.device_cert_pem;
+    mqtt_cfg.credentials.authentication.key = config_.private_key_pem;
+    mqtt_cfg.credentials.client_id = config_.client_id.c_str();
+    mqtt_cfg.buffer.size = config_.rx_buffer_size;
+    mqtt_cfg.buffer.out_size = config_.tx_buffer_size;
+    mqtt_cfg.session.keepalive = 60;
+    mqtt_cfg.network.disable_auto_reconnect = true;
+    ESP_LOGI(TAG, "Initializing ESP MQTT client...");
+    client_handle_ = esp_mqtt_client_init(&mqtt_cfg);
+    if (!client_handle_) { ESP_LOGE(TAG, "esp_mqtt_client_init failed"); return false; }
+    ESP_LOGI(TAG, "Registering ESP MQTT event handler...");
+    esp_mqtt_client_handle_t concrete_handle = GET_MQTT_HANDLE(client_handle_);
+    esp_err_t err = esp_mqtt_client_register_event(concrete_handle, (esp_mqtt_event_id_t)ESP_EVENT_ANY_ID, MqttEventHandlerStatic, this);
+    if (err != ESP_OK) { ESP_LOGE(TAG, "esp_mqtt_client_register_event failed: %s", esp_err_to_name(err)); esp_mqtt_client_destroy(concrete_handle); client_handle_ = nullptr; return false; }
+    ESP_LOGI(TAG, "ESP MQTT client initialized successfully.");
+    return true;
+}
+
+void AwsIotMqttClient::CleanupMqttClient() {
+    // Assumes mutex_ is locked
+    if (client_handle_) {
+        ESP_LOGI(TAG, "Cleaning up MQTT client...");
+        esp_mqtt_client_handle_t concrete_handle = GET_MQTT_HANDLE(client_handle_);
+        esp_err_t stop_err = esp_mqtt_client_stop(concrete_handle);
+        if (stop_err != ESP_OK && stop_err != ESP_ERR_INVALID_STATE) { ESP_LOGW(TAG, "esp_mqtt_client_stop failed: %s", esp_err_to_name(stop_err)); }
+        esp_err_t destroy_err = esp_mqtt_client_destroy(concrete_handle);
+        if (destroy_err != ESP_OK) { ESP_LOGW(TAG, "esp_mqtt_client_destroy failed: %s", esp_err_to_name(destroy_err)); }
+        client_handle_ = nullptr;
+        ESP_LOGI(TAG, "MQTT client cleaned up.");
+    }
+    connected_ = false;
+    connecting_ = false;
+}
+
+bool AwsIotMqttClient::Connect() {
+    GuardLock lock(mutex_);
+    if (!initialized_) { ESP_LOGE(TAG, "Cannot connect: Not initialized."); return false; }
+    if (connected_.load() || connecting_.load()) { ESP_LOGW(TAG, "Connect() called while already %s.", connected_.load() ? "connected" : "connecting"); return false; }
+    ESP_LOGI(TAG, "Connect requested by application.");
+    connecting_ = true;
+    disconnect_requested_ = false; // Reset flag on new connect attempt
+    if (!InitializeMqttClient()) { ESP_LOGE(TAG, "Connect failed during client initialization."); connecting_ = false; return false; }
+    if (!client_handle_) { ESP_LOGE(TAG, "Connect failed: Handle is null after init."); connecting_ = false; return false; }
+    esp_mqtt_client_handle_t concrete_handle = GET_MQTT_HANDLE(client_handle_);
+    ESP_LOGI(TAG, "Starting ESP MQTT client task...");
+    esp_err_t start_err = esp_mqtt_client_start(concrete_handle);
+    if (start_err != ESP_OK) { ESP_LOGE(TAG, "esp_mqtt_client_start failed: %s", esp_err_to_name(start_err)); CleanupMqttClient(); connecting_ = false; return false; }
+    ESP_LOGI(TAG, "MQTT client start initiated. Waiting for connection event...");
+    return true;
+}
+
+void AwsIotMqttClient::Disconnect() {
+     ESP_LOGI(TAG, "Disconnect requested by user.");
+    {
+        GuardLock lock(mutex_);
+        disconnect_requested_ = true;
+        CleanupMqttClient();
+    }
+    ESP_LOGI(TAG, "Client disconnect action complete.");
+}
+
+bool AwsIotMqttClient::IsConnected() const { return connected_.load(); }
+
+// --- Publish / Subscribe / Unsubscribe ---
+bool AwsIotMqttClient::Publish(const std::string& topic, const std::string& payload, int qos, bool retain) { return Publish(topic, std::string_view(payload), qos, retain); }
+bool AwsIotMqttClient::Publish(const std::string& topic, std::string_view payload, int qos, bool retain) { return Publish(topic, reinterpret_cast<const uint8_t*>(payload.data()), payload.length(), qos, retain); }
+bool AwsIotMqttClient::Publish(const std::string& topic, const uint8_t* payload, size_t len, int qos, bool retain) {
+    GuardLock lock(mutex_);
+    if (!connected_.load() || !client_handle_) { ESP_LOGW(TAG, "Cannot publish: Not connected or handle null."); return false; }
+    if (topic.length() >= kMaxTopicLen) { ESP_LOGE(TAG, "Cannot publish: Topic too long."); return false; }
+    if (payload == nullptr && len > 0) { ESP_LOGE(TAG, "Cannot publish: Null payload non-zero len."); return false; }
+    esp_mqtt_client_handle_t concrete_handle = GET_MQTT_HANDLE(client_handle_);
+    int msg_id = esp_mqtt_client_publish(concrete_handle, topic.c_str(), reinterpret_cast<const char*>(payload), static_cast<int>(len), qos, retain);
+    if (msg_id == -1) { ESP_LOGE(TAG, "esp_mqtt_client_publish failed for topic '%s'.", topic.c_str()); return false; }
+    ESP_LOGD(TAG, "Publish queued to topic '%s', msg_id=%d, len=%d", topic.c_str(), msg_id, (int)len); return true;
+}
+
+bool AwsIotMqttClient::Subscribe(const std::string& topic_filter, int qos, MqttMessageCallback callback) {
+    GuardLock lock(mutex_);
+    if (!initialized_) { ESP_LOGE(TAG, "Cannot subscribe: Not initialized."); return false; }
+    if (topic_filter.length() >= kMaxTopicLen) { ESP_LOGE(TAG, "Cannot subscribe: Topic too long."); return false; }
+    int available_slot = -1; int existing_slot = -1;
+    for (int i = 0; i < kMaxSubs; ++i) { if (subscriptions_[i].active) { if (strncmp(subscriptions_[i].topic, topic_filter.c_str(), kMaxTopicLen) == 0) { existing_slot = i; break; } } else if (available_slot == -1) { available_slot = i; } }
+    int target_slot = -1; bool new_subscription = false;
+    if (existing_slot != -1) { ESP_LOGI(TAG, "Updating subscription: %s", topic_filter.c_str()); target_slot = existing_slot; }
+    else if (available_slot != -1) { ESP_LOGI(TAG, "Adding subscription: %s", topic_filter.c_str()); target_slot = available_slot; new_subscription = true; }
+    else { ESP_LOGE(TAG, "Cannot subscribe: Max subs (%d) reached.", kMaxSubs); return false; }
+    subscriptions_[target_slot].qos = qos; subscriptions_[target_slot].callback = std::move(callback); subscriptions_[target_slot].pending_subscribe = true;
+    if (new_subscription) { strncpy(subscriptions_[target_slot].topic, topic_filter.c_str(), kMaxTopicLen - 1); subscriptions_[target_slot].topic[kMaxTopicLen - 1] = '\0'; subscriptions_[target_slot].active = true; active_subscription_count_++; }
+    if (connected_.load() && client_handle_) {
+       if (SubscribeInternal(subscriptions_[target_slot].topic, subscriptions_[target_slot].qos)) { subscriptions_[target_slot].pending_subscribe = false; }
+       else { ESP_LOGE(TAG, "SubscribeInternal failed for %s", topic_filter.c_str()); }
+    } else { ESP_LOGI(TAG, "Subscription to '%s' pending connection.", topic_filter.c_str()); }
+    return true;
+}
+
+bool AwsIotMqttClient::SubscribeInternal(const char* topic_filter, int qos) {
+    // Assumes mutex_ is locked
+    if (!client_handle_) return false;
+    esp_mqtt_client_handle_t concrete_handle = GET_MQTT_HANDLE(client_handle_);
+    ESP_LOGI(TAG, "Subscribing internal to topic '%s' QoS %d", topic_filter, qos);
+    int msg_id = esp_mqtt_client_subscribe(concrete_handle, topic_filter, qos);
+    if (msg_id < 0) { ESP_LOGE(TAG, "esp_mqtt_client_subscribe failed for '%s'", topic_filter); return false; }
+    ESP_LOGD(TAG, "Subscribe request sent for '%s', msg_id=%d", topic_filter, msg_id); return true;
+}
+
+bool AwsIotMqttClient::Unsubscribe(const std::string& topic_filter) {
+    GuardLock lock(mutex_);
+    if (!initialized_) { ESP_LOGE(TAG, "Cannot unsubscribe: Not initialized."); return false; }
+    int found_slot = -1;
+    for (int i = 0; i < kMaxSubs; ++i) { if (subscriptions_[i].active && strncmp(subscriptions_[i].topic, topic_filter.c_str(), kMaxTopicLen) == 0) { found_slot = i; break; } }
+    if (found_slot == -1) { ESP_LOGW(TAG, "Cannot unsubscribe: Topic '%s' not found.", topic_filter.c_str()); return false; }
+    char topic_copy[kMaxTopicLen]; strncpy(topic_copy, subscriptions_[found_slot].topic, kMaxTopicLen -1); topic_copy[kMaxTopicLen -1] = '\0';
+    subscriptions_[found_slot].active = false; subscriptions_[found_slot].pending_subscribe = false; subscriptions_[found_slot].callback = nullptr; memset(subscriptions_[found_slot].topic, 0, kMaxTopicLen); active_subscription_count_--;
+    ESP_LOGI(TAG, "Removed internal subscription for: %s", topic_copy);
+    if (connected_.load() && client_handle_) {
+        if (!UnsubscribeInternal(topic_copy)) { ESP_LOGE(TAG, "UnsubscribeInternal failed for %s", topic_copy); }
+    }
+    return true;
+}
+
+bool AwsIotMqttClient::UnsubscribeInternal(const char* topic_filter) {
+    // Assumes mutex_ is locked
+    if (!client_handle_) return false;
+    esp_mqtt_client_handle_t concrete_handle = GET_MQTT_HANDLE(client_handle_);
+    ESP_LOGI(TAG, "Unsubscribing internal from topic '%s'", topic_filter);
+    int msg_id = esp_mqtt_client_unsubscribe(concrete_handle, topic_filter);
+     if (msg_id < 0) { ESP_LOGE(TAG, "esp_mqtt_client_unsubscribe failed for '%s'", topic_filter); return false; }
+    ESP_LOGD(TAG, "Unsubscribe request sent for '%s', msg_id=%d", topic_filter, msg_id); return true;
+}
+
+
+// --- Event Handling ---
+
+/*static*/ void MqttEventHandlerStatic(void* handler_args, esp_event_base_t base, int32_t event_id, void* event_data) {
+    AwsIotMqttClient* client = static_cast<AwsIotMqttClient*>(handler_args);
+    if (client) { client->HandleMqttEvent(event_data); } // Call the public method
+    else { ESP_LOGE(TAG, "MQTT event with null handler_args!"); }
+}
+
+// PUBLIC method
+void AwsIotMqttClient::HandleMqttEvent(void* event_data_void) {
+    if (!event_data_void) { ESP_LOGE(TAG, "HandleMqttEvent received null event_data!"); return; }
+    esp_mqtt_event_handle_t event = static_cast<esp_mqtt_event_handle_t>(event_data_void);
+
+    GuardLock lock(mutex_); // LOCK (Conditional)
+
+    if (client_handle_ && event->client != GET_MQTT_HANDLE(client_handle_)) {
+         if (client_handle_ != nullptr) { ESP_LOGW(TAG, "Event for unexpected client (%p vs %p). Ignoring.", event->client, GET_MQTT_HANDLE(client_handle_)); }
+         return;
+    }
+    if (disconnect_requested_.load() && event->event_id != MQTT_EVENT_DELETED) {
+        ESP_LOGD(TAG, "Ignoring MQTT event %d (disconnect requested)", (int)event->event_id); return;
+    }
+
+    switch (event->event_id) {
+        case MQTT_EVENT_CONNECTED:    ESP_LOGI(TAG, "MQTT_EVENT_CONNECTED"); HandleConnect(); break;
+        case MQTT_EVENT_DISCONNECTED: ESP_LOGW(TAG, "MQTT_EVENT_DISCONNECTED"); HandleDisconnect(); break;
+        case MQTT_EVENT_SUBSCRIBED:   ESP_LOGI(TAG, "MQTT_EVENT_SUBSCRIBED, msg_id=%d", event->msg_id); break;
+        case MQTT_EVENT_UNSUBSCRIBED: ESP_LOGI(TAG, "MQTT_EVENT_UNSUBSCRIBED, msg_id=%d", event->msg_id); break;
+        case MQTT_EVENT_PUBLISHED:    ESP_LOGD(TAG, "MQTT_EVENT_PUBLISHED, msg_id=%d", event->msg_id); break;
+        case MQTT_EVENT_DATA:         ESP_LOGD(TAG, "MQTT_EVENT_DATA received"); HandleData(event->topic, event->topic_len, event->data, event->data_len); break;
+        case MQTT_EVENT_ERROR:
+            ESP_LOGE(TAG, "MQTT_EVENT_ERROR");
+            if (event->error_handle) { ESP_LOGE(TAG, "  ESP TLS Last ESP Error: 0x%x (%s)", event->error_handle->esp_tls_last_esp_err, esp_err_to_name(event->error_handle->esp_tls_last_esp_err)); if (event->error_handle->error_type == MQTT_ERROR_TYPE_CONNECTION_REFUSED) { ESP_LOGE(TAG, "  Connection Refused, MQTT Return Code: 0x%x", event->error_handle->connect_return_code); } }
+            if (connecting_.load()) { connecting_ = false; ESP_LOGW(TAG,"Connection attempt failed during connect phase."); }
+            break;
+         case MQTT_EVENT_DELETED:
+            ESP_LOGW(TAG, "MQTT_EVENT_DELETED (client handle destroyed)");
+            if(client_handle_ != nullptr) { ESP_LOGW(TAG, "MQTT_EVENT_DELETED but handle was not null! Nullifying."); client_handle_ = nullptr; }
+            connected_ = false; connecting_ = false; disconnect_requested_ = true;
+            break;
+        default: ESP_LOGI(TAG, "Other MQTT event id: %d", (int)event->event_id); break;
+    }
+} // UNLOCK (RAII)
+
+void AwsIotMqttClient::HandleConnect() {
+    // Assumes mutex is locked by HandleMqttEvent
+    ESP_LOGI(TAG, "HandleConnect: Successfully connected.");
+    connected_ = true;
+    connecting_ = false;
+    disconnect_requested_ = false;
+    ResubscribePending(); // Assumes lock is held
+    if (on_connected_cb_) {
+        //! WARNING: User callback 'on_connected_cb_' is called WHILE internal client mutex is held.
+        //! If this callback calls back into public AwsIotMqttClient methods, it WILL deadlock if thread safety is enabled.
+        on_connected_cb_();
+    }
+}
+
+void AwsIotMqttClient::HandleDisconnect() {
+     // Assumes mutex is locked by HandleMqttEvent
+    ESP_LOGW(TAG, "HandleDisconnect: Processing disconnect.");
+    bool was_connected = connected_.load();
+    connected_ = false;
+    connecting_ = false;
+    for (auto& sub : subscriptions_) {
+        if (sub.active) { sub.pending_subscribe = true; }
+    }
+    // Application handles reconnect loop
+
+    // Call user callback AFTER updating internal state, WHILE LOCK IS HELD
+    if (was_connected && on_disconnected_cb_) {
+        //! WARNING: User callback 'on_disconnected_cb_' is called WHILE internal client mutex is held.
+        //! If this callback calls back into public AwsIotMqttClient methods, it WILL deadlock if thread safety is enabled.
+        on_disconnected_cb_();
+    }
+}
+
+void AwsIotMqttClient::ResubscribePending() {
+    // Assumes mutex is locked
+    ESP_LOGI(TAG, "Resubscribing to pending topics...");
+    int count = 0;
+    if (!client_handle_) { ESP_LOGE(TAG, "Cannot resubscribe, handle is null."); return; }
+    for (auto& sub : subscriptions_) {
+        if (sub.active && sub.pending_subscribe) {
+            // SubscribeInternal assumes lock is held
+            if (SubscribeInternal(sub.topic, sub.qos)) { sub.pending_subscribe = false; count++; }
+            else { ESP_LOGE(TAG, "Failed resubscribe: %s", sub.topic); }
+        }
+    }
+    ESP_LOGI(TAG, "Resubscribe attempt complete for %d topics.", count);
+}
+
+void AwsIotMqttClient::RouteAwsCallback(const std::string& topic, std::string_view payload) {
+    // Assumes mutex is locked by HandleData -> callback call
+    ESP_LOGD(TAG, "RouteAwsCallback received topic: %s", topic.c_str());
+    bool routed = false;
+    // --- Shadow Topic Routing ---
+    char shadow_prefix_buf[kMaxTopicLen]; snprintf(shadow_prefix_buf, sizeof(shadow_prefix_buf), "$aws/things/%s/shadow/", config_.thing_name.c_str()); size_t shadow_prefix_len = strlen(shadow_prefix_buf);
+    if (topic.length() > shadow_prefix_len && topic.rfind(shadow_prefix_buf, 0) == 0) {
+        const char* suffix = topic.c_str() + shadow_prefix_len; size_t suffix_len = topic.length() - shadow_prefix_len;
+        if ((strncmp(suffix, "update/", 7) == 0 && suffix_len > 7) || (strncmp(suffix, "delta", 5) == 0 && suffix_len == 5)) {
+             if (shadow_update_cb_) { std::string type; if (suffix[0] == 'd') { type = "delta"; } else { type.assign(suffix + 7, suffix_len - 7); } ESP_LOGD(TAG, "Routing to shadow update callback type '%s'", type.c_str()); shadow_update_cb_(type, payload); routed = true; }
+        } else if (strncmp(suffix, "get/", 4) == 0 && suffix_len > 4) {
+             if (shadow_get_cb_) { std::string type(suffix + 4, suffix_len - 4); ESP_LOGD(TAG, "Routing to shadow get callback type '%s'", type.c_str()); shadow_get_cb_(type, payload); routed = true; }
+        }
+    }
+    // --- Jobs Topic Routing ---
+    char jobs_notify_buf[kMaxTopicLen]; char jobs_update_prefix_buf[kMaxTopicLen]; snprintf(jobs_notify_buf, sizeof(jobs_notify_buf), "$aws/things/%s/jobs/notify-next", config_.thing_name.c_str()); snprintf(jobs_update_prefix_buf, sizeof(jobs_update_prefix_buf), "$aws/things/%s/jobs/", config_.thing_name.c_str()); size_t jobs_update_prefix_len = strlen(jobs_update_prefix_buf);
+    if (!routed && topic == jobs_notify_buf) { if (job_notify_cb_) { ESP_LOGD(TAG, "Routing job notify-next"); job_notify_cb_("unknown_job_id", "QUEUED", std::string(payload)); routed = true; }
+    } else if (!routed && topic.length() > jobs_update_prefix_len && topic.rfind(jobs_update_prefix_buf, 0) == 0) {
+         const char* job_suffix = topic.c_str() + jobs_update_prefix_len; size_t job_suffix_len = topic.length() - jobs_update_prefix_len; const char* update_accepted_str = "/update/accepted"; const char* update_rejected_str = "/update/rejected"; size_t accepted_len = strlen(update_accepted_str); size_t rejected_len = strlen(update_rejected_str); std::string job_id_str; std::string status_str;
+         if (job_suffix_len > accepted_len && strcmp(job_suffix + job_suffix_len - accepted_len, update_accepted_str) == 0) { job_id_str.assign(job_suffix, job_suffix_len - accepted_len); status_str = "ACCEPTED";
+         } else if (job_suffix_len > rejected_len && strcmp(job_suffix + job_suffix_len - rejected_len, update_rejected_str) == 0) { job_id_str.assign(job_suffix, job_suffix_len - rejected_len); status_str = "REJECTED"; }
+         if (!job_id_str.empty() && job_notify_cb_) { ESP_LOGD(TAG, "Routing job update cb (%s for %s)", status_str.c_str(), job_id_str.c_str()); job_notify_cb_(job_id_str, status_str, std::string(payload)); routed = true; }
+    }
+    if (!routed) { ESP_LOGW(TAG, "RouteAwsCallback called for unknown AWS topic: %s", topic.c_str()); }
+}
+
+void AwsIotMqttClient::HandleData(const char* topic, int topic_len, const char* data, int data_len) {
+    // Assumes mutex is locked by HandleMqttEvent
+    if (!topic || !data) return;
+    std::string topic_str(topic, topic_len);
+    std::string_view payload_view(data, data_len);
+    ESP_LOGD(TAG, "HandleData searching callback for topic: %s", topic_str.c_str());
+    bool handled = false;
+    MqttMessageCallback cb_to_call = nullptr; // Copy callback under lock
+
+    // Only loop through generic subscriptions_ array
+    for (const auto& sub : subscriptions_) {
+        // TODO: Implement proper wildcard matching if needed. Exact match only now.
+        if (sub.active && sub.callback && (topic_str == sub.topic)) {
+             ESP_LOGD(TAG, "Found matching callback for topic: %s", sub.topic);
+             cb_to_call = sub.callback; // Copy std::function
+             handled = true;
+             break; // Stop on first exact match
+        }
+    }
+
+    // Call the found callback (which might be the router lambda or a direct user cb)
+    if (handled && cb_to_call) {
+         //! WARNING: User/Router callback is called WHILE internal client mutex is held.
+         //! If the callback calls back into public AwsIotMqttClient methods, it WILL deadlock if thread safety is enabled.
+         //! Consider deferring actions requiring client calls to another task (e.g., via queue/event group).
+        cb_to_call(topic_str, payload_view);
+    } else {
+         ESP_LOGD(TAG, "No suitable callback registered for incoming topic: %s", topic_str.c_str());
+    }
+}
+
+
+// --- AWS IoT Specific Helpers ---
+bool AwsIotMqttClient::GetShadowTopic(const std::string& operation, char* buffer, size_t buffer_size) { int w = snprintf(buffer, buffer_size, "$aws/things/%s/shadow/%s", config_.thing_name.c_str(), operation.c_str()); return (w > 0 && w < (int)buffer_size); }
+bool AwsIotMqttClient::GetJobsTopic(const std::string& operation, const std::string& job_id, char* buffer, size_t buffer_size) { int w; if (job_id.empty() || job_id == "+") { w = snprintf(buffer, buffer_size, "$aws/things/%s/jobs/%s", config_.thing_name.c_str(), operation.c_str()); } else { w = snprintf(buffer, buffer_size, "$aws/things/%s/jobs/%s/%s", config_.thing_name.c_str(), job_id.c_str(), operation.c_str()); } return (w > 0 && w < (int)buffer_size); }
+bool AwsIotMqttClient::SubscribeToShadowUpdates(ShadowUpdateCallback callback) {
+    // Lock is only needed briefly to store the callback pointer safely.
+    // Calling public Subscribe later handles its own locking.
+    {
+        GuardLock lock(mutex_);
+        shadow_update_cb_ = std::move(callback);
+    }
+    ESP_LOGI(TAG, "Subscribing to Shadow Updates...");
+    bool success = true; char topic_buf[kMaxTopicLen];
+    auto router_callback = [this](const std::string& topic, std::string_view payload){ this->RouteAwsCallback(topic, payload); };
+    if (GetShadowTopic("update/accepted", topic_buf, sizeof(topic_buf))) { success &= Subscribe(topic_buf, 1, router_callback); } else { success = false; ESP_LOGE(TAG, "Shadow topic buffer small!"); }
+    if (GetShadowTopic("update/rejected", topic_buf, sizeof(topic_buf))) { success &= Subscribe(topic_buf, 1, router_callback); } else { success = false; ESP_LOGE(TAG, "Shadow topic buffer small!"); }
+    if (GetShadowTopic("update/delta", topic_buf, sizeof(topic_buf))) { success &= Subscribe(topic_buf, 1, router_callback); } else { success = false; ESP_LOGE(TAG, "Shadow topic buffer small!"); }
+    if (!success) { ESP_LOGE(TAG, "One or more shadow update subscriptions failed!"); }
+    return success;
+}
+bool AwsIotMqttClient::SubscribeToShadowGetResponses(ShadowUpdateCallback callback) {
+    // Lock is only needed briefly to store the callback pointer safely.
+    {
+        GuardLock lock(mutex_);
+        shadow_get_cb_ = std::move(callback);
+    }
+    ESP_LOGI(TAG, "Subscribing to Shadow Get Responses...");
+    bool success = true; char topic_buf[kMaxTopicLen];
+    auto router_callback = [this](const std::string& topic, std::string_view payload){ this->RouteAwsCallback(topic, payload); };
+    if (GetShadowTopic("get/accepted", topic_buf, sizeof(topic_buf))) { success &= Subscribe(topic_buf, 1, router_callback); } else { success = false; ESP_LOGE(TAG, "Shadow topic buffer small!"); }
+    if (GetShadowTopic("get/rejected", topic_buf, sizeof(topic_buf))) { success &= Subscribe(topic_buf, 1, router_callback); } else { success = false; ESP_LOGE(TAG, "Shadow topic buffer small!"); }
+    if (!success) { ESP_LOGE(TAG, "One or more shadow get response subscriptions failed!"); }
+    return success;
+}
+bool AwsIotMqttClient::UpdateShadow(const std::string& shadow_payload, int qos) { return UpdateShadow(std::string_view(shadow_payload), qos); }
+bool AwsIotMqttClient::UpdateShadow(std::string_view shadow_payload, int qos) { char topic_buf[kMaxTopicLen]; if (!GetShadowTopic("update", topic_buf, sizeof(topic_buf))) { ESP_LOGE(TAG, "Shadow topic buffer small!"); return false; } return Publish(topic_buf, reinterpret_cast<const uint8_t*>(shadow_payload.data()), shadow_payload.length(), qos); }
+bool AwsIotMqttClient::GetShadow(const std::string& client_token) { char topic_buf[kMaxTopicLen]; if (!GetShadowTopic("get", topic_buf, sizeof(topic_buf))) { ESP_LOGE(TAG, "Shadow topic buffer small!"); return false; } char payload_buf[128]; int len; if (client_token.empty()) { len = snprintf(payload_buf, sizeof(payload_buf), "{}"); } else { len = snprintf(payload_buf, sizeof(payload_buf), "{\"clientToken\":\"%.*s\"}", (int)client_token.length(), client_token.c_str()); } if (len <= 0 || len >= (int)sizeof(payload_buf)) { ESP_LOGE(TAG, "Client token payload buffer small!"); len = snprintf(payload_buf, sizeof(payload_buf), "{}"); } return Publish(topic_buf, reinterpret_cast<const uint8_t*>(payload_buf), len, 0); }
+bool AwsIotMqttClient::SubscribeToJobs(JobNotificationCallback callback) {
+    // Lock is only needed briefly to store the callback pointer safely.
+    {
+        GuardLock lock(mutex_);
+        job_notify_cb_ = std::move(callback);
+    }
+    ESP_LOGI(TAG, "Subscribing to Jobs topics...");
+    bool success = true; char topic_buf[kMaxTopicLen];
+    auto router_callback = [this](const std::string& topic, std::string_view payload){ this->RouteAwsCallback(topic, payload); };
+    if (GetJobsTopic("notify-next", "", topic_buf, sizeof(topic_buf))) { success &= Subscribe(topic_buf, 1, router_callback); } else { success = false; ESP_LOGE(TAG, "Jobs topic buffer small!"); }
+    if (GetJobsTopic("update/accepted", "+", topic_buf, sizeof(topic_buf))) { success &= Subscribe(topic_buf, 1, router_callback); } else { success = false; ESP_LOGE(TAG, "Jobs topic buffer small!"); }
+    if (GetJobsTopic("update/rejected", "+", topic_buf, sizeof(topic_buf))) { success &= Subscribe(topic_buf, 1, router_callback); } else { success = false; ESP_LOGE(TAG, "Jobs topic buffer small!"); }
+    if (!success) { ESP_LOGE(TAG, "One or more job subscriptions failed!"); }
+    return success;
+}
+bool AwsIotMqttClient::UpdateJobStatus(const std::string& job_id, const std::string& status, const std::string& status_details_json) { return UpdateJobStatus(job_id, status, std::string_view(status_details_json)); }
+bool AwsIotMqttClient::UpdateJobStatus(const std::string& job_id, const std::string& status, std::string_view status_details_json) { if (job_id.empty() || status.empty()) { ESP_LOGE(TAG, "Job ID and Status cannot be empty"); return false; } char topic_buf[kMaxTopicLen]; if (!GetJobsTopic("update", job_id, topic_buf, sizeof(topic_buf))) { ESP_LOGE(TAG, "Jobs topic buffer small!"); return false; } char payload_buf[kMaxPayloadLen]; int written = snprintf(payload_buf, sizeof(payload_buf), "{\"status\":\"%.*s\",\"statusDetails\":%.*s}", (int)status.length(), status.c_str(), (int)status_details_json.length(), status_details_json.data()); if (written <= 0 || written >= (int)sizeof(payload_buf)) { ESP_LOGE(TAG, "UpdateJobStatus payload buffer small!"); return false; } return Publish(topic_buf, reinterpret_cast<const uint8_t*>(payload_buf), written, 1); }
+
+// --- Setters for Callbacks ---
+void AwsIotMqttClient::SetOnConnectedCallback(StatusCallback cb) { GuardLock lock(mutex_); on_connected_cb_ = std::move(cb); }
+void AwsIotMqttClient::SetOnDisconnectedCallback(StatusCallback cb) { GuardLock lock(mutex_); on_disconnected_cb_ = std::move(cb); }
+
+} // namespace AwsIot
+
+---------------------------------------------------
+#ifndef AWS_IOT_MQTT_CLIENT_HPP_
+#define AWS_IOT_MQTT_CLIENT_HPP_
+
+#include <functional>
+#include <string>
+#include <string_view>
+#include <mutex> // Always include mutex header for the member variable type
+#include <atomic>
+#include <cstdint>
+#include <memory>
+
+// NO ESP-IDF specific headers or types here. Platform Agnostic.
+
+namespace AwsIot {
+
+// --- Configuration ---
+constexpr size_t kMaxTopicLen = 256;
+constexpr size_t kMaxPayloadLen = 1024;
+constexpr size_t kMaxSubs = 10;
+constexpr size_t kMaxCertLen = 2048; // Cert buffer size
+
+struct MqttConfig {
+    std::string aws_endpoint;
+    std::string client_id;
+    std::string thing_name;
+    uint16_t    port = 8883;
+    // Certificate Buffers (Require manual copy)
+    char root_ca_pem[kMaxCertLen] = {0};
+    char device_cert_pem[kMaxCertLen] = {0};
+    char private_key_pem[kMaxCertLen] = {0};
+    // MQTT RX/TX Buffers
+    int         rx_buffer_size = 2048;
+    int         tx_buffer_size = 2048;
+};
+
+// --- Callbacks ---
+using MqttMessageCallback = std::function<void(const std::string& topic, std::string_view payload)>;
+using StatusCallback = std::function<void()>;
+using JobNotificationCallback = std::function<void(const std::string& job_id, const std::string& status, const std::string& document)>;
+using ShadowUpdateCallback = std::function<void(const std::string& update_type, std::string_view payload)>;
+
+// --- Main Class ---
+// NOTE: Internal thread safety is configurable via Kconfig
+// CONFIG_AWS_IOT_MQTT_CLIENT_THREAD_SAFE
+class AwsIotMqttClient {
+public: // Public Interface
+    AwsIotMqttClient();
+    ~AwsIotMqttClient();
+
+    AwsIotMqttClient(const AwsIotMqttClient&) = delete;
+    AwsIotMqttClient& operator=(const AwsIotMqttClient&) = delete;
+    AwsIotMqttClient(AwsIotMqttClient&&) = delete;
+    AwsIotMqttClient& operator=(AwsIotMqttClient&&) = delete;
+
+    bool Initialize(const MqttConfig& config);
+    bool Connect();
+    void Disconnect();
+    bool IsConnected() const; // Doesn't need lock (uses atomic)
+
+    // Publish/Subscribe/Unsubscribe/AWS Helpers
+    bool Publish(const std::string& topic, const std::string& payload, int qos = 0, bool retain = false);
+    bool Publish(const std::string& topic, std::string_view payload, int qos = 0, bool retain = false);
+    bool Publish(const std::string& topic, const uint8_t* payload, size_t len, int qos = 0, bool retain = false);
+    bool Subscribe(const std::string& topic_filter, int qos, MqttMessageCallback callback);
+    bool Unsubscribe(const std::string& topic_filter);
+    bool SubscribeToShadowUpdates(ShadowUpdateCallback callback);
+    bool SubscribeToShadowGetResponses(ShadowUpdateCallback callback);
+    bool UpdateShadow(const std::string& shadow_payload, int qos = 0);
+    bool UpdateShadow(std::string_view shadow_payload, int qos = 0);
+    bool GetShadow(const std::string& client_token = "");
+    bool SubscribeToJobs(JobNotificationCallback callback);
+    bool UpdateJobStatus(const std::string& job_id, const std::string& status, const std::string& status_details_json = "{}");
+    bool UpdateJobStatus(const std::string& job_id, const std::string& status, std::string_view status_details_json);
+
+    // Setters for Callbacks
+    void SetOnConnectedCallback(StatusCallback cb);
+    void SetOnDisconnectedCallback(StatusCallback cb);
+
+    // Public Event Handler Method
+    void HandleMqttEvent(void* event_data_void);
+
+private: // Private Implementation Details
+    // --- Private Data Members ---
+    struct Subscription {
+        char topic[kMaxTopicLen] = {0};
+        int qos = 0;
+        MqttMessageCallback callback;
+        bool active = false;
+        bool pending_subscribe = false;
+     };
+
+    std::mutex                  mutex_;
+    MqttConfig                  config_;
+    std::atomic<bool>           initialized_{false};
+    std::atomic<bool>           connected_{false};
+    std::atomic<bool>           connecting_{false};
+    std::atomic<bool>           disconnect_requested_{false};
+    void* client_handle_{nullptr}; // OPAQUE HANDLE (renamed)
+    Subscription                subscriptions_[kMaxSubs];
+    size_t                      active_subscription_count_ = 0;
+    StatusCallback              on_connected_cb_ = nullptr;
+    StatusCallback              on_disconnected_cb_ = nullptr;
+    JobNotificationCallback     job_notify_cb_ = nullptr;
+    ShadowUpdateCallback        shadow_update_cb_ = nullptr;
+    ShadowUpdateCallback        shadow_get_cb_ = nullptr;
+
+    // --- Private Methods ---
+    bool InitializeMqttClient();
+    void CleanupMqttClient();
+    bool SubscribeInternal(const char* topic_filter, int qos);
+    bool UnsubscribeInternal(const char* topic_filter);
+    void HandleConnect();
+    void HandleDisconnect();
+    void HandleData(const char* topic, int topic_len, const char* data, int data_len);
+    void ResubscribePending();
+    // Added router method for AWS callbacks
+    void RouteAwsCallback(const std::string& topic, std::string_view payload);
+    bool GetShadowTopic(const std::string& operation, char* buffer, size_t buffer_size);
+    bool GetJobsTopic(const std::string& operation, const std::string& job_id, char* buffer, size_t buffer_size);
+
+}; // class AwsIotMqttClient
+
+} // namespace AwsIot
+
+#endif // AWS_IOT_MQTT_CLIENT_HPP_
