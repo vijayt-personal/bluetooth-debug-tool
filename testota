@@ -1,0 +1,275 @@
+/**
+ * @file https_ota_transport.h
+ * @brief Defines the HttpsOtaTransport class using the generic HttpClient.
+ * @version 2.0
+ * @date 2025-04-13
+ *
+ * This class orchestrates an OTA update over HTTPS by utilizing a generic
+ * HttpClient for the download and a CoreUpdateModule for applying the update.
+ *
+ * Copyright 2025 Google LLC
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+#ifndef HTTPS_OTA_TRANSPORT_H_
+#define HTTPS_OTA_TRANSPORT_H_
+
+#include <string>
+#include "core_update_module.h" // Include the core OTA module interface
+#include "http_client.h"        // Include the generic HttpClient interface
+
+/**
+ * @class HttpsOtaTransport
+ * @brief Handles firmware updates over HTTPS using HttpClient and CoreUpdateModule.
+ *
+ * Orchestrates the download of a firmware image from a URL via an HttpClient
+ * instance and streams the data to a CoreUpdateModule instance for application.
+ *
+ * @note This class's PerformUpdate method is blocking and should typically be
+ * run in a dedicated FreeRTOS task. The provided HttpClient instance must be
+ * configured (e.g., with TLS certificates) before calling PerformUpdate.
+ */
+class HttpsOtaTransport {
+ public:
+  /**
+   * @brief Constructor for HttpsOtaTransport.
+   * @param core_updater Reference to the CoreUpdateModule instance that will
+   * handle the actual OTA process (writing to flash, validation, etc.).
+   * @param http_client Reference to a configured HttpClient instance that will
+   * perform the download. The HttpClient's lifetime must exceed that of this
+   * HttpsOtaTransport instance or the duration of the PerformUpdate call.
+   */
+  HttpsOtaTransport(CoreUpdateModule& core_updater, HttpClient& http_client);
+
+  /**
+   * @brief Destructor.
+   */
+  ~HttpsOtaTransport();
+
+  // Prevent copying and assignment
+  HttpsOtaTransport(const HttpsOtaTransport&) = delete;
+  HttpsOtaTransport& operator=(const HttpsOtaTransport&) = delete;
+
+  /**
+   * @brief Performs the firmware update by downloading from the given URL.
+   *
+   * Uses the provided HttpClient to download the firmware from the URL,
+   * streaming the response body to the CoreUpdateModule via a callback.
+   * Handles starting, finishing, or aborting the update via the CoreUpdateModule.
+   *
+   * @param url The HTTPS URL to download the firmware from (e.g., S3 pre-signed URL).
+   * @return CoreUpdateStatus::kOk on successful download and finalization by CoreUpdateModule.
+   * @return CoreUpdateStatus::kErrConnectionFailed if the HTTPS connection fails.
+   * @return CoreUpdateStatus::kErrValidateFailed if CoreUpdateModule fails validation.
+   * @return CoreUpdateStatus::kFail for other download or generic errors.
+   * @return Other CoreUpdateStatus codes for specific errors during the update process.
+   */
+  CoreUpdateStatus PerformUpdate(const std::string& url);
+
+ private:
+  /**
+   * @brief Maps HttpClientStatus to CoreUpdateStatus for return values.
+   * @param http_status The status returned by the HttpClient.
+   * @return CoreUpdateStatus The corresponding CoreUpdateModule status code.
+   */
+  static CoreUpdateStatus MapHttpClientError(HttpClientStatus http_status);
+
+  // --- Member Variables ---
+
+  CoreUpdateModule& core_updater_; ///< Reference to the core update logic handler.
+  HttpClient& http_client_;        ///< Reference to the generic HTTP client.
+};
+
+#endif // HTTPS_OTA_TRANSPORT_H_
+
+// ========================================================================== //
+// ================= Implementation (https_ota_transport.cpp) =============== //
+// ========================================================================== //
+
+/**
+ * @file https_ota_transport.cpp
+ * @brief Implements the HttpsOtaTransport class using HttpClient and CoreUpdateModule.
+ * @version 2.0
+ * @date 2025-04-13
+ *
+ * Copyright 2025 Google LLC
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#include "https_ota_transport.h"
+
+#include <esp_log.h> // For logging (platform specific)
+
+// Define TAG for logging
+static const char* kTag = "HttpsOtaTransport";
+
+// --- Constructor ---
+HttpsOtaTransport::HttpsOtaTransport(CoreUpdateModule& core_updater, HttpClient& http_client)
+    : core_updater_(core_updater),
+      http_client_(http_client)
+       {
+    ESP_LOGI(kTag, "HttpsOtaTransport initialized.");
+}
+
+// --- Destructor ---
+HttpsOtaTransport::~HttpsOtaTransport() {
+    ESP_LOGI(kTag, "HttpsOtaTransport destroyed.");
+    // Note: Does not own core_updater_ or http_client_, so no cleanup here.
+    // If an update was somehow interrupted without PerformUpdate finishing,
+    // the CoreUpdateModule's destructor should handle aborting.
+}
+
+// --- MapHttpClientError (Static Helper) ---
+CoreUpdateStatus HttpsOtaTransport::MapHttpClientError(HttpClientStatus http_status) {
+    // Simple mapping, can be expanded if needed
+    switch (http_status) {
+        case HttpClientStatus::kOk:             return CoreUpdateStatus::kOk;
+        case HttpClientStatus::kTimeout:        return CoreUpdateStatus::kErrTimeout;
+        case HttpClientStatus::kConnectionError: return CoreUpdateStatus::kFail; // Map generic connection errors
+        case HttpClientStatus::kSslError:       return CoreUpdateStatus::kFail; // Map generic SSL errors
+        case HttpClientStatus::kHttpError:      return CoreUpdateStatus::kFail; // Map HTTP non-2xx errors
+        case HttpClientStatus::kInvalidArgument: return CoreUpdateStatus::kErrInvalidArg;
+        case HttpClientStatus::kInternalError:  return CoreUpdateStatus::kErrInternal;
+        case HttpClientStatus::kSendError:      return CoreUpdateStatus::kFail;
+        case HttpClientStatus::kRecvError:      return CoreUpdateStatus::kFail;
+        case HttpClientStatus::kOutOfMemory:    return CoreUpdateStatus::kErrNoMem;
+        case HttpClientStatus::kCallbackError:  return CoreUpdateStatus::kFail; // Callback stopped or had error
+        case HttpClientStatus::kParseError:     return CoreUpdateStatus::kErrInvalidArg; // Treat parse error as invalid arg
+        case HttpClientStatus::kFail:
+        default:
+            return CoreUpdateStatus::kFail;
+    }
+}
+
+
+// --- PerformUpdate ---
+CoreUpdateStatus HttpsOtaTransport::PerformUpdate(const std::string& url) {
+
+  // 1. Check Core Updater State
+  if (core_updater_.IsInProgress()) {
+      ESP_LOGE(kTag, "PerformUpdate failed: CoreUpdateModule already in progress.");
+      return CoreUpdateStatus::kErrInvalidState;
+  }
+
+  ESP_LOGI(kTag, "Starting OTA update from URL: %s", url.c_str());
+
+  // 2. Prepare HTTP Request
+  HttpRequest request;
+  request.method = HttpMethod::kGet;
+  request.url = url;
+  // Add specific headers for OTA if needed, e.g., range requests (not implemented here)
+  // request.headers["Accept"] = "application/octet-stream"; // Example
+
+  // 3. Define the Response Body Callback (using a lambda)
+  bool ota_process_error = false;
+  CoreUpdateStatus ota_process_status = CoreUpdateStatus::kOk;
+  size_t received_size = 0; // Track received size for logging/comparison
+
+  ResponseBodyCallback ota_callback =
+      [this, &ota_process_error, &ota_process_status, &received_size] // Capture needed variables
+      (const char* data, size_t len) -> bool {
+      // Feed data to the core updater
+      CoreUpdateStatus status = core_updater_.ProcessData(reinterpret_cast<const uint8_t*>(data), len);
+      if (status != CoreUpdateStatus::kOk) {
+          ESP_LOGE(kTag, "CoreUpdateModule::ProcessData failed (%d). Stopping download.", static_cast<int>(status));
+          ota_process_error = true;
+          ota_process_status = status; // Store the specific error
+          return false; // Stop processing response body
+      }
+      received_size += len; // Track total bytes received via callback
+      return true; // Continue processing response body
+  };
+
+  // --- Pre-check: Start CoreUpdateModule before download ---
+  // We don't know the size yet, so start with unknown size.
+  // CoreUpdateModule will determine size from header later.
+  CoreUpdateStatus start_status = core_updater_.StartUpdate(kCoreUpdateSizeUnknown);
+  if (start_status != CoreUpdateStatus::kOk) {
+      ESP_LOGE(kTag, "CoreUpdateModule::StartUpdate failed (%d). Cannot proceed.", static_cast<int>(start_status));
+      return start_status;
+  }
+  ESP_LOGI(kTag, "CoreUpdateModule started successfully.");
+  // --- End Pre-check ---
+
+
+  // 4. Execute the Request using the HttpClient
+  ESP_LOGI(kTag, "Executing HTTPS request...");
+  HttpResponse response = http_client_.Execute(request, ota_callback);
+
+  // 5. Process the Result
+  CoreUpdateStatus final_status = CoreUpdateStatus::kOk;
+
+  if (response.status == HttpClientStatus::kOk) {
+      // HTTP request and download streaming finished successfully (or callback stopped early but HTTP was OK)
+      ESP_LOGI(kTag, "HTTP request successful (HTTP Status: %d). Total bytes received via callback: %zu",
+               response.http_status_code, received_size);
+
+      // Check if the callback encountered an error during ProcessData
+      if (ota_process_error) {
+           ESP_LOGE(kTag, "Finalization skipped: Error occurred during CoreUpdateModule::ProcessData (%d).", static_cast<int>(ota_process_status));
+           // Abort was likely already called by ProcessData on error, but call again just in case.
+           core_updater_.AbortUpdate();
+           final_status = ota_process_status; // Return the error from ProcessData
+      }
+      // Check if callback stopped early without ProcessData error (e.g. user cancellation)
+      else if (response.status == HttpClientStatus::kCallbackError) {
+           ESP_LOGW(kTag, "Download stopped by callback without specific ProcessData error.");
+           core_updater_.AbortUpdate();
+           final_status = CoreUpdateStatus::kFail; // Generic failure for callback stop
+      }
+      else {
+          // Download completed fully without callback errors, try to finalize.
+          ESP_LOGI(kTag, "Download complete. Finalizing update...");
+          final_status = core_updater_.FinishUpdate();
+          if (final_status == CoreUpdateStatus::kOk) {
+              ESP_LOGI(kTag, "CoreUpdateModule::FinishUpdate successful!");
+              // Device needs restart externally
+          } else {
+              ESP_LOGE(kTag, "CoreUpdateModule::FinishUpdate failed (%d).", static_cast<int>(final_status));
+              // FinishUpdate should internally call Abort on failure.
+          }
+      }
+  } else {
+      // HttpClient Execute failed (connection, timeout, HTTP error, etc.)
+      ESP_LOGE(kTag, "HttpClient::Execute failed (%d). HTTP Status: %d.",
+               static_cast<int>(response.status), response.http_status_code);
+
+       // Map the HttpClientStatus to CoreUpdateStatus for the return value
+       final_status = MapHttpClientError(response.status);
+
+      // Ensure the core update process is aborted if it was started but download failed
+      if (core_updater_.IsInProgress()) {
+          ESP_LOGW(kTag, "Aborting core update due to HTTP client failure.");
+          core_updater_.AbortUpdate();
+      }
+       // If the error was specifically the callback stopping, reflect that if desired
+       if (response.status == HttpClientStatus::kCallbackError && ota_process_error) {
+           final_status = ota_process_status; // Return the more specific error from ProcessData
+       } else if (response.status == HttpClientStatus::kCallbackError) {
+            // If callback stopped but we didn't get a specific ProcessData error, map it generally
+            final_status = CoreUpdateStatus::kFail;
+       }
+  }
+
+  ESP_LOGI(kTag, "HTTPS OTA Transport finished with status: %d", static_cast<int>(final_status));
+  return final_status;
+}
