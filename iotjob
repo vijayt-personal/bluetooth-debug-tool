@@ -1,0 +1,385 @@
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/event_groups.h"
+#include "freertos/queue.h" // For deferring actions from callbacks
+#include "esp_log.h"
+#include "nvs_flash.h"
+#include "esp_netif.h"
+#include "esp_event.h"
+#include "esp_wifi.h"
+#include "esp_idf_version.h"
+#include <string>
+#include <string_view>
+#include <cstring>
+#include <cstdlib>
+#include <algorithm>
+
+// --- OTA Includes ---
+#include "esp_ota_ops.h"
+#include "esp_http_client.h"
+#include "esp_https_ota.h"
+// --- End OTA Includes ---
+
+// --- RapidJSON Includes ---
+#include "rapidjson/document.h"
+#include "rapidjson/writer.h"
+#include "rapidjson/stringbuffer.h"
+// --- End RapidJSON Includes ---
+
+// Include your MQTT client header
+#include "aws_iot_mqtt_client.hpp"
+
+// --- Config Defines / Cert Embedding / Globals / Prototypes ---
+#define EXAMPLE_ESP_WIFI_SSID      CONFIG_ESP_WIFI_SSID
+#define EXAMPLE_ESP_WIFI_PASS      CONFIG_ESP_WIFI_PASSWORD
+#define EXAMPLE_ESP_MAXIMUM_RETRY  CONFIG_ESP_MAXIMUM_RETRY
+#define EXAMPLE_AWS_ENDPOINT       CONFIG_AWS_IOT_ENDPOINT
+#define EXAMPLE_AWS_THING_NAME     CONFIG_AWS_IOT_THING_NAME
+constexpr uint32_t APP_MQTT_RECONNECT_BASE_MS = 2000;
+constexpr uint32_t APP_MQTT_RECONNECT_MAX_MS  = 120000;
+extern const uint8_t aws_root_ca_pem_start[] asm("_binary_aws_root_ca_pem_start");
+extern const uint8_t device_crt_start[] asm("_binary_device_crt_start");
+extern const uint8_t device_key_start[] asm("_binary_device_key_start");
+// Optional: Embed S3 Root CA if needed (Amazon Root CA 1 often works)
+// extern const uint8_t s3_root_ca_pem_start[] asm("_binary_s3_root_ca_pem_start");
+
+static const char* TAG_MAIN = "MyAppMain";
+static EventGroupHandle_t s_wifi_event_group;
+#define WIFI_CONNECTED_BIT BIT0
+#define WIFI_FAIL_BIT      BIT1
+static int s_retry_num = 0;
+static bool g_app_mqtt_disconnect_requested = false;
+static bool g_app_is_attempting_connect = false;
+static uint32_t g_app_reconnect_delay_ms = APP_MQTT_RECONNECT_BASE_MS;
+
+// --- For deferring actions from MQTT callbacks ---
+typedef struct {
+    enum class ActionType {
+        UPDATE_JOB_STATUS,
+        PERFORM_OTA
+    } type;
+    // Common fields
+    std::string job_id;
+    // Fields for UPDATE_JOB_STATUS
+    std::string status;
+    std::string details_json; // Pre-formatted JSON string
+    // Fields for PERFORM_OTA
+    std::string ota_url;
+} AppAction_t;
+
+static QueueHandle_t g_app_action_queue = nullptr;
+static const int APP_ACTION_QUEUE_SIZE = 5;
+// --- End deferred action items ---
+
+static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data);
+static void wifi_init_sta(void);
+static bool copy_embedded_data(char* dest_buf, size_t dest_size, const uint8_t* src_start, const uint8_t* src_end);
+void on_mqtt_connected();
+void on_mqtt_disconnected();
+void on_shadow_update(const std::string& update_type, std::string_view payload);
+void on_shadow_get_response(const std::string& response_type, std::string_view payload);
+void on_job_received(const std::string& job_id, const std::string& status, const std::string& document);
+void application_reconnect_logic();
+static void application_action_task(void *pvParameter); // Task to handle deferred actions
+static esp_err_t perform_ota_update(const std::string& url, const std::string& job_id); // OTA function
+std::string create_job_details_json(const std::vector<std::pair<std::string, std::string>>& details); // Helper to create JSON details
+
+
+AwsIot::AwsIotMqttClient mqtt_client;
+
+// --- MQTT Callback Implementations ---
+void on_mqtt_connected() {
+    ESP_LOGI(TAG_MAIN, "++++++++ MQTT Client Connected! ++++++++");
+    g_app_reconnect_delay_ms = APP_MQTT_RECONNECT_BASE_MS;
+    g_app_is_attempting_connect = false;
+    mqtt_client.GetShadow("on_connect");
+    // Other subscriptions...
+}
+void on_mqtt_disconnected() {
+    ESP_LOGW(TAG_MAIN, "-------- MQTT Client Disconnected Callback! --------");
+    g_app_is_attempting_connect = false;
+}
+void on_shadow_update(const std::string& update_type, std::string_view payload) { /* ... */ } // Add parsing if needed
+void on_shadow_get_response(const std::string& response_type, std::string_view payload) { /* ... */ } // Add parsing if needed
+
+// --- Job Callback Implementation (Using RapidJSON & Deferral) ---
+void on_job_received(const std::string& job_id, const std::string& status, const std::string& document_str) {
+     ESP_LOGI(TAG_MAIN, "== Job Notification Received ==");
+     ESP_LOGI(TAG_MAIN, "   Job ID: %s", job_id.c_str());
+     ESP_LOGI(TAG_MAIN, "   Status: %s", status.c_str());
+     ESP_LOGI(TAG_MAIN, "   Document: %s", document_str.c_str());
+
+     // Queue an action for processing newly notified/queued jobs
+     if (status == "QUEUED") {
+        ESP_LOGI(TAG_MAIN, "   Processing NEW Job %s...", job_id.c_str());
+
+        // --- Parse Job Document with RapidJSON ---
+        rapidjson::Document doc;
+        // Parse document_str directly. Needs to be null-terminated for some Parse variants,
+        // std::string provides this. In-situ might require mutable buffer.
+        doc.Parse(document_str.c_str());
+
+        std::string operation = "unknown";
+        std::string s3_url = "";
+        bool parse_ok = false;
+
+        if (doc.HasParseError()) {
+            ESP_LOGE(TAG_MAIN, "   Job doc parse error: %s (offset %u)",
+                     rapidjson::GetParseError_En(doc.GetParseError()), (unsigned)doc.GetErrorOffset());
+        } else if (!doc.IsObject()) {
+            ESP_LOGE(TAG_MAIN, "   Job doc is not a JSON object");
+        } else {
+            if (doc.HasMember("operation") && doc["operation"].IsString()) {
+                operation = doc["operation"].GetString();
+                ESP_LOGI(TAG_MAIN, "   Parsed operation: %s", operation.c_str());
+                parse_ok = true; // Got the essential part
+
+                // Example: OTA Job
+                if (operation == "ota_s3") {
+                    if (doc.HasMember("s3_url") && doc["s3_url"].IsString()) {
+                        s3_url = doc["s3_url"].GetString();
+                        if (s3_url.empty() || s3_url.rfind("https://", 0) != 0) {
+                             ESP_LOGE(TAG_MAIN, "   Invalid or missing https 's3_url' for ota_s3 operation.");
+                             parse_ok = false; // Mark as failure if URL is bad
+                             s3_url = ""; // Clear bad URL
+                        } else {
+                             ESP_LOGI(TAG_MAIN, "   Parsed S3 URL: %s", s3_url.c_str());
+                        }
+                    } else {
+                        ESP_LOGE(TAG_MAIN, "   ota_s3 operation missing 's3_url' string.");
+                        parse_ok = false;
+                    }
+                }
+                 // Add parsing for other operations if needed...
+
+            } else {
+                ESP_LOGE(TAG_MAIN, "   Job document missing 'operation' string.");
+            }
+        }
+        // --- End Parsing ---
+
+        // Prepare action structure
+        AppAction_t action;
+        action.job_id = job_id; // Copy job ID
+
+        if (!parse_ok) {
+            // Send FAILED status update via queue
+            action.type = AppAction_t::ActionType::UPDATE_JOB_STATUS;
+            action.status = "FAILED";
+            action.details_json = create_job_details_json({{"reason", "InvalidJobDocument"}, {"details", "Parsing failed or missing required fields"}});
+        } else {
+            // Send IN_PROGRESS status update via queue
+            action.type = AppAction_t::ActionType::UPDATE_JOB_STATUS;
+            action.status = "IN_PROGRESS";
+            action.details_json = create_job_details_json({{"step", "parse_ok"}, {"operation", operation}});
+
+            // Queue the status update first
+            if (xQueueSend(g_app_action_queue, &action, pdMS_TO_TICKS(100)) != pdTRUE) {
+                ESP_LOGE(TAG_MAIN, "Failed to queue IN_PROGRESS update for job %s", job_id.c_str());
+                // Decide how to handle - maybe try to fail job directly? Risky from callback.
+                return; // Cannot proceed if queue fails
+            }
+
+            // Now queue the actual work (e.g., OTA)
+            if (operation == "ota_s3" && !s3_url.empty()) {
+                 action.type = AppAction_t::ActionType::PERFORM_OTA;
+                 action.ota_url = s3_url; // Pass URL to action task
+                 // Job ID already set
+            } else {
+                 // For other non-OTA operations, could define different actions
+                 // Or simply mark as success/failure immediately if work is trivial
+                 ESP_LOGW(TAG_MAIN, "Operation '%s' not implemented or requires immediate completion.", operation.c_str());
+                 // Queue a SUCCEEDED update for now for unknown ops
+                 action.type = AppAction_t::ActionType::UPDATE_JOB_STATUS;
+                 action.status = "SUCCEEDED";
+                 action.details_json = create_job_details_json({{"result", "Operation not implemented/applicable"}});
+            }
+        }
+
+        // Send the final action (OTA trigger or immediate completion) to the queue
+        if (xQueueSend(g_app_action_queue, &action, pdMS_TO_TICKS(100)) != pdTRUE) {
+            ESP_LOGE(TAG_MAIN, "Failed to queue action (%d) for job %s", (int)action.type, job_id.c_str());
+            // May need to queue a FAILED status here if IN_PROGRESS was already sent
+        }
+
+     } else if (status == "ACCEPTED" || status == "REJECTED") {
+        ESP_LOGI(TAG_MAIN, "   Job status update %s for Job ID %s acknowledged by AWS.", status.c_str(), job_id.c_str());
+     } else {
+        ESP_LOGI(TAG_MAIN, "   Ignoring job notification with status [%s].", status.c_str());
+     }
+}
+
+
+// --- Application Reconnect Logic ---
+void application_reconnect_logic() { /* ... as before ... */ }
+
+
+// --- Helper to create simple JSON status details ---
+std::string create_job_details_json(const std::vector<std::pair<std::string, std::string>>& details) {
+    rapidjson::Document d;
+    d.SetObject();
+    rapidjson::Document::AllocatorType& allocator = d.GetAllocator();
+
+    for (const auto& pair : details) {
+        rapidjson::Value key(pair.first.c_str(), allocator);
+        rapidjson::Value value(pair.second.c_str(), allocator);
+        d.AddMember(key, value, allocator);
+    }
+
+    rapidjson::StringBuffer buffer;
+    rapidjson::Writer<rapidjson::StringBuffer> writer(buffer);
+    d.Accept(writer);
+
+    return buffer.GetString();
+}
+
+// --- OTA Task Function ---
+// IMPORTANT: This runs the blocking OTA update. It should run with sufficient stack!
+static esp_err_t perform_ota_update(const std::string& url, const std::string& job_id) {
+    ESP_LOGI(TAG_MAIN, "[OTA_TASK] Starting OTA update for Job %s from URL: %s", job_id.c_str(), url.c_str());
+
+    esp_http_client_config_t config = {};
+    config.url = url.c_str();
+    config.cert_pem = reinterpret_cast<const char *>(aws_root_ca_pem_start); // Use Amazon Root CA or specific S3 CA
+    config.timeout_ms = 15000; // 15 seconds connection timeout
+    config.keep_alive_enable = true;
+    // config.skip_cert_common_name_check = true; // Use only if necessary, less secure
+
+    // Configure OTA - buffer size affects RAM usage during download
+    esp_https_ota_config_t ota_config = {};
+    ota_config.http_config = &config;
+    // ota_config.bulk_flash_erase = true; // Optional: Erase range before writing
+    // ota_config.partial_http_download = true; // Optional: Use Range requests
+
+    AppAction_t action_update; // To queue status updates
+    action_update.job_id = job_id;
+    action_update.type = AppAction_t::ActionType::UPDATE_JOB_STATUS;
+
+    // Update job status: Starting Download
+    action_update.status = "IN_PROGRESS";
+    action_update.details_json = create_job_details_json({{"step", "download_start"}});
+    xQueueSend(g_app_action_queue, &action_update, pdMS_TO_TICKS(50)); // Best effort queue send
+
+    ESP_LOGI(TAG_MAIN, "[OTA_TASK] Calling esp_https_ota...");
+    esp_err_t result = esp_https_ota(&ota_config);
+    ESP_LOGI(TAG_MAIN, "[OTA_TASK] esp_https_ota finished.");
+
+    if (result == ESP_OK) {
+        ESP_LOGI(TAG_MAIN, "[OTA_TASK] OTA Update Successful for Job %s.", job_id.c_str());
+        // Update job status: Succeeded
+        action_update.status = "SUCCEEDED";
+        action_update.details_json = create_job_details_json({{"result", "ota_complete_rebooting"}});
+        xQueueSend(g_app_action_queue, &action_update, pdMS_TO_TICKS(50));
+        vTaskDelay(pdMS_TO_TICKS(2000)); // Short delay for message to likely send
+        esp_restart(); // Restart to boot into new firmware
+        // Code below here will not execute after restart
+        return ESP_OK;
+    } else {
+        ESP_LOGE(TAG_MAIN, "[OTA_TASK] OTA Update Failed for Job %s (err: 0x%x - %s)", job_id.c_str(), result, esp_err_to_name(result));
+        // Update job status: Failed
+        action_update.status = "FAILED";
+        action_update.details_json = create_job_details_json({{"reason", "esp_https_ota_failed"}, {"code", std::to_string(result)}});
+        xQueueSend(g_app_action_queue, &action_update, pdMS_TO_TICKS(50));
+        return result;
+    }
+}
+
+// --- Task to handle deferred actions from callbacks ---
+static void application_action_task(void *pvParameter) {
+    ESP_LOGI(TAG_MAIN, "Application Action Task Started.");
+    AppAction_t received_action;
+
+    while (true) {
+        // Wait indefinitely for actions from the queue
+        if (xQueueReceive(g_app_action_queue, &received_action, portMAX_DELAY) == pdTRUE) {
+            ESP_LOGI(TAG_MAIN, "[ACTION_TASK] Received action type %d for job %s", (int)received_action.type, received_action.job_id.c_str());
+
+            if (received_action.type == AppAction_t::ActionType::UPDATE_JOB_STATUS) {
+                ESP_LOGI(TAG_MAIN, "[ACTION_TASK] Updating job %s status to %s",
+                         received_action.job_id.c_str(), received_action.status.c_str());
+                 ESP_LOGD(TAG_MAIN, "[ACTION_TASK] Details: %s", received_action.details_json.c_str());
+                if (!mqtt_client.UpdateJobStatus(received_action.job_id, received_action.status, received_action.details_json)) {
+                    ESP_LOGE(TAG_MAIN, "[ACTION_TASK] Failed to send UpdateJobStatus!");
+                    // Consider retry logic or other error handling
+                }
+            } else if (received_action.type == AppAction_t::ActionType::PERFORM_OTA) {
+                ESP_LOGI(TAG_MAIN, "[ACTION_TASK] Starting OTA process for job %s", received_action.job_id.c_str());
+                // Run the potentially long-running OTA function
+                perform_ota_update(received_action.ota_url, received_action.job_id);
+                // perform_ota_update handles final status updates and reboot/failure reporting
+            } else {
+                 ESP_LOGE(TAG_MAIN, "[ACTION_TASK] Unknown action type received: %d", (int)received_action.type);
+            }
+        }
+        // Yield allows lower priority tasks to run if queue is empty temporarily
+        // (though portMAX_DELAY means it usually blocks until message arrives)
+        // vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    // Should not exit
+    vTaskDelete(NULL);
+}
+
+
+// --- Main Application ---
+extern "C" void app_main(void) {
+    ESP_LOGI(TAG_MAIN, "[APP] Starting application...");
+    // ... Initialize NVS, WiFi ...
+    esp_err_t ret = nvs_flash_init(); if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) { ESP_ERROR_CHECK(nvs_flash_erase()); ret = nvs_flash_init(); } ESP_ERROR_CHECK(ret);
+    ESP_LOGI(TAG_MAIN, "[APP] Initializing WiFi..."); wifi_init_sta();
+    EventBits_t bits = xEventGroupGetBits(s_wifi_event_group); if (!(bits & WIFI_CONNECTED_BIT)) { ESP_LOGE(TAG_MAIN, "[APP] WiFi connection failed. Halting."); while(1) vTaskDelay(portMAX_DELAY); } ESP_LOGI(TAG_MAIN, "[APP] WiFi Connected.");
+
+    // --- Create Action Queue ---
+    g_app_action_queue = xQueueCreate(APP_ACTION_QUEUE_SIZE, sizeof(AppAction_t));
+    if (g_app_action_queue == nullptr) {
+        ESP_LOGE(TAG_MAIN, "[APP] Failed to create action queue. Halting.");
+        while(1) vTaskDelay(portMAX_DELAY);
+    }
+
+    // --- Start Action Task ---
+    // Increase stack size significantly for OTA task if it runs there directly,
+    // or ensure perform_ota_update spawns its own task with adequate stack.
+    // Let's give this action task more stack.
+    xTaskCreate(application_action_task, "app_action_task", 8192, NULL, 5, NULL);
+
+
+    // Initialize MQTT Client
+    ESP_LOGI(TAG_MAIN, "[APP] Setting up MQTT Client Configuration...");
+    AwsIot::MqttConfig config = {};
+    // ... Populate config, Copy certs ...
+    config.aws_endpoint = EXAMPLE_AWS_ENDPOINT; config.client_id = EXAMPLE_AWS_THING_NAME; config.thing_name = EXAMPLE_AWS_THING_NAME;
+    bool certs_ok = true; certs_ok &= copy_embedded_data(config.root_ca_pem, AwsIot::kMaxCertLen, aws_root_ca_pem_start, aws_root_ca_pem_end); certs_ok &= copy_embedded_data(config.device_cert_pem, AwsIot::kMaxCertLen, device_crt_start, device_crt_end); certs_ok &= copy_embedded_data(config.private_key_pem, AwsIot::kMaxCertLen, device_key_start, device_key_end); if (!certs_ok) { ESP_LOGE(TAG_MAIN, "[APP] Failed to copy certificates. Halting."); while(1) vTaskDelay(portMAX_DELAY); }
+
+    ESP_LOGI(TAG_MAIN, "[APP] Initializing MQTT Client library...");
+    if (!mqtt_client.Initialize(config)) { ESP_LOGE(TAG_MAIN, "[APP] Failed to initialize MQTT Client. Halting."); while(1) vTaskDelay(portMAX_DELAY); }
+
+    // Set callbacks
+    mqtt_client.SetOnConnectedCallback(on_mqtt_connected);
+    mqtt_client.SetOnDisconnectedCallback(on_mqtt_disconnected);
+    mqtt_client.SubscribeToShadowUpdates(on_shadow_update);
+    mqtt_client.SubscribeToShadowGetResponses(on_shadow_get_response);
+    ESP_LOGI(TAG_MAIN, "[APP] Subscribing to Jobs notifications...");
+    if (!mqtt_client.SubscribeToJobs(on_job_received)) { ESP_LOGE(TAG_MAIN, "[APP] Failed to subscribe to Jobs notifications!"); }
+
+    ESP_LOGI(TAG_MAIN, "[APP] Setup complete. Entering main loop.");
+    g_app_disconnect_requested = false; g_app_is_attempting_connect = false; g_app_reconnect_delay_ms = APP_MQTT_RECONNECT_BASE_MS;
+
+    // --- Main Loop ---
+    uint32_t iteration = 0;
+    while (1) {
+        application_reconnect_logic(); // Handle connection/reconnection
+
+        if (mqtt_client.IsConnected()) {
+            iteration++;
+            // Your periodic work... publish sensor data, update reported state etc.
+            // ...
+        }
+        // Main loop delay - less frequent work now that action task handles jobs
+        vTaskDelay(pdMS_TO_TICKS(30000));
+    }
+}
+
+
+// --- Helper Func Implementations --- (WiFi init, cert copy - unchanged)
+static bool copy_embedded_data(char* dest_buf, size_t dest_size, const uint8_t* src_start, const uint8_t* src_end) { /* ... as before ... */ }
+static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data) { /* ... as before ... */ }
+void wifi_init_sta(void) { /* ... as before ... */ }
