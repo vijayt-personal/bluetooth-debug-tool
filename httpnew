@@ -1,0 +1,227 @@
+#ifndef HTTPS_CLIENT_H
+#define HTTPS_CLIENT_H
+
+#include <functional> // For std::function
+#include <string_view> // For string views
+#include <map>         // For header map
+#include <cstddef>     // For size_t
+#include <cstdint>     // For uint8_t if needed in future
+
+/**
+ * @class HttpsClient
+ * @brief Provides a C++ wrapper for HTTPS communication, abstracting underlying implementation (like ESP-IDF).
+ *
+ * Handles GET, POST, PUT, PATCH requests, supports optional server verification,
+ * persistent connections, and streaming of request/response bodies. Aims for
+ * deterministic memory usage by configuring buffer sizes during initialization.
+ * Uses Google C++ Style naming conventions.
+ * NOTE: Network operations performed by this client are BLOCKING the calling task.
+ * For non-blocking behavior, run client methods in a dedicated FreeRTOS task.
+ */
+class HttpsClient {
+ public:
+  /**
+   * @brief Status codes returned by HttpsClient methods and callbacks.
+   * Nested within HttpsClient class. Access as HttpsClient::Status::kOk, etc.
+   * Follows Google Style 'kUpperCamelCase' for enum values.
+   */
+  enum class Status {
+    kOk = 0,             ///< Operation successful.
+    kFail,               ///< Generic failure.
+    kInvalidArgument,    ///< Invalid argument provided.
+    kNotInitialized,     ///< Client handle is not initialized (Open not called or failed).
+    kAlreadyInitialized, ///< Open() called when already open.
+    kNoMemory,           ///< Memory allocation failed.
+    kTimeout,            ///< Operation timed out.
+    kNetworkError,       ///< Lower-level network error (DNS, TCP, etc.).
+    kConnectionError,    ///< Failed to establish connection or connection lost.
+    kTlsError,           ///< TLS handshake or encryption/decryption error.
+    kHttpError,          ///< HTTP protocol error (parsing, redirects, etc.).
+    kResponseError,      ///< Error indicated by HTTP status code (e.g., 4xx, 5xx).
+    kStreamError,        ///< Error during request or response streaming (e.g., callback error).
+    kBufferTooSmall,     ///< Provided buffer was too small.
+    kUnsupported         ///< Feature or operation not supported.
+  };
+
+  /**
+   * @brief Callback function type for receiving response body data in chunks.
+   * @return HttpsClient::Status Should return HttpsClient::Status::kOk on success, or an error code to abort.
+   */
+  using DataReceivedCallback =
+      std::function<Status(const char* data, size_t len, void* user_context)>;
+
+  /**
+   * @brief Callback function type for providing request body data in chunks for streaming uploads.
+   * @return int Bytes written (positive), 0 (EOF), or negative (error).
+   */
+  using DataProviderCallback =
+      std::function<int(char* buffer, size_t max_len, void* user_context)>;
+
+
+  /**
+   * @brief Configuration structure for opening a connection.
+   */
+  struct Config {
+    std::string_view base_url;
+    bool verify_server = true;
+    const char* server_cert_pem = nullptr;
+    int timeout_ms = 10000;
+    size_t buffer_size_rx_bytes = 512;
+    size_t buffer_size_tx_bytes = 512;
+    int keep_alive_idle_sec = 5;
+    int keep_alive_interval_sec = 5;
+    int keep_alive_count = 3;
+    void* user_context = nullptr;
+  };
+
+  /**
+   * @brief Structure to hold response information.
+   */
+  struct ResponseInfo {
+      int status_code = 0;
+      long long content_length = -1;
+      bool connection_close = false;
+      // std::string content_type;
+  };
+
+  using Headers = std::map<std::string_view, std::string_view>;
+
+  HttpsClient();
+  ~HttpsClient();
+
+  // Disable copy/move semantics
+  HttpsClient(const HttpsClient&) = delete;
+  HttpsClient& operator=(const HttpsClient&) = delete;
+  HttpsClient(HttpsClient&&) = delete;
+  HttpsClient& operator=(HttpsClient&&) = delete;
+
+  /**
+   * @brief Initializes the client and potentially establishes a base connection. BLOCKING.
+   * @param config Configuration settings for the client.
+   * @return HttpsClient::Status HttpsClient::Status::kOk on success, error code otherwise.
+   */
+  Status Open(const Config& config); // Renamed to UpperCamelCase
+
+  /**
+   * @brief Closes any open connection and cleans up resources. BLOCKING (during cleanup).
+   * @return HttpsClient::Status HttpsClient::Status::kOk on success, error code otherwise.
+   */
+  Status Close(); // Renamed to UpperCamelCase
+
+  /**
+   * @brief Performs an HTTP GET request. BLOCKING.
+   * @param path The path relative to the base URL (e.g., "/data").
+   * @param headers Optional map of additional request headers.
+   * @param on_data_received Callback function (HttpsClient::DataReceivedCallback) to handle response body chunks. Can be nullptr.
+   * @param response_info Optional output parameter to store response details.
+   * @return HttpsClient::Status HttpsClient::Status::kOk on success, error code otherwise. Check response_info->status_code for HTTP status.
+   */
+  Status Get(std::string_view path, const Headers& headers, // Renamed
+             DataReceivedCallback on_data_received,
+             ResponseInfo* response_info = nullptr);
+
+  /**
+   * @brief Performs an HTTP POST request with a complete body. BLOCKING.
+   * @param path The path relative to the base URL.
+   * @param headers Optional map of additional request headers. Should include 'Content-Type'.
+   * @param post_data The entire request body data.
+   * @param on_data_received Callback function (HttpsClient::DataReceivedCallback) to handle response body chunks. Can be nullptr.
+   * @param response_info Optional output parameter to store response details.
+   * @return HttpsClient::Status HttpsClient::Status::kOk on success, error code otherwise. Check response_info->status_code for HTTP status.
+   */
+  Status Post(std::string_view path, const Headers& headers, // Renamed
+              std::string_view post_data,
+              DataReceivedCallback on_data_received,
+              ResponseInfo* response_info = nullptr);
+
+
+  /**
+   * @brief Performs an HTTP POST request with a streaming body. BLOCKING.
+   * @param path The path relative to the base URL.
+   * @param headers Optional map of additional request headers. MUST include 'Content-Length'.
+   * @param total_body_length The total size of the request body to be sent.
+   * @param data_provider Callback function (HttpsClient::DataProviderCallback) to provide request body chunks. Must not be nullptr.
+   * @param on_data_received Callback function (HttpsClient::DataReceivedCallback) to handle response body chunks. Can be nullptr.
+   * @param response_info Optional output parameter to store response details.
+   * @return HttpsClient::Status HttpsClient::Status::kOk on success, error code otherwise. Check response_info->status_code for HTTP status.
+   */
+  Status PostStream(std::string_view path, const Headers& headers, // Renamed
+                    size_t total_body_length,
+                    DataProviderCallback data_provider,
+                    DataReceivedCallback on_data_received,
+                    ResponseInfo* response_info = nullptr);
+
+
+  /**
+   * @brief Performs an HTTP PUT request with a complete body. BLOCKING.
+   * @param path The path relative to the base URL.
+   * @param headers Optional map of additional request headers. Should include 'Content-Type'.
+   * @param put_data The entire request body data.
+   * @param on_data_received Callback function (HttpsClient::DataReceivedCallback) to handle response body chunks. Can be nullptr.
+   * @param response_info Optional output parameter to store response details.
+   * @return HttpsClient::Status HttpsClient::Status::kOk on success, error code otherwise. Check response_info->status_code for HTTP status.
+   */
+  Status Put(std::string_view path, const Headers& headers, // Renamed
+             std::string_view put_data,
+             DataReceivedCallback on_data_received,
+             ResponseInfo* response_info = nullptr);
+
+
+  /**
+   * @brief Performs an HTTP PUT request with a streaming body. BLOCKING.
+   * @param path The path relative to the base URL.
+   * @param headers Optional map of additional request headers. MUST include 'Content-Length'.
+   * @param total_body_length The total size of the request body to be sent.
+   * @param data_provider Callback function (HttpsClient::DataProviderCallback) to provide request body chunks. Must not be nullptr.
+   * @param on_data_received Callback function (HttpsClient::DataReceivedCallback) to handle response body chunks. Can be nullptr.
+   * @param response_info Optional output parameter to store response details.
+   * @return HttpsClient::Status HttpsClient::Status::kOk on success, error code otherwise. Check response_info->status_code for HTTP status.
+   */
+  Status PutStream(std::string_view path, const Headers& headers, // Renamed
+                   size_t total_body_length,
+                   DataProviderCallback data_provider,
+                   DataReceivedCallback on_data_received,
+                   ResponseInfo* response_info = nullptr);
+
+
+  /**
+   * @brief Performs an HTTP PATCH request with a complete body. BLOCKING.
+   * @param path The path relative to the base URL.
+   * @param headers Optional map of additional request headers. Should include 'Content-Type'.
+   * @param patch_data The entire request body data.
+   * @param on_data_received Callback function (HttpsClient::DataReceivedCallback) to handle response body chunks. Can be nullptr.
+   * @param response_info Optional output parameter to store response details.
+   * @return HttpsClient::Status HttpsClient::Status::kOk on success, error code otherwise. Check response_info->status_code for HTTP status.
+   */
+  Status Patch(std::string_view path, const Headers& headers, // Renamed
+               std::string_view patch_data,
+               DataReceivedCallback on_data_received,
+               ResponseInfo* response_info = nullptr);
+
+  /**
+   * @brief Converts HttpsClient::Status enum to a descriptive string.
+   * @param status The status code (HttpsClient::Status) to convert.
+   * @return A null-terminated string describing the status.
+   */
+  static const char* StatusToString(Status status); // Renamed
+
+
+ private:
+   // Forward declaration of internal implementation structure (PIMPL-like)
+   struct HttpsClientImpl;
+   HttpsClientImpl* impl_ = nullptr; // Pointer to implementation details (member var -> lower_snake_case_)
+
+   // Internal context structure passed to the underlying implementation handlers
+   struct RequestContext {
+        DataReceivedCallback on_data_received; // Uses nested type alias
+        void* user_context = nullptr;          // member var -> lower_snake_case_
+        ResponseInfo* response_info_ptr = nullptr; // member var -> lower_snake_case_
+   };
+
+   RequestContext current_request_ctx_; // member var -> lower_snake_case_
+
+   std::string base_url_storage_; // member var -> lower_snake_case_
+   size_t tx_buffer_size_ = 0;    // member var -> lower_snake_case_
+};
+
+#endif // HTTPS_CLIENT_H
