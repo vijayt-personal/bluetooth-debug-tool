@@ -1,0 +1,157 @@
+#ifndef APPLICATION_UPDATER_H_
+#define APPLICATION_UPDATER_H_
+
+#include <cstddef> // For size_t
+#include <cstdint> // For uint8_t
+#include <memory>  // For std::unique_ptr
+
+// Forward declaration for the implementation class (PIMPL idiom)
+class ApplicationUpdaterImpl;
+
+/**
+ * @brief Defines the possible states of the ApplicationUpdater.
+ */
+typedef enum {
+  APP_UPDATE_STATE_INITIAL = 0,    ///< Initial state, updater not started.
+  APP_UPDATE_STATE_READY,          ///< Updater started, ready for header data.
+  APP_UPDATE_STATE_VERIFYING_HEADER, ///< Verifying the initial firmware header.
+  APP_UPDATE_STATE_WRITING_BLOCKS, ///< Writing firmware blocks to storage.
+  APP_UPDATE_STATE_VERIFYING_IMAGE,  ///< Verifying the complete written image.
+  APP_UPDATE_STATE_FINISHED,       ///< Update successfully completed and validated.
+  APP_UPDATE_STATE_ABORTED,        ///< Update process was aborted.
+  APP_UPDATE_STATE_ERROR           ///< An unrecoverable error occurred.
+} ApplicationUpdateState;
+
+/**
+ * @brief Defines generic error codes for the ApplicationUpdater.
+ */
+typedef enum {
+  APP_UPDATE_SUCCESS = 0,            ///< Operation successful.
+  APP_UPDATE_ERR_FAILURE,          ///< General failure.
+  APP_UPDATE_ERR_INVALID_STATE,    ///< Operation called in an invalid state.
+  APP_UPDATE_ERR_INVALID_ARG,      ///< Invalid argument provided to a method.
+  APP_UPDATE_ERR_VERIFICATION_FAILED, ///< Header or image verification failed.
+  APP_UPDATE_ERR_STORAGE_ERROR,    ///< Error interacting with storage (begin, write, end).
+  APP_UPDATE_ERR_NOT_FOUND,        ///< Required resource (e.g., update partition) not found.
+  APP_UPDATE_ERR_BUFFER_ERROR,     ///< Internal buffering error.
+  APP_UPDATE_ERR_ABORTED           ///< Operation was aborted.
+} ApplicationUpdateError;
+
+/**
+ * @class ApplicationUpdater
+ * @brief Manages an application update process (e.g., firmware OTA).
+ *
+ * This class provides a platform-agnostic interface for handling
+ * application updates through a state machine. It manages receiving
+ * update data, writing it to storage, verifying it, and finalizing the process.
+ * The underlying storage mechanism (e.g., ESP-IDF OTA) is hidden.
+ */
+class ApplicationUpdater {
+ public:
+  /**
+   * @brief Constructor for ApplicationUpdater.
+   * @param header_size The expected size of the application header in bytes.
+   * @param storage_block_size The optimal size of blocks to write to the
+   * underlying storage medium (e.g., 4096 for ESP32 flash).
+   */
+  ApplicationUpdater(size_t header_size, size_t storage_block_size = 4096);
+
+  /**
+   * @brief Destructor for ApplicationUpdater.
+   * Ensures resources are cleaned up if the update wasn't finished
+   * or explicitly aborted.
+   */
+  ~ApplicationUpdater();
+
+  // Disable copy constructor and assignment operator (PIMPL requires care)
+  ApplicationUpdater(const ApplicationUpdater&) = delete;
+  ApplicationUpdater& operator=(const ApplicationUpdater&) = delete;
+
+  // Explicit move constructor and assignment can be added if needed,
+  // managing the unique_ptr ownership. For simplicity, they are omitted here.
+  ApplicationUpdater(ApplicationUpdater&&) noexcept = default;
+  ApplicationUpdater& operator=(ApplicationUpdater&&) noexcept = default;
+
+
+  /**
+   * @brief Initializes the application update process.
+   *
+   * Prepares the underlying storage for receiving the update.
+   * Transitions state from INITIAL to READY.
+   *
+   * @param total_image_size Optional: The total expected size of the application
+   * image in bytes. If provided (e.g., from download headers), it can be used
+   * for validation. If 0, it's ignored or determined from the header later.
+   * @return ApplicationUpdateError APP_UPDATE_SUCCESS on success, or an error
+   * code on failure (e.g., APP_UPDATE_ERR_STORAGE_ERROR,
+   * APP_UPDATE_ERR_NOT_FOUND).
+   */
+  ApplicationUpdateError Begin(size_t total_image_size = 0);
+
+  /**
+   * @brief Processes incoming application data.
+   *
+   * Handles header verification and writing data blocks to storage.
+   * Manages internal buffering to write in storage_block_size chunks.
+   * Transitions state through READY, VERIFYING_HEADER, WRITING_BLOCKS.
+   *
+   * @param data Pointer to the buffer containing application data.
+   * @param size Size of the data in the buffer.
+   * @return ApplicationUpdateError APP_UPDATE_SUCCESS on success,
+   * APP_UPDATE_ERR_INVALID_STATE if called in an incorrect state, or other
+   * error codes on failure (e.g., APP_UPDATE_ERR_STORAGE_ERROR,
+   * APP_UPDATE_ERR_VERIFICATION_FAILED).
+   */
+  ApplicationUpdateError Write(const uint8_t* data, size_t size);
+
+  /**
+   * @brief Finalizes the application update process.
+   *
+   * Must be called after all application data has been successfully written
+   * via Write(). This method performs final image verification (if needed)
+   * and commits the update (e.g., marks it as valid for the next boot).
+   * Transitions state to FINISHED on success or ERROR on failure.
+   *
+   * @return ApplicationUpdateError APP_UPDATE_SUCCESS on success,
+   * APP_UPDATE_ERR_INVALID_STATE if called prematurely,
+   * APP_UPDATE_ERR_VERIFICATION_FAILED if image verification fails,
+   * APP_UPDATE_ERR_STORAGE_ERROR on commit failure.
+   */
+  ApplicationUpdateError End();
+
+  /**
+   * @brief Aborts the application update process.
+   *
+   * Cleans up any resources and invalidates the update operation if it was in
+   * progress. Transitions state to ABORTED. Can be called from most states
+   * except INITIAL and FINISHED.
+   *
+   * @return ApplicationUpdateError APP_UPDATE_SUCCESS on successful abort,
+   * APP_UPDATE_ERR_FAILURE if cleanup encounters issues.
+   */
+  ApplicationUpdateError Abort();
+
+  /**
+   * @brief Gets the current state of the update process.
+   * @return ApplicationUpdateState The current state.
+   */
+  ApplicationUpdateState GetState() const;
+
+  /**
+   * @brief Gets the last encountered error code.
+   * @return ApplicationUpdateError The last error code (APP_UPDATE_SUCCESS if no error).
+   */
+  ApplicationUpdateError GetLastErrorCode() const;
+
+  /**
+   * @brief Gets the number of bytes successfully written to storage so far.
+   * @return size_t Number of bytes written.
+   */
+  size_t GetBytesWritten() const;
+
+ private:
+  // Pointer to the implementation - hides platform specifics
+  std::unique_ptr<ApplicationUpdaterImpl> pimpl_;
+};
+
+#endif // APPLICATION_UPDATER_H_
