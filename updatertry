@@ -1,0 +1,860 @@
+// ========================================================================= //
+//                            Header File Content                            //
+//                        (application_updater.h)                            //
+// ========================================================================= //
+
+#ifndef APPLICATION_UPDATER_H_
+#define APPLICATION_UPDATER_H_
+
+#include <cstddef> // For size_t
+#include <cstdint> // For uint8_t
+#include <memory>  // For std::unique_ptr
+#include <string>  // For diagnostic function return types
+
+// Forward declaration for the implementation class (PIMPL idiom)
+class ApplicationUpdaterImpl;
+
+/**
+ * @brief Defines the possible states of the ApplicationUpdater.
+ */
+typedef enum {
+  APP_UPDATE_STATE_INITIAL = 0,    ///< Initial state, updater not started.
+  APP_UPDATE_STATE_READY,          ///< Updater started, ready for header data.
+  APP_UPDATE_STATE_VERIFYING_HEADER, ///< Verifying the initial firmware header.
+  APP_UPDATE_STATE_WRITING_BLOCKS, ///< Writing firmware blocks to storage.
+  APP_UPDATE_STATE_VERIFYING_IMAGE,  ///< Verifying the complete written image.
+  APP_UPDATE_STATE_FINISHED,       ///< Update successfully completed and validated.
+  APP_UPDATE_STATE_ABORTED,        ///< Update process was aborted.
+  APP_UPDATE_STATE_ERROR           ///< An unrecoverable error occurred.
+} ApplicationUpdateState;
+
+/**
+ * @brief Defines generic error codes for the ApplicationUpdater.
+ */
+typedef enum {
+  APP_UPDATE_SUCCESS = 0,            ///< Operation successful.
+  APP_UPDATE_ERR_FAILURE,          ///< General failure.
+  APP_UPDATE_ERR_INVALID_STATE,    ///< Operation called in an invalid state.
+  APP_UPDATE_ERR_INVALID_ARG,      ///< Invalid argument provided to a method.
+  APP_UPDATE_ERR_VERIFICATION_FAILED, ///< Header or image verification failed.
+  APP_UPDATE_ERR_STORAGE_ERROR,    ///< Error interacting with storage (begin, write, end).
+  APP_UPDATE_ERR_NOT_FOUND,        ///< Required resource (e.g., update partition) not found.
+  APP_UPDATE_ERR_BUFFER_ERROR,     ///< Internal buffering error.
+  APP_UPDATE_ERR_ABORTED           ///< Operation was aborted.
+} ApplicationUpdateError;
+
+/**
+ * @class ApplicationUpdater
+ * @brief Manages an application update process (e.g., firmware OTA).
+ *
+ * This class provides a platform-agnostic interface for handling
+ * application updates through a state machine. It manages receiving
+ * update data, writing it to storage, verifying it, and finalizing the process.
+ * The underlying storage mechanism (e.g., ESP-IDF OTA) is hidden.
+ */
+class ApplicationUpdater {
+ public:
+  /**
+   * @brief Constructor for ApplicationUpdater.
+   * @param header_size The expected size of the application header in bytes.
+   * @param storage_block_size The optimal size of blocks to write to the
+   * underlying storage medium (e.g., 4096 for ESP32 flash).
+   */
+  ApplicationUpdater(size_t header_size, size_t storage_block_size = 4096);
+
+  /**
+   * @brief Destructor for ApplicationUpdater.
+   * Ensures resources are cleaned up if the update wasn't finished
+   * or explicitly aborted. Must be defined in the .cpp file.
+   */
+  ~ApplicationUpdater();
+
+  // Disable copy constructor and assignment operator (PIMPL requires care)
+  ApplicationUpdater(const ApplicationUpdater&) = delete;
+  ApplicationUpdater& operator=(const ApplicationUpdater&) = delete;
+
+  // Explicit move constructor and assignment (defined in .cpp or defaulted)
+  ApplicationUpdater(ApplicationUpdater&&) noexcept;
+  ApplicationUpdater& operator=(ApplicationUpdater&&) noexcept;
+
+
+  // --- Main Operations ---
+
+  /**
+   * @brief Initializes the application update process.
+   * @param total_image_size Optional: The total expected size of the application image.
+   * @return ApplicationUpdateError APP_UPDATE_SUCCESS on success, or an error code.
+   */
+  ApplicationUpdateError Begin(size_t total_image_size = 0);
+
+  /**
+   * @brief Processes incoming application data.
+   * @param data Pointer to the buffer containing application data.
+   * @param size Size of the data in the buffer.
+   * @return ApplicationUpdateError APP_UPDATE_SUCCESS on success, or an error code.
+   */
+  ApplicationUpdateError Write(const uint8_t* data, size_t size);
+
+  /**
+   * @brief Finalizes the application update process.
+   * @return ApplicationUpdateError APP_UPDATE_SUCCESS on success, or an error code.
+   */
+  ApplicationUpdateError End();
+
+  /**
+   * @brief Aborts the application update process.
+   * @return ApplicationUpdateError APP_UPDATE_SUCCESS on successful abort, or failure code.
+   */
+  ApplicationUpdateError Abort();
+
+
+  // --- State and Error Reporting ---
+
+  /**
+   * @brief Gets the current state of the update process.
+   * @return ApplicationUpdateState The current state.
+   */
+  ApplicationUpdateState GetState() const;
+
+  /**
+   * @brief Gets the last encountered error code.
+   * @return ApplicationUpdateError The last error code (APP_UPDATE_SUCCESS if no error).
+   */
+  ApplicationUpdateError GetLastErrorCode() const;
+
+
+  // --- Diagnostics ---
+
+  /**
+   * @brief Gets the number of bytes successfully written to storage so far.
+   * @return size_t Number of bytes written.
+   */
+  size_t GetBytesWritten() const;
+
+  /**
+   * @brief Gets the total number of bytes processed via the Write() method.
+   * This includes header data and data currently in the internal buffer.
+   * @return size_t Total bytes processed from input.
+   */
+  size_t GetBytesProcessed() const;
+
+  /**
+   * @brief Gets the expected total size of the application image, if known.
+   * This value is set either by Begin() or potentially extracted during header
+   * verification.
+   * @return size_t Expected image size in bytes, or 0 if unknown.
+   */
+  size_t GetExpectedImageSize() const;
+
+  /**
+   * @brief Gets the number of bytes currently held in the internal write buffer.
+   * @return size_t Current buffer fill level in bytes.
+   */
+  size_t GetCurrentBufferSize() const;
+
+  /**
+   * @brief Gets descriptive information about the target update partition.
+   * Information is captured during Begin() and remains available until the
+   * updater object is destroyed, even after End() or Abort().
+   * @return std::string A string describing the partition (e.g., "ota_1 (Size: 1MB, Offset: 0x100000)")
+   * or an empty string if Begin() was not called or failed.
+   */
+  std::string GetTargetPartitionInfo() const;
+
+  /**
+   * @brief Gets descriptive information about the currently running partition.
+   * This provides context for the update target. This information is static
+   * for the duration of the application run.
+   * @return std::string A string describing the running partition, or an empty string on error.
+   */
+  std::string GetRunningPartitionInfo() const;
+
+
+ private:
+  // Pointer to the implementation - hides platform specifics
+  std::unique_ptr<ApplicationUpdaterImpl> impl_; // Renamed from pimpl_
+};
+
+#endif // APPLICATION_UPDATER_H_
+
+
+// ========================================================================= //
+//                           Source File Content                             //
+//                       (application_updater.cpp)                           //
+// ========================================================================= //
+
+#include "application_updater.h" // Only include the public header
+
+// --- ESP-IDF and Standard C++ Includes ---
+#include <vector>
+#include <string>
+#include <cstring> // For memcpy
+#include <algorithm> // For std::min
+#include <memory>  // Required for std::unique_ptr definition if not in header
+#include <cstdio>  // For snprintf
+#include "esp_log.h"
+#include "esp_ota_ops.h"
+#include "esp_partition.h"
+#include "esp_system.h" // For esp_chip_info (optional, for header verification)
+#include "esp_app_format.h" // For esp_app_desc_t (optional extra diagnostics)
+#include "esp_err.h"
+// --- End Includes ---
+
+static const char* TAG = "AppUpdater"; // Logging tag
+
+// Helper to format partition info string
+static std::string FormatPartitionInfo(const esp_partition_t* partition) {
+    if (!partition) {
+        return "";
+    }
+    // Buffer large enough for "label (Size: XXXXXXXB, Offset: 0xXXXXXXXX)"
+    char buffer[128];
+    // Use MiB for larger sizes for readability
+    const char* size_unit = "B";
+    uint32_t size_val = partition->size;
+    if (size_val >= 1024 * 1024) {
+        size_unit = "MiB";
+        size_val /= (1024 * 1024);
+    } else if (size_val >= 1024) {
+        size_unit = "KiB";
+        size_val /= 1024;
+    }
+
+    snprintf(buffer, sizeof(buffer), "%s (Size: %u %s, Offset: 0x%X)",
+             partition->label,
+             size_val,
+             size_unit,
+             partition->address);
+    return std::string(buffer);
+}
+
+
+/**
+ * @brief Maps internal ESP-IDF errors to public ApplicationUpdateError codes.
+ * (Implementation unchanged)
+ */
+static ApplicationUpdateError MapEspError(esp_err_t err) {
+    switch (err) {
+        case ESP_OK:
+            return APP_UPDATE_SUCCESS;
+        case ESP_ERR_INVALID_STATE:
+            return APP_UPDATE_ERR_INVALID_STATE;
+        case ESP_ERR_INVALID_ARG:
+            return APP_UPDATE_ERR_INVALID_ARG;
+        case ESP_ERR_NOT_FOUND:
+            return APP_UPDATE_ERR_NOT_FOUND;
+        case ESP_ERR_OTA_VALIDATE_FAILED:
+        case ESP_ERR_INVALID_CRC: // Potentially map CRC errors too
+            return APP_UPDATE_ERR_VERIFICATION_FAILED;
+        case ESP_FAIL:
+        case ESP_ERR_FLASH_OP_FAIL:
+        case ESP_ERR_FLASH_OP_TIMEOUT:
+        case ESP_ERR_ESP_TLS_FAILED_CONNECT:
+        case ESP_ERR_HTTP_BASE:
+            return APP_UPDATE_ERR_STORAGE_ERROR;
+        default:
+            ESP_LOGW(TAG, "Unmapped esp_err_t %d (%s)", err, esp_err_to_name(err));
+            return APP_UPDATE_ERR_FAILURE;
+    }
+}
+
+
+/**
+ * @class ApplicationUpdaterImpl
+ * @brief Private implementation class for ApplicationUpdater.
+ * Contains all platform-specific (ESP-IDF) state and logic.
+ */
+class ApplicationUpdaterImpl {
+public:
+    ApplicationUpdaterImpl(size_t header_size, size_t storage_block_size)
+        : state_(APP_UPDATE_STATE_INITIAL),
+          last_error_code_(APP_UPDATE_SUCCESS),
+          header_size_(header_size),
+          storage_block_size_(storage_block_size),
+          total_image_size_(0),
+          bytes_processed_(0),
+          bytes_written_to_flash_(0),
+          update_partition_(nullptr), // Store pointer temporarily during operation
+          update_handle_(0) {
+
+        if (header_size == 0) {
+            ESP_LOGW(TAG, "Header size is 0. Header verification might be skipped.");
+        }
+        if (storage_block_size_ == 0 || storage_block_size_ % 4 != 0) {
+            ESP_LOGW(TAG, "Invalid storage_block_size %u. Using default 4096.", storage_block_size_);
+            storage_block_size_ = 4096;
+        }
+        buffer_.reserve(storage_block_size_);
+        ESP_LOGI(TAG, "Impl created. Header: %u, Block: %u", header_size_, storage_block_size_);
+    }
+
+    ~ApplicationUpdaterImpl() {
+        if (state_ != APP_UPDATE_STATE_INITIAL && state_ != APP_UPDATE_STATE_FINISHED &&
+            state_ != APP_UPDATE_STATE_ABORTED && state_ != APP_UPDATE_STATE_ERROR) {
+            ESP_LOGW(TAG, "Impl destroyed mid-update (state %d). Aborting.", state_);
+            AbortImpl();
+        }
+    }
+
+    // Non-copyable/movable
+    ApplicationUpdaterImpl(const ApplicationUpdaterImpl&) = delete;
+    ApplicationUpdaterImpl& operator=(const ApplicationUpdaterImpl&) = delete;
+    ApplicationUpdaterImpl(ApplicationUpdaterImpl&&) = delete;
+    ApplicationUpdaterImpl& operator=(ApplicationUpdaterImpl&&) = delete;
+
+
+    // --- Public Interface Implementation Methods ---
+
+    ApplicationUpdateError BeginImpl(size_t total_image_size) {
+        if (state_ != APP_UPDATE_STATE_INITIAL) {
+             ESP_LOGE(TAG, "BeginImpl called in invalid state: %d", state_);
+             SetState(APP_UPDATE_STATE_ERROR, APP_UPDATE_ERR_INVALID_STATE);
+             return last_error_code_;
+        }
+        ESP_LOGI(TAG, "Starting Update. Header: %u, Block: %u", header_size_, storage_block_size_);
+        total_image_size_ = total_image_size;
+
+        update_partition_ = esp_ota_get_next_update_partition(nullptr);
+        if (update_partition_ == nullptr) {
+            ESP_LOGE(TAG, "Failed to find OTA update partition.");
+            target_partition_info_ = ""; // Clear any previous info
+            SetState(APP_UPDATE_STATE_ERROR, APP_UPDATE_ERR_NOT_FOUND);
+            return last_error_code_;
+        }
+        // Store partition info now for diagnostics later
+        target_partition_info_ = FormatPartitionInfo(update_partition_);
+        ESP_LOGI(TAG, "Found update partition: %s", target_partition_info_.c_str());
+
+        esp_err_t err = esp_ota_begin(update_partition_, OTA_SIZE_UNKNOWN, &update_handle_);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "esp_ota_begin failed: %s", esp_err_to_name(err));
+            update_partition_ = nullptr; // Don't hold pointer if begin failed
+            target_partition_info_ = ""; // Clear info on failure
+            SetState(APP_UPDATE_STATE_ERROR, MapEspError(err));
+            return last_error_code_;
+        }
+
+        ESP_LOGI(TAG, "esp_ota_begin succeeded. Ready for data.");
+        bytes_processed_ = 0;
+        bytes_written_to_flash_ = 0;
+        buffer_.clear();
+        SetState(APP_UPDATE_STATE_READY);
+        return APP_UPDATE_SUCCESS;
+    }
+
+    ApplicationUpdateError WriteImpl(const uint8_t* data, size_t size) {
+        if (state_ != APP_UPDATE_STATE_READY && state_ != APP_UPDATE_STATE_VERIFYING_HEADER &&
+            state_ != APP_UPDATE_STATE_WRITING_BLOCKS) {
+             ESP_LOGE(TAG, "WriteImpl called in invalid state: %d", state_);
+             return APP_UPDATE_ERR_INVALID_STATE;
+        }
+        if (data == nullptr || size == 0) {
+             return APP_UPDATE_SUCCESS;
+        }
+
+        ApplicationUpdateError app_err = APP_UPDATE_SUCCESS;
+        esp_err_t esp_err = ESP_OK;
+        const uint8_t* data_ptr = data;
+        size_t remaining_size = size;
+        size_t initial_bytes_processed = bytes_processed_; // Track for this call
+
+        while (remaining_size > 0 && app_err == APP_UPDATE_SUCCESS) {
+            // --- 1. Handle Header Verification ---
+            if (state_ == APP_UPDATE_STATE_READY || state_ == APP_UPDATE_STATE_VERIFYING_HEADER) {
+                SetState(APP_UPDATE_STATE_VERIFYING_HEADER);
+                size_t needed = header_size_ - (bytes_processed_ - initial_bytes_processed); // Bytes needed for header in *this* call context
+                size_t to_copy = std::min(remaining_size, needed);
+
+                if (buffer_.size() + to_copy > buffer_.capacity() && buffer_.capacity() < header_size_) {
+                    ESP_LOGE(TAG, "Internal buffer error during header processing.");
+                     AbortImpl();
+                     SetState(APP_UPDATE_STATE_ERROR, APP_UPDATE_ERR_BUFFER_ERROR);
+                     return last_error_code_;
+                }
+                buffer_.insert(buffer_.end(), data_ptr, data_ptr + to_copy);
+
+                bytes_processed_ += to_copy; // Increment total processed immediately
+                data_ptr += to_copy;
+                remaining_size -= to_copy;
+
+                // Check if header is complete based on total bytes processed so far
+                if (bytes_processed_ >= header_size_) {
+                    ESP_LOGI(TAG, "Received complete header (%u bytes total). Verifying...", bytes_processed_);
+                    // Verify using the initial part of the buffer
+                    esp_err = VerifyHeaderInternal(buffer_.data(), header_size_);
+                    app_err = MapEspError(esp_err);
+                    if (app_err != APP_UPDATE_SUCCESS) {
+                        ESP_LOGE(TAG, "Header verification failed: %s", esp_err_to_name(esp_err));
+                        AbortImpl();
+                        SetState(APP_UPDATE_STATE_ERROR, app_err);
+                        return app_err;
+                    }
+                    ESP_LOGI(TAG, "Header verified successfully.");
+                    // Remove only the header portion from the buffer, keep excess data
+                    if(buffer_.size() > header_size_) {
+                        buffer_.erase(buffer_.begin(), buffer_.begin() + header_size_);
+                    } else {
+                         buffer_.clear();
+                    }
+                    SetState(APP_UPDATE_STATE_WRITING_BLOCKS);
+                } else {
+                    // Header not yet complete, buffer filled, need more data in next Write()
+                    return APP_UPDATE_SUCCESS;
+                }
+            } // End header handling
+
+            // --- 2. Handle Block Writing ---
+             if (state_ == APP_UPDATE_STATE_WRITING_BLOCKS && remaining_size > 0) {
+                // Check total size limit
+                if (total_image_size_ > 0 &&
+                    (bytes_written_to_flash_ + buffer_.size() + remaining_size) > total_image_size_) {
+                    ESP_LOGE(TAG, "Error: Exceeding total image size (%u bytes). Aborting.", total_image_size_);
+                    AbortImpl();
+                    SetState(APP_UPDATE_STATE_ERROR, APP_UPDATE_ERR_VERIFICATION_FAILED);
+                    return last_error_code_;
+                }
+
+                size_t space_in_buffer = storage_block_size_ - buffer_.size();
+                size_t to_copy = std::min(remaining_size, space_in_buffer);
+
+                 if (buffer_.size() + to_copy > storage_block_size_) {
+                     ESP_LOGE(TAG, "Internal buffer error during block writing.");
+                     AbortImpl();
+                     SetState(APP_UPDATE_STATE_ERROR, APP_UPDATE_ERR_BUFFER_ERROR);
+                     return last_error_code_;
+                 }
+                buffer_.insert(buffer_.end(), data_ptr, data_ptr + to_copy);
+
+                bytes_processed_ += to_copy; // Increment total processed
+                data_ptr += to_copy;
+                remaining_size -= to_copy;
+
+                if (buffer_.size() == storage_block_size_) {
+                    app_err = WriteFlashInternal();
+                    if (app_err != APP_UPDATE_SUCCESS) {
+                        return app_err; // Error handled within WriteFlashInternal
+                    }
+                }
+            } // End block writing
+        } // end while(remaining_size > 0)
+
+        return app_err;
+    }
+
+    ApplicationUpdateError EndImpl() {
+        if (state_ != APP_UPDATE_STATE_WRITING_BLOCKS) {
+            if (state_ == APP_UPDATE_STATE_VERIFYING_HEADER && bytes_processed_ >= header_size_) {
+                ESP_LOGI(TAG, "EndImpl called after header verification, assuming no payload data.");
+            } else {
+                ESP_LOGE(TAG, "EndImpl called in invalid state: %d", state_);
+                return APP_UPDATE_ERR_INVALID_STATE;
+            }
+        }
+
+        ApplicationUpdateError app_err = APP_UPDATE_SUCCESS;
+        esp_err_t esp_err = ESP_OK;
+
+        // Write remaining data
+        if (!buffer_.empty()) {
+            ESP_LOGI(TAG, "Writing final %u bytes from buffer.", buffer_.size());
+            app_err = WriteFlashInternal(true);
+            if (app_err != APP_UPDATE_SUCCESS) {
+                return app_err;
+            }
+        }
+
+        // Verification
+        SetState(APP_UPDATE_STATE_VERIFYING_IMAGE);
+        esp_err = VerifyImageInternal();
+        app_err = MapEspError(esp_err);
+        if (app_err != APP_UPDATE_SUCCESS) {
+            ESP_LOGE(TAG, "Internal image verification failed: %s", esp_err_to_name(esp_err));
+            AbortImpl();
+            SetState(APP_UPDATE_STATE_ERROR, app_err);
+            return app_err;
+        }
+        ESP_LOGI(TAG, "Internal image verification successful (or skipped).");
+
+        // Commit
+        if (update_handle_ == 0) {
+             ESP_LOGE(TAG, "Cannot call esp_ota_end, handle is invalid.");
+             SetState(APP_UPDATE_STATE_ERROR, APP_UPDATE_ERR_INVALID_STATE);
+             return last_error_code_;
+        }
+        esp_err = esp_ota_end(update_handle_);
+        update_handle_ = 0;
+        app_err = MapEspError(esp_err);
+        if (app_err != APP_UPDATE_SUCCESS) {
+            ESP_LOGE(TAG, "esp_ota_end failed: %s", esp_err_to_name(esp_err));
+            update_partition_ = nullptr; // Pointer may no longer be valid
+            // Don't clear target_partition_info_ here, keep for diagnostics
+            SetState(APP_UPDATE_STATE_ERROR, app_err);
+            return app_err;
+        }
+
+        // Set Boot
+        if (update_partition_ == nullptr) {
+            ESP_LOGE(TAG, "Cannot set boot partition, partition pointer is invalid.");
+             SetState(APP_UPDATE_STATE_ERROR, APP_UPDATE_ERR_INVALID_STATE);
+             return last_error_code_;
+        }
+        esp_err = esp_ota_set_boot_partition(update_partition_);
+        app_err = MapEspError(esp_err);
+        if (app_err != APP_UPDATE_SUCCESS) {
+            ESP_LOGE(TAG, "esp_ota_set_boot_partition failed: %s", esp_err_to_name(esp_err));
+            // Don't clear target_partition_info_ here, keep for diagnostics
+            update_partition_ = nullptr;
+            SetState(APP_UPDATE_STATE_ERROR, app_err);
+            return app_err;
+        }
+
+        ESP_LOGI(TAG, "Update successful! Partition %s set as boot partition.", target_partition_info_.c_str());
+        SetState(APP_UPDATE_STATE_FINISHED);
+        update_partition_ = nullptr; // Operation complete, pointer no longer needed
+        return APP_UPDATE_SUCCESS;
+    }
+
+
+    ApplicationUpdateError AbortImpl() {
+         if (state_ == APP_UPDATE_STATE_INITIAL || state_ == APP_UPDATE_STATE_FINISHED) {
+             ESP_LOGW(TAG, "AbortImpl called in state %d, no active update to abort.", state_);
+             return APP_UPDATE_SUCCESS;
+         }
+        if ((state_ == APP_UPDATE_STATE_ABORTED || state_ == APP_UPDATE_STATE_ERROR) && update_handle_ == 0) {
+             ESP_LOGW(TAG, "AbortImpl called in state %d with invalid handle, assuming already cleaned up.", state_);
+              if(state_ == APP_UPDATE_STATE_ABORTED) return APP_UPDATE_ERR_ABORTED;
+              return last_error_code_;
+        }
+
+        ESP_LOGW(TAG, "Aborting update process. Current state: %d", state_);
+        esp_err_t esp_err = ESP_OK;
+        ApplicationUpdateError app_err = APP_UPDATE_SUCCESS;
+
+        if (update_handle_ != 0) {
+            esp_err = esp_ota_abort(update_handle_);
+            app_err = MapEspError(esp_err);
+            if (app_err != APP_UPDATE_SUCCESS) {
+                ESP_LOGE(TAG, "esp_ota_abort failed: %s. Continuing cleanup.", esp_err_to_name(esp_err));
+            } else {
+                 ESP_LOGI(TAG,"esp_ota_abort successful.");
+            }
+            update_handle_ = 0;
+        } else {
+             ESP_LOGW(TAG,"AbortImpl called but update handle was already invalid.");
+        }
+
+        // Reset volatile state, keep diagnostic info like target_partition_info_
+        buffer_.clear();
+        update_partition_ = nullptr; // Pointer no longer valid
+        bytes_processed_ = 0;
+        bytes_written_to_flash_ = 0;
+        total_image_size_ = 0; // Reset expected size as well? Maybe keep if needed. Let's reset.
+
+        ApplicationUpdateError final_error_code = APP_UPDATE_ERR_ABORTED;
+        if (app_err != APP_UPDATE_SUCCESS) {
+             final_error_code = app_err;
+        }
+        SetState(APP_UPDATE_STATE_ABORTED, final_error_code);
+
+        return app_err; // Return the result of esp_ota_abort call
+    }
+
+    // --- Getters for Diagnostics ---
+    ApplicationUpdateState GetStateImpl() const { return state_; }
+    ApplicationUpdateError GetLastErrorCodeImpl() const { return last_error_code_; }
+    size_t GetBytesWrittenImpl() const { return bytes_written_to_flash_; }
+    size_t GetBytesProcessedImpl() const { return bytes_processed_; }
+    size_t GetExpectedImageSizeImpl() const { return total_image_size_; }
+    size_t GetCurrentBufferSizeImpl() const { return buffer_.size(); }
+    std::string GetTargetPartitionInfoImpl() const { return target_partition_info_; }
+
+    // Static-like diagnostic, doesn't depend on Impl state
+    std::string GetRunningPartitionInfoImpl() const {
+        const esp_partition_t* running = esp_ota_get_running_partition();
+        if (!running) {
+             ESP_LOGE(TAG, "Failed to get running partition information.");
+             return "";
+        }
+        return FormatPartitionInfo(running);
+    }
+
+
+private:
+    // --- Private Helper Methods ---
+
+    // SetState Implementation (mostly unchanged)
+    void SetState(ApplicationUpdateState new_state, ApplicationUpdateError error_code = APP_UPDATE_SUCCESS) {
+        if (state_ != new_state) {
+            ESP_LOGD(TAG, "State transition: %d -> %d", state_, new_state);
+        }
+        state_ = new_state;
+        last_error_code_ = error_code;
+
+        if (error_code != APP_UPDATE_SUCCESS &&
+            error_code != APP_UPDATE_ERR_ABORTED &&
+            new_state != APP_UPDATE_STATE_FINISHED &&
+            new_state != APP_UPDATE_STATE_ABORTED)
+        {
+            if (state_ != APP_UPDATE_STATE_ERROR) {
+                 ESP_LOGD(TAG, "Error occurred (%d), forcing state to ERROR", error_code);
+                 state_ = APP_UPDATE_STATE_ERROR;
+            }
+        }
+        else if (new_state == APP_UPDATE_STATE_ABORTED && error_code == APP_UPDATE_SUCCESS) {
+             last_error_code_ = APP_UPDATE_ERR_ABORTED;
+        }
+         else if (error_code == APP_UPDATE_SUCCESS &&
+                  new_state != APP_UPDATE_STATE_ERROR &&
+                  new_state != APP_UPDATE_STATE_ABORTED &&
+                  new_state != APP_UPDATE_STATE_FINISHED) {
+            last_error_code_ = APP_UPDATE_SUCCESS;
+         }
+    }
+
+
+    // WriteFlashInternal Implementation (mostly unchanged)
+    ApplicationUpdateError WriteFlashInternal(bool force_write = false) {
+        if (update_handle_ == 0 || update_partition_ == nullptr) {
+            ESP_LOGE(TAG, "Internal error: WriteFlashInternal without valid handle/partition.");
+            return APP_UPDATE_ERR_INVALID_STATE;
+        }
+        if (buffer_.empty() || (!force_write && buffer_.size() < storage_block_size_)) {
+             return APP_UPDATE_SUCCESS;
+        }
+
+        size_t write_size = buffer_.size();
+        ESP_LOGD(TAG, "Writing %u bytes to flash partition %s at offset 0x%X",
+                 write_size, target_partition_info_.c_str(), bytes_written_to_flash_); // Use stored info
+
+        esp_err_t esp_err = esp_ota_write(update_handle_, buffer_.data(), write_size);
+        if (esp_err != ESP_OK) {
+            ESP_LOGE(TAG, "esp_ota_write failed: %s", esp_err_to_name(esp_err));
+            return MapEspError(esp_err); // Return error, caller handles Abort/SetState
+        }
+
+        bytes_written_to_flash_ += write_size;
+        buffer_.clear();
+        return APP_UPDATE_SUCCESS;
+    }
+
+    // --- Placeholder Verification Methods (Unchanged - Customize these!) ---
+    esp_err_t VerifyHeaderInternal(const uint8_t* header_data, size_t size) {
+         ESP_LOGI(TAG, "Verifying header (Placeholder - Implement actual checks!)");
+         if (size != header_size_ || header_data == nullptr) {
+             ESP_LOGE(TAG, "Header size/data invalid (Expected %u, Got %u, Data %p)",
+                      header_size_, size, header_data);
+             return ESP_ERR_INVALID_ARG;
+         }
+         // Example: Extract expected size from header if not provided in Begin()
+         // if (total_image_size_ == 0) {
+         //    // Assuming size is uint32_t at offset 8
+         //    if(header_size_ >= 12) {
+         //        total_image_size_ = *reinterpret_cast<const uint32_t*>(header_data + 8);
+         //        ESP_LOGI(TAG,"Extracted total_image_size_ from header: %u", total_image_size_);
+         //    }
+         // }
+         return ESP_OK;
+    }
+
+    esp_err_t VerifyImageInternal() {
+        ESP_LOGI(TAG, "Verifying final image (Placeholder - Implement actual checks!)");
+        if (total_image_size_ > 0 && bytes_written_to_flash_ != total_image_size_) {
+             ESP_LOGE(TAG, "Final image size mismatch (Expected: %u, Written: %u)",
+                      total_image_size_, bytes_written_to_flash_);
+             return ESP_ERR_OTA_VALIDATE_FAILED;
+        }
+        ESP_LOGI(TAG, "Total bytes written (%u) matches expected size (%s).",
+                 bytes_written_to_flash_, total_image_size_ > 0 ? std::to_string(total_image_size_).c_str() : "not provided");
+        return ESP_OK;
+    }
+
+    // --- Member Variables ---
+    ApplicationUpdateState state_;
+    ApplicationUpdateError last_error_code_;
+    size_t header_size_;
+    size_t storage_block_size_;
+    size_t total_image_size_;
+    size_t bytes_processed_;
+    size_t bytes_written_to_flash_;
+    std::vector<uint8_t> buffer_;
+    std::string target_partition_info_; // Store formatted info for diagnostics
+
+    // ESP-IDF specific members (transient pointers/handles)
+    const esp_partition_t* update_partition_; // Pointer valid only during operation
+    esp_ota_handle_t update_handle_;
+};
+
+
+// --- ApplicationUpdater Public Method Implementations ---
+
+ApplicationUpdater::ApplicationUpdater(size_t header_size, size_t storage_block_size)
+    : impl_(std::make_unique<ApplicationUpdaterImpl>(header_size, storage_block_size)) {}
+
+ApplicationUpdater::~ApplicationUpdater() = default;
+ApplicationUpdater::ApplicationUpdater(ApplicationUpdater&&) noexcept = default;
+ApplicationUpdater& ApplicationUpdater::operator=(ApplicationUpdater&&) noexcept = default;
+
+ApplicationUpdateError ApplicationUpdater::Begin(size_t total_image_size) {
+    if (!impl_) return APP_UPDATE_ERR_INVALID_STATE;
+    return impl_->BeginImpl(total_image_size);
+}
+
+ApplicationUpdateError ApplicationUpdater::Write(const uint8_t* data, size_t size) {
+     if (!impl_) return APP_UPDATE_ERR_INVALID_STATE;
+    return impl_->WriteImpl(data, size);
+}
+
+ApplicationUpdateError ApplicationUpdater::End() {
+     if (!impl_) return APP_UPDATE_ERR_INVALID_STATE;
+    return impl_->EndImpl();
+}
+
+ApplicationUpdateError ApplicationUpdater::Abort() {
+     if (!impl_) return APP_UPDATE_ERR_INVALID_STATE;
+    return impl_->AbortImpl();
+}
+
+ApplicationUpdateState ApplicationUpdater::GetState() const {
+    return impl_ ? impl_->GetStateImpl() : APP_UPDATE_STATE_ERROR;
+}
+
+ApplicationUpdateError ApplicationUpdater::GetLastErrorCode() const {
+     return impl_ ? impl_->GetLastErrorCodeImpl() : APP_UPDATE_ERR_FAILURE;
+}
+
+// --- Diagnostics ---
+size_t ApplicationUpdater::GetBytesWritten() const {
+    return impl_ ? impl_->GetBytesWrittenImpl() : 0;
+}
+
+size_t ApplicationUpdater::GetBytesProcessed() const {
+    return impl_ ? impl_->GetBytesProcessedImpl() : 0;
+}
+
+size_t ApplicationUpdater::GetExpectedImageSize() const {
+    return impl_ ? impl_->GetExpectedImageSizeImpl() : 0;
+}
+
+size_t ApplicationUpdater::GetCurrentBufferSize() const {
+    return impl_ ? impl_->GetCurrentBufferSizeImpl() : 0;
+}
+
+std::string ApplicationUpdater::GetTargetPartitionInfo() const {
+    return impl_ ? impl_->GetTargetPartitionInfoImpl() : "";
+}
+
+std::string ApplicationUpdater::GetRunningPartitionInfo() const {
+    // This doesn't strictly need the impl instance state, but call it via impl
+    // for consistency and potential future enhancements.
+    return impl_ ? impl_->GetRunningPartitionInfoImpl() : "";
+}
+
+
+// ========================================================================= //
+//                              Example Usage (Updated)                      //
+// ========================================================================= //
+
+/*
+#include "application_updater.h"
+#include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "esp_system.h"
+
+static const char* TAG_APP = "App";
+
+// Assume: extern bool get_firmware_chunk(uint8_t* buffer, size_t buffer_size, size_t* bytes_read);
+
+void perform_ota_update_task(void* pvParameter) {
+    const size_t kAppHeaderSize = 64;
+    ApplicationUpdater updater(kAppHeaderSize, 4096);
+    ApplicationUpdateError err_code;
+
+    // Log current running partition before starting
+    ESP_LOGI(TAG_APP, "Currently running from: %s", updater.GetRunningPartitionInfo().c_str());
+
+    size_t total_size = 20 * 1024; // Example size
+
+    ESP_LOGI(TAG_APP, "Starting application update task (Target size: %u bytes)...", total_size);
+
+    err_code = updater.Begin(total_size);
+    if (err_code != APP_UPDATE_SUCCESS) {
+        ESP_LOGE(TAG_APP, "Failed to begin update: Error %d", err_code);
+        vTaskDelete(NULL);
+        return;
+    }
+
+    // Log target partition after successful Begin
+    ESP_LOGI(TAG_APP, "Update target: %s", updater.GetTargetPartitionInfo().c_str());
+
+
+    uint8_t data_buffer[1024];
+    size_t bytes_read = 0;
+    bool more_data = true;
+    size_t total_bytes_sent = 0;
+    int log_counter = 0;
+
+    while (more_data && updater.GetState() < APP_UPDATE_STATE_FINISHED) {
+        // --- Dummy Data Fetch ---
+        size_t remaining_to_send = (total_size > total_bytes_sent) ? (total_size - total_bytes_sent) : 0;
+        if (remaining_to_send == 0) {
+             more_data = false;
+             bytes_read = 0;
+        } else {
+             bytes_read = std::min(sizeof(data_buffer), remaining_to_send);
+             for(size_t i = 0; i < bytes_read; ++i) data_buffer[i] = (uint8_t)((total_bytes_sent + i) % 256);
+             if (total_bytes_sent == 0 && kAppHeaderSize > 0) { // Inject dummy header
+                 memset(data_buffer, 0, std::min(bytes_read, kAppHeaderSize));
+             }
+        }
+        // --- End Dummy Data ---
+
+        if (bytes_read > 0) {
+            err_code = updater.Write(data_buffer, bytes_read);
+            if (err_code != APP_UPDATE_SUCCESS) {
+                ESP_LOGE(TAG_APP, "Write failed: Error %d (State: %d)", err_code, updater.GetState());
+                break;
+            }
+             total_bytes_sent += bytes_read;
+
+             // Log progress periodically using diagnostics
+             if (++log_counter % 10 == 0 || !more_data) { // Log every 10 chunks or on last
+                 ESP_LOGI(TAG_APP, "Progress: Processed %u/%u, Written %u, Buffer %u",
+                          updater.GetBytesProcessed(),
+                          updater.GetExpectedImageSize(),
+                          updater.GetBytesWritten(),
+                          updater.GetCurrentBufferSize());
+             }
+
+        } else if (!more_data) {
+             ESP_LOGI(TAG_APP,"End of data stream detected.");
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(10)); // Small delay to allow logging/yielding
+    }
+
+    // Finalization logic (same as before)
+    ApplicationUpdateState final_state = updater.GetState();
+    if (final_state == APP_UPDATE_STATE_WRITING_BLOCKS || final_state == APP_UPDATE_STATE_VERIFYING_HEADER) {
+        ESP_LOGI(TAG_APP, "End of data stream. Finalizing update...");
+        // Log final stats before End()
+         ESP_LOGI(TAG_APP, "Final Stats: Processed %u, Written %u, Buffer %u",
+                  updater.GetBytesProcessed(), updater.GetBytesWritten(), updater.GetCurrentBufferSize());
+        err_code = updater.End();
+        if (err_code != APP_UPDATE_SUCCESS) {
+            ESP_LOGE(TAG_APP, "Finalize failed: Error %d (State: %d)", err_code, updater.GetState());
+            ESP_LOGE(TAG_APP, "Target was: %s", updater.GetTargetPartitionInfo().c_str()); // Log target info on failure
+        } else {
+            ESP_LOGI(TAG_APP, "Update successful! Target: %s. Rebooting...", updater.GetTargetPartitionInfo().c_str());
+            vTaskDelay(pdMS_TO_TICKS(5000));
+            esp_restart();
+        }
+    } else {
+         ESP_LOGE(TAG_APP, "Update did not finish normally. State: %d, Error: %d", final_state, updater.GetLastErrorCode());
+         ESP_LOGE(TAG_APP, "Target was: %s", updater.GetTargetPartitionInfo().c_str());
+    }
+
+    ESP_LOGI(TAG_APP, "Update task finishing.");
+    vTaskDelete(NULL);
+}
+*/
