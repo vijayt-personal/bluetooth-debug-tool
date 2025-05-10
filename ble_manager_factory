@@ -1,0 +1,510 @@
+// platform/ble_manager.h
+#ifndef PLATFORM_BLE_MANAGER_H_
+#define PLATFORM_BLE_MANAGER_H_
+
+#include <functional>
+#include <map>
+#include <memory>  // For std::shared_ptr
+#include <string>
+#include <tuple>    // For std::tuple
+#include <vector>
+#include <cstddef>  // For size_t
+#include <cstdint>  // For uint16_t
+
+namespace platform {
+namespace connectivity {
+
+/**
+ * @brief Abstract interface for managing Bluetooth Low Energy (BLE) server
+ * functionalities.
+ *
+ * This class defines a standard interface for initializing BLE, managing
+ * services and characteristics, handling connections, and controlling
+ * advertising. Concrete implementations will provide platform-specific
+ * BLE stack interactions.
+ */
+class BLEManager {
+ public:
+  /**
+   * @brief Defines the possible states of the BLE connection.
+   */
+  enum class BLEState {
+    IDLE,        /**< BLE is idle, not advertising or connected. */
+    ADVERTISING, /**< BLE is currently advertising. */
+    CONNECTED,   /**< BLE is connected to a central device. */
+    DISCONNECTED /**< BLE was connected and is now disconnected. */
+  };
+
+  /**
+   * @brief Defines the properties of a BLE characteristic.
+   * These values are typically bitmasks and might be combined in some BLE stacks.
+   */
+  enum class CharProperty {
+    READ = 0x02,   /**< Characteristic supports read operations. */
+    WRITE = 0x08,  /**< Characteristic supports write operations. */
+    NOTIFY = 0x10  /**< Characteristic supports notifications (unacknowledged). */
+    // INDICATE = 0x20, // Example: Could be added for acknowledged indications
+  };
+
+  /**
+   * @brief Callback function type for characteristic events.
+   * @param data Pointer to the data buffer associated with the event (e.g.,
+   * written data).
+   * @param size Size of the data in bytes.
+   */
+  using CharCallback = std::function<void(const void* data, size_t size)>;
+
+  /**
+   * @brief Virtual destructor.
+   * Ensures proper cleanup of resources in derived concrete classes.
+   */
+  virtual ~BLEManager() = default;
+
+  /**
+   * @brief Initializes the BLE stack and manager.
+   * This should be called before any other BLE operations.
+   * @param device_name The name under which the BLE device will advertise.
+   */
+  virtual void Init(const std::string& device_name) = 0;
+
+  /**
+   * @brief Registers a BLE service along with its characteristics.
+   * @param service_uuid The UUID string for the service to be registered.
+   * @param characteristics A vector of tuples, where each tuple defines a
+   * characteristic:
+   * - std::string: Characteristic UUID string.
+   * - CharProperty: Property of the characteristic (e.g., READ, WRITE).
+   * - CharCallback: Callback function for characteristic events (e.g.,
+   * onWrite).
+   */
+  virtual void RegisterService(
+      const std::string& service_uuid,
+      const std::vector<
+          std::tuple<std::string, CharProperty, CharCallback>>& characteristics) = 0;
+
+  /**
+   * @brief Sets the value of a specified characteristic.
+   * Optionally notifies subscribed clients if the characteristic supports
+   * notifications.
+   * @param char_uuid The UUID string of the characteristic whose value is to be
+   * set.
+   * @param value Pointer to the data buffer containing the value.
+   * @param size Size of the data buffer in bytes.
+   * @param notify If true and the characteristic has the NOTIFY property,
+   * a notification will be sent to subscribed clients. Defaults to
+   * false.
+   */
+  virtual void SetCharacteristicValue(const std::string& char_uuid,
+                                      const void* value,
+                                      size_t size,
+                                      bool notify = false) = 0;
+
+  /**
+   * @brief Disconnects any currently active BLE connection.
+   * If connected to a central device, this function initiates a disconnect.
+   */
+  virtual void Disconnect() = 0;
+
+  /**
+   * @brief Sets a callback function to be invoked upon a successful BLE
+   * connection.
+   * @param callback The function to call when a device connects.
+   */
+  virtual void SetConnectionCallback(std::function<void()> callback) = 0;
+
+  /**
+   * @brief Sets a callback function to be invoked when a BLE connection is
+   * terminated.
+   * @param callback The function to call when a device disconnects.
+   */
+  virtual void SetDisconnectionCallback(std::function<void()> callback) = 0;
+
+  /**
+   * @brief Starts BLE advertising.
+   * Makes the device discoverable and potentially connectable.
+   * @param connectable_enable If true, the advertising will be connectable.
+   * Defaults to true.
+   * @param adv_interval Advertising interval in units of 0.625 ms.
+   * (e.g., 160 = 100ms). Defaults to 160.
+   */
+  virtual void StartAdvertising(bool connectable_enable = true,
+                                uint16_t adv_interval = 160) = 0;
+
+  /**
+   * @brief Stops BLE advertising.
+   * Makes the device no longer discoverable.
+   */
+  virtual void StopAdvertising() = 0;
+
+  /**
+   * @brief Adds a service UUID to the advertising packet.
+   * This allows central devices to discover the device based on the services it
+   * offers.
+   * @param uuid The UUID string of the service to add to advertising data.
+   */
+  virtual void AddServiceUUID(const char* uuid) = 0;
+
+  /**
+   * @brief Retrieves the current state of the BLE manager.
+   * @return The current BLEState (e.g., IDLE, ADVERTISING, CONNECTED).
+   */
+  virtual BLEState GetState() = 0;
+
+ protected:
+  /**
+   * @brief Protected default constructor.
+   * Prevents direct instantiation of the interface. Concrete classes should be
+   * obtained via the factory function.
+   */
+  BLEManager() = default;
+
+ private:
+  // Disallow copy and move semantics for the interface to prevent slicing
+  // and ensure it's used polymorphically via pointers/references.
+  BLEManager(const BLEManager&) = delete;
+  BLEManager& operator=(const BLEManager&) = delete;
+  BLEManager(BLEManager&&) = delete;
+  BLEManager& operator=(BLEManager&&) = delete;
+};
+
+/**
+ * @brief Factory function to create or retrieve a BLEManager instance.
+ *
+ * This function provides access to a platform-specific implementation
+ * of the BLEManager interface. The returned instance might be a singleton
+ * or a new instance depending on the underlying platform's implementation
+ * and BLE stack behavior.
+ *
+ * @return A std::shared_ptr to an initialized BLEManager interface.
+ * Returns nullptr if an instance cannot be created.
+ */
+std::shared_ptr<BLEManager> CreateBLEManager();
+
+}  // namespace connectivity
+}  // namespace platform
+
+#endif  // PLATFORM_BLE_MANAGER_H_
+
+----------------------------------------------------------------------------------------------------------------------
+
+// platform/esp32_nimble_ble_manager.cc
+#include "platform/ble_manager.h" // For BLEManager interface and CreateBLEManager() declaration
+
+#include <memory>  // For std::make_shared, std::unique_ptr
+#include <string>
+#include <vector>
+// Specific includes for the NimBLE stack on ESP32
+#include "NimBLEDevice.h"  // NOLINT(build/include_subdir): Assuming NimBLE.h path.
+
+namespace platform {
+namespace connectivity {
+
+namespace {  // Anonymous namespace for implementation details.
+
+// Forward declaration for mutual dependency if ConnectionCallbacks/CharacteristicCallbacks
+// need to call methods on Esp32NimBLEManager not exposed by BLEManager interface.
+// In this case, they primarily modify member variables for which Esp32NimBLEManager
+// is friended.
+class Esp32NimBLEManager;
+
+class ConnectionCallbacksImpl : public NimBLEServerCallbacks {
+ public:
+  explicit ConnectionCallbacksImpl(Esp32NimBLEManager* manager)
+      : ble_manager_instance_(manager) {}
+
+  void onConnect(NimBLEServer* p_server, NimBLEConnInfo& conn_info) override;
+  void onDisconnect(NimBLEServer* p_server,
+                    NimBLEConnInfo& conn_info,
+                    int reason) override;
+
+ private:
+  Esp32NimBLEManager* ble_manager_instance_;  // Not owning.
+};
+
+class CharacteristicCallbacksImpl : public NimBLECharacteristicCallbacks {
+ public:
+  explicit CharacteristicCallbacksImpl(Esp32NimBLEManager* manager)
+      : ble_manager_instance_(manager) {}
+
+  void onWrite(NimBLECharacteristic* p_characteristic,
+               NimBLEConnInfo& conn_info) override;
+
+ private:
+  Esp32NimBLEManager* ble_manager_instance_;  // Not owning.
+};
+
+// Concrete BLEManager Implementation for ESP32 with NimBLE.
+class Esp32NimBLEManager : public BLEManager {
+ public:
+  Esp32NimBLEManager();
+  ~Esp32NimBLEManager() override;
+
+  // Delete copy and move constructors and assignment operators.
+  Esp32NimBLEManager(const Esp32NimBLEManager&) = delete;
+  Esp32NimBLEManager& operator=(const Esp32NimBLEManager&) = delete;
+  Esp32NimBLEManager(Esp32NimBLEManager&&) = delete;
+  Esp32NimBLEManager& operator=(Esp32NimBLEManager&&) = delete;
+
+  void Init(const std::string& device_name) override;
+  void RegisterService(
+      const std::string& service_uuid,
+      const std::vector<
+          std::tuple<std::string, CharProperty, CharCallback>>& characteristics)
+      override;
+  void SetCharacteristicValue(const std::string& char_uuid,
+                              const void* value,
+                              size_t size,
+                              bool notify = false) override;
+  void Disconnect() override;
+  void SetConnectionCallback(std::function<void()> callback) override;
+  void SetDisconnectionCallback(std::function<void()> callback) override;
+  void StartAdvertising(bool connectable_enable = true,
+                        uint16_t adv_interval = 160) override;
+  void StopAdvertising() override;
+  void AddServiceUUID(const char* uuid) override;
+  BLEState GetState() override;
+
+ private:
+  // Allow callback handlers to modify private state of this manager.
+  friend class ConnectionCallbacksImpl;
+  friend class CharacteristicCallbacksImpl;
+
+  struct CharacteristicInfo {
+    CharProperty property;
+    CharCallback callback;
+    NimBLECharacteristic* characteristic_handle_; // Specific NimBLE handle
+  };
+
+  std::map<std::string, std::map<std::string, CharacteristicInfo>>
+      service_char_table_;
+  NimBLEAdvertising* advertising_handle_ = nullptr;
+  NimBLEServer* server_handle_ = nullptr;
+  BLEState current_state_ = BLEState::IDLE;
+  std::function<void()> on_connect_callback_;
+  std::function<void()> on_disconnect_callback_;
+  bool initialized_ = false;
+
+  std::unique_ptr<ConnectionCallbacksImpl> connection_callbacks_handler_;
+  std::unique_ptr<CharacteristicCallbacksImpl>
+      characteristic_callbacks_handler_;
+};
+
+// --- Implementation of Helper Callback Classes ---
+void ConnectionCallbacksImpl::onConnect(NimBLEServer* p_server,
+                                       NimBLEConnInfo& conn_info) {
+  if (ble_manager_instance_) {
+    ble_manager_instance_->current_state_ = BLEManager::BLEState::CONNECTED;
+    if (ble_manager_instance_->on_connect_callback_) {
+      ble_manager_instance_->on_connect_callback_();
+    }
+  }
+}
+
+void ConnectionCallbacksImpl::onDisconnect(NimBLEServer* p_server,
+                                          NimBLEConnInfo& conn_info,
+                                          int reason) {
+  if (ble_manager_instance_) {
+    ble_manager_instance_->current_state_ = BLEManager::BLEState::DISCONNECTED;
+    if (ble_manager_instance_->on_disconnect_callback_) {
+      ble_manager_instance_->on_disconnect_callback_();
+    }
+  }
+}
+
+void CharacteristicCallbacksImpl::onWrite(
+    NimBLECharacteristic* p_characteristic, NimBLEConnInfo& conn_info) {
+  if (!ble_manager_instance_) {
+    return;
+  }
+  for (auto& service_pair : ble_manager_instance_->service_char_table_) {
+    for (auto& char_pair : service_pair.second) {
+      if (char_pair.second.characteristic_handle_ == p_characteristic) {
+        const std::string& value_str = p_characteristic->getValue();
+        if (char_pair.second.callback) {
+          char_pair.second.callback(value_str.data(), value_str.size());
+        }
+        return;
+      }
+    }
+  }
+}
+
+// --- Esp32NimBLEManager Method Implementations ---
+Esp32NimBLEManager::Esp32NimBLEManager() {
+  connection_callbacks_handler_ =
+      std::make_unique<ConnectionCallbacksImpl>(this);
+  characteristic_callbacks_handler_ =
+      std::make_unique<CharacteristicCallbacksImpl>(this);
+}
+
+Esp32NimBLEManager::~Esp32NimBLEManager() {
+  // NimBLEDevice::deinit(); // Consider if deinit is needed.
+  // If this singleton is torn down, deinit might be appropriate.
+}
+
+void Esp32NimBLEManager::Init(const std::string& device_name) {
+  if (!initialized_) {
+    NimBLEDevice::init(device_name);
+    NimBLEDevice::setMTU(512);  // Example, consider making this configurable.
+    // NimBLEDevice::setPowerLevel(ESP_PWR_LVL_P9); // ESP-specific, if needed.
+
+    server_handle_ = NimBLEDevice::createServer();
+    if (server_handle_ && connection_callbacks_handler_) {
+      server_handle_->setCallbacks(connection_callbacks_handler_.get());
+    }
+
+    advertising_handle_ = NimBLEDevice::getAdvertising();
+    if (advertising_handle_) {
+      advertising_handle_->setScanResponse(true);
+      advertising_handle_->setName(device_name);
+    }
+
+    initialized_ = true;
+    current_state_ = BLEState::IDLE;
+  }
+}
+
+void Esp32NimBLEManager::RegisterService(
+    const std::string& service_uuid,
+    const std::vector<std::tuple<std::string, CharProperty, CharCallback>>&
+        characteristics) {
+  if (!server_handle_ || !initialized_ ||
+      !characteristic_callbacks_handler_) {
+    return;
+  }
+
+  NimBLEService* service = server_handle_->createService(service_uuid);
+  if (!service) {
+    // Consider logging an error or returning a status.
+    return;
+  }
+
+  for (const auto& characteristic_definition : characteristics) {
+    const std::string& characteristic_uuid_str =
+        std::get(characteristic_definition);
+    CharProperty property = std::get(characteristic_definition);
+    CharCallback callback = std::get(characteristic_definition);
+
+    uint32_t nimble_properties = 0;
+    // Assuming CharProperty enum values can be bitwise-ANDed if they were designed as bitflags.
+    // If they are discrete, this logic might need adjustment for combined properties.
+    if ((static_cast<int>(property) & static_cast<int>(CharProperty::READ)) != 0) {
+      nimble_properties |= NIMBLE_PROPERTY::READ;
+    }
+    if ((static_cast<int>(property) & static_cast<int>(CharProperty::WRITE)) != 0) {
+      nimble_properties |= NIMBLE_PROPERTY::WRITE;
+    }
+    if ((static_cast<int>(property) & static_cast<int>(CharProperty::NOTIFY)) != 0) {
+      nimble_properties |= NIMBLE_PROPERTY::NOTIFY;
+    }
+
+    NimBLECharacteristic* characteristic =
+        service->createCharacteristic(characteristic_uuid_str, nimble_properties);
+    if (characteristic) {
+      characteristic->setCallbacks(characteristic_callbacks_handler_.get());
+      service_char_table_[service_uuid][characteristic_uuid_str] = {
+          property, callback, characteristic};
+    } else {
+      // Consider logging an error.
+    }
+  }
+  service->start();
+}
+
+void Esp32NimBLEManager::SetCharacteristicValue(
+    const std::string& char_uuid, const void* value, size_t size, bool notify) {
+  if (!initialized_) {
+    return;
+  }
+  for (auto const& [service_id, chars_map] : service_char_table_) {
+    auto it = chars_map.find(char_uuid);
+    if (it != chars_map.end()) {
+      NimBLECharacteristic* characteristic_handle =
+          it->second.characteristic_handle_;
+      if (characteristic_handle) {
+        characteristic_handle->setValue(static_cast<const uint8_t*>(value),
+                                        size);
+        bool can_notify = (static_cast<int>(it->second.property) &
+                           static_cast<int>(CharProperty::NOTIFY)) != 0;
+        if (notify && can_notify &&
+            characteristic_handle->getSubscribedCount() > 0) {
+          characteristic_handle->notify();
+        }
+      }
+      return; // Characteristic found and processed.
+    }
+  }
+  // Characteristic not found, consider logging.
+}
+
+void Esp32NimBLEManager::Disconnect() {
+  if (server_handle_ && initialized_ && current_state_ == BLEState::CONNECTED) {
+    auto connected_peers = server_handle_->getPeerDevices();
+    for (auto& peer : connected_peers) {
+      server_handle_->disconnect(peer.first);
+    }
+    // The onDisconnect callback will handle the state_ update.
+  }
+}
+
+void Esp32NimBLEManager::SetConnectionCallback(
+    std::function<void()> callback) {
+  on_connect_callback_ = std::move(callback);
+}
+
+void Esp32NimBLEManager::SetDisconnectionCallback(
+    std::function<void()> callback) {
+  on_disconnect_callback_ = std::move(callback);
+}
+
+void Esp32NimBLEManager::StartAdvertising(bool connectable_enable,
+                                          uint16_t adv_interval) {
+  if (advertising_handle_ && initialized_) {
+    advertising_handle_->setAdvertisingInterval(adv_interval);
+    advertising_handle_->setConnectable(connectable_enable);
+    // Potentially clear and re-add service UUIDs if they need to be refreshed in the payload.
+    advertising_handle_->start();
+    current_state_ = BLEState::ADVERTISING;
+  }
+}
+
+void Esp32NimBLEManager::StopAdvertising() {
+  if (advertising_handle_ && initialized_) {
+    advertising_handle_->stop();
+    // Only set to IDLE if not connected. If connected, stopping advertising
+    // might not change the CONNECTED state.
+    if (current_state_ != BLEState::CONNECTED) {
+        current_state_ = BLEState::IDLE;
+    }
+  }
+}
+
+void Esp32NimBLEManager::AddServiceUUID(const char* uuid) {
+  if (advertising_handle_ && initialized_ && uuid) {
+    NimBLEUUID service_uuid_to_add(uuid); // Corrected variable name
+    advertising_handle_->addServiceUUID(service_uuid_to_add);
+    // Adding a service UUID usually modifies the advertising payload.
+    // If advertising is active, it might need to be stopped and restarted
+    // for the change to take effect on all platforms/stacks.
+    // The original code set state_ to IDLE here, which is likely incorrect.
+    // Leaving state as is or triggering an advertising restart might be better.
+  }
+}
+
+BLEManager::BLEState Esp32NimBLEManager::GetState() {
+  return current_state_;
+}
+
+}  // anonymous namespace
+
+
+// --- Factory Function Definition ---
+std::shared_ptr<BLEManager> CreateBLEManager() {
+  // This implementation provides a singleton instance for ESP32/NimBLE.
+  static std::shared_ptr<BLEManager> instance =
+      std::make_shared<Esp32NimBLEManager>(); // Uses class from anonymous namespace
+  return instance;
+}
+
+}  // namespace connectivity
+}  // namespace platform
