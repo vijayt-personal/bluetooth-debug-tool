@@ -1,0 +1,767 @@
+// Copyright [2025] [Your Name or Company]
+// (Apache License header as before)
+
+#ifndef APP_UPDATER_H
+#define APP_UPDATER_H
+
+#include <cstdint>  // For uint8_t, size_t
+#include <functional> // For std::function
+#include <map>      // For std::map
+#include <memory>   // For std::unique_ptr
+#include <string>   // For std::string
+#include <cstdio>   // For snprintf, used in StatusToString for unknown status
+
+
+namespace platform {
+
+enum class AppUpdateStatus {
+  kSuccess,
+  kErrorAlreadyInProgress,
+  kErrorNotIdle,
+  kErrorInvalidState,
+  kErrorMetadataInvalid,
+  kErrorPartitionNotFound,
+  kErrorOtaBeginFailed,
+  kErrorWriteFailed,
+  kErrorImageSizeMismatch,
+  kErrorOtaEndFailed,
+  kErrorSetBootPartitionFailed,
+  kErrorRebootFailed,
+  kErrorInvalidArgument,
+  kErrorCancelled,
+  kErrorNotImplemented,
+  kErrorGeneric,
+};
+
+/**
+ * @class AppUpdater
+ * @brief Abstract interface for an Application Updater.
+ */
+class AppUpdater {
+ public:
+  /**
+   * @brief Metadata for an application update.
+   */
+  struct Metadata {
+    size_t image_size = 0;
+    std::string version_string;
+    std::string target_platform_identifier;
+    std::map<std::string, std::string> custom_fields;
+  };
+
+  /**
+   * @brief Operational flow states of the updater.
+   */
+  enum class FlowState {
+    kIdle,
+    kPreparing,
+    kReceivingData,
+    kFinalizing,
+    kReadyToApply,
+    kApplying,
+    kError
+  };
+
+  /**
+   * @brief Structure to hold details about a partition.
+   */
+  struct PartitionDetail {
+    std::string label;        ///< Label or name of the partition.
+    uint32_t type_id = 0;     ///< Platform-specific type identifier.
+    uint32_t subtype_id = 0;  ///< Platform-specific subtype identifier.
+    size_t address = 0;       ///< Starting address of the partition.
+    size_t size = 0;          ///< Size of the partition in bytes.
+    bool is_encrypted = false;///< True if the partition is encrypted.
+    bool is_valid = false;    ///< True if this struct contains valid data.
+  };
+
+
+  virtual ~AppUpdater() = default;
+
+  virtual AppUpdateStatus Begin(const Metadata& metadata) = 0;
+  virtual AppUpdateStatus Write(const uint8_t* data, size_t size) = 0;
+  virtual AppUpdateStatus End() = 0;
+
+  /**
+   * @brief Applies the update (sets boot partition and reboots).
+   * Allows an optional hook for pre-restart cleanup.
+   * @param pre_restart_hook An optional function to call after setting the
+   * boot partition but before restarting the device. This hook can be used
+   * for application-specific cleanup (e.g., disconnecting Wi-Fi, saving state).
+   * @return AppUpdateStatus indicating success or failure.
+   */
+  virtual AppUpdateStatus Apply(
+      std::function<void()> pre_restart_hook = nullptr) = 0;
+
+  virtual FlowState GetState() const = 0;
+  virtual std::string GetLastError() const = 0;
+  virtual size_t GetBytesWritten() const = 0;
+  virtual AppUpdateStatus Cancel() = 0;
+
+  /**
+   * @brief Gets details of the currently running application partition.
+   * @return PartitionDetail structure. If no valid info, is_valid will be false.
+   */
+  virtual PartitionDetail GetRunningPartitionDetail() const = 0;
+
+  /**
+   * @brief Gets details of the partition that is currently set to boot on the
+   * next startup. This may or may not be the same as the running partition.
+   * @return PartitionDetail structure. If no valid info, is_valid will be false.
+   */
+  virtual PartitionDetail GetNextBootPartitionDetail() const = 0;
+
+  static inline const char* StatusToString(AppUpdateStatus status) {
+    static char unknown_buf[30];
+    switch (status) {
+      case AppUpdateStatus::kSuccess: return "SUCCESS";
+      case AppUpdateStatus::kErrorAlreadyInProgress: return "ERROR_ALREADY_IN_PROGRESS";
+      case AppUpdateStatus::kErrorNotIdle: return "ERROR_NOT_IDLE";
+      case AppUpdateStatus::kErrorInvalidState: return "ERROR_INVALID_STATE";
+      case AppUpdateStatus::kErrorMetadataInvalid: return "ERROR_METADATA_INVALID";
+      case AppUpdateStatus::kErrorPartitionNotFound: return "ERROR_PARTITION_NOT_FOUND";
+      case AppUpdateStatus::kErrorOtaBeginFailed: return "ERROR_OTA_BEGIN_FAILED";
+      case AppUpdateStatus::kErrorWriteFailed: return "ERROR_WRITE_FAILED";
+      case AppUpdateStatus::kErrorImageSizeMismatch: return "ERROR_IMAGE_SIZE_MISMATCH";
+      case AppUpdateStatus::kErrorOtaEndFailed: return "ERROR_OTA_END_FAILED";
+      case AppUpdateStatus::kErrorSetBootPartitionFailed: return "ERROR_SET_BOOT_PARTITION_FAILED";
+      case AppUpdateStatus::kErrorRebootFailed: return "ERROR_REBOOT_FAILED";
+      case AppUpdateStatus::kErrorInvalidArgument: return "ERROR_INVALID_ARGUMENT";
+      case AppUpdateStatus::kErrorCancelled: return "ERROR_CANCELLED";
+      case AppUpdateStatus::kErrorNotImplemented: return "ERROR_NOT_IMPLEMENTED";
+      case AppUpdateStatus::kErrorGeneric: return "ERROR_GENERIC";
+      default:
+        snprintf(unknown_buf, sizeof(unknown_buf), "UNKNOWN_STATUS(%d)", static_cast<int>(status));
+        return unknown_buf;
+    }
+  }
+};
+
+std::unique_ptr<AppUpdater> CreateAppUpdater();
+
+}  // namespace platform
+
+#endif  // APP_UPDATER_H
+
+------------------------------------------------------------
+
+// Copyright [2025] [Your Name or Company]
+// (Apache License header as before)
+
+#include "app_updater.h"
+
+#include <algorithm>
+#include <cstring>
+
+#include "esp_app_format.h"
+#include "esp_chip_info.h"
+#include "esp_log.h"
+#include "esp_ota_ops.h"
+#include "esp_partition.h" // For esp_partition_find_first, esp_partition_get_next
+#include "esp_system.h"
+
+#ifndef OTA_SIZE_UNKNOWN
+#define OTA_SIZE_UNKNOWN 0xFFFFFFFF
+#endif
+
+namespace platform {
+namespace {
+
+const char* kEspIdfUpdaterTag = "EspIdfAppUpdater";
+
+std::string ChipModelToString(esp_chip_model_t model) {
+  switch (model) {
+    case CHIP_ESP32: return "ESP32";
+    case CHIP_ESP32S2: return "ESP32S2";
+    case CHIP_ESP32S3: return "ESP32S3";
+    case CHIP_ESP32C3: return "ESP32C3";
+    case CHIP_ESP32H2: return "ESP32H2";
+    case CHIP_ESP32C2: return "ESP32C2";
+    case CHIP_ESP32C6: return "ESP32C6";
+    default:
+      char unknown_chip_buf[30];
+      snprintf(unknown_chip_buf, sizeof(unknown_chip_buf), "UNKNOWN_CHIP(%d)", static_cast<int>(model));
+      return std::string(unknown_chip_buf);
+  }
+}
+
+// Helper to populate PartitionDetail from esp_partition_t
+AppUpdater::PartitionDetail ToPartitionDetail(const esp_partition_t* esp_part) {
+    AppUpdater::PartitionDetail detail;
+    if (esp_part) {
+        detail.label = esp_part->label;
+        detail.type_id = esp_part->type;
+        detail.subtype_id = esp_part->subtype;
+        detail.address = esp_part->address;
+        detail.size = esp_part->size;
+        detail.is_encrypted = esp_part->encrypted;
+        detail.is_valid = true;
+    } else {
+        detail.is_valid = false;
+    }
+    return detail;
+}
+
+
+class EspIdfAppUpdater : public AppUpdater {
+ public:
+  EspIdfAppUpdater() { ResetInternalState(); }
+
+  ~EspIdfAppUpdater() override {
+    if (ota_handle_ != 0) {
+      ESP_LOGW(kEspIdfUpdaterTag,
+               "Destructor called with active OTA handle, aborting.");
+      esp_ota_abort(ota_handle_);
+      ota_handle_ = 0;
+    }
+  }
+
+  EspIdfAppUpdater(const EspIdfAppUpdater&) = delete;
+  EspIdfAppUpdater& operator=(const EspIdfAppUpdater&) = delete;
+
+  AppUpdateStatus Begin(const Metadata& metadata) override {
+    if (current_state_ != FlowState::kIdle) {
+      SetError("Begin called but updater is not idle. Current state: " +
+               std::to_string(static_cast<int>(current_state_)));
+      return AppUpdateStatus::kErrorNotIdle;
+    }
+    ResetInternalState(); 
+
+    SetState(FlowState::kPreparing);
+    ESP_LOGI(kEspIdfUpdaterTag, "Beginning OTA update process...");
+
+    if (!metadata.target_platform_identifier.empty()) {
+      esp_chip_info_t chip_info;
+      esp_chip_info(&chip_info);
+      std::string current_chip_model_str = ChipModelToString(chip_info.model);
+      if (metadata.target_platform_identifier != current_chip_model_str) {
+        SetErrorAndAbort("Firmware target platform ('" +
+                         metadata.target_platform_identifier +
+                         "') does not match current chip ('" +
+                         current_chip_model_str + "').");
+        return AppUpdateStatus::kErrorMetadataInvalid;
+      }
+      ESP_LOGI(kEspIdfUpdaterTag, "Chip target check passed: %s",
+               current_chip_model_str.c_str());
+    } else {
+      ESP_LOGW(kEspIdfUpdaterTag,
+               "No target_platform_identifier in metadata; skipping chip check.");
+    }
+    
+    esp_app_desc_t running_app_info;
+    esp_err_t err_desc = esp_ota_get_partition_description(
+        esp_ota_get_running_partition(), &running_app_info);
+     if (err_desc != ESP_OK) {
+      SetErrorAndAbort("Failed to get running app description.", err_desc);
+      return AppUpdateStatus::kErrorGeneric;
+    }
+    ESP_LOGI(kEspIdfUpdaterTag, "Running firmware version: %s", running_app_info.version);
+    if(!metadata.version_string.empty()){
+        ESP_LOGI(kEspIdfUpdaterTag, "Update firmware version: %s", metadata.version_string.c_str());
+    }
+
+    update_partition_ = esp_ota_get_next_update_partition(nullptr);
+    if (update_partition_ == nullptr) {
+      SetErrorAndAbort("No valid OTA update partition found.");
+      return AppUpdateStatus::kErrorPartitionNotFound;
+    }
+     ESP_LOGI(kEspIdfUpdaterTag, "Writing update to partition: %s (type %d, subtype %d) at offset 0x%lx, size 0x%lx",
+           update_partition_->label, update_partition_->type, update_partition_->subtype,
+           update_partition_->address, update_partition_->size);
+
+
+    total_image_size_ =
+        (metadata.image_size == 0) ? OTA_SIZE_UNKNOWN : metadata.image_size;
+
+    esp_err_t err =
+        esp_ota_begin(update_partition_, total_image_size_, &ota_handle_);
+    if (err != ESP_OK) {
+      SetErrorAndAbort("esp_ota_begin failed.", err);
+      update_partition_ = nullptr; 
+      return AppUpdateStatus::kErrorOtaBeginFailed;
+    }
+    ESP_LOGI(kEspIdfUpdaterTag, "esp_ota_begin succeeded. OTA Handle: %p", (void*)ota_handle_);
+
+    SetState(FlowState::kReceivingData);
+    return AppUpdateStatus::kSuccess;
+  }
+
+  AppUpdateStatus Write(const uint8_t* data, size_t size) override {
+    if (current_state_ != FlowState::kReceivingData) {
+      SetError("Not in RECEIVING_DATA state for writing.");
+      return AppUpdateStatus::kErrorInvalidState;
+    }
+    if (data == nullptr && size > 0) {
+      SetError("Null data pointer with non-zero size for write.");
+      return AppUpdateStatus::kErrorInvalidArgument;
+    }
+    if (size == 0) {
+      ESP_LOGD(kEspIdfUpdaterTag, "Write called with zero size.");
+      return AppUpdateStatus::kSuccess;
+    }
+    if (ota_handle_ == 0) {
+      SetError("OTA handle is not valid for writing (internal error or invalid sequence).");
+      return AppUpdateStatus::kErrorInvalidState;
+    }
+
+    esp_err_t err = esp_ota_write(ota_handle_, data, size);
+    if (err != ESP_OK) {
+      SetErrorAndAbort("esp_ota_write failed.", err);
+      return AppUpdateStatus::kErrorWriteFailed;
+    }
+    bytes_written_ += size;
+    return AppUpdateStatus::kSuccess;
+  }
+
+  AppUpdateStatus End() override {
+    if (current_state_ != FlowState::kReceivingData) {
+        if (! (total_image_size_ != OTA_SIZE_UNKNOWN && bytes_written_ >= total_image_size_ && current_state_ == FlowState::kReceivingData) &&
+            ! (total_image_size_ == 0 && bytes_written_ == 0 && current_state_ == FlowState::kReceivingData) ) {
+           SetError("Not in a valid state to end update. Current state: " + std::to_string(static_cast<int>(current_state_)));
+           return AppUpdateStatus::kErrorInvalidState;
+        }
+    }
+     if (ota_handle_ == 0) { 
+        if (total_image_size_ == 0 && bytes_written_ == 0) {
+            ESP_LOGW(kEspIdfUpdaterTag, "Ending a zero-byte update. No esp_ota_end call needed.");
+            SetState(FlowState::kReadyToApply);
+            return AppUpdateStatus::kSuccess;
+        }
+        SetError("OTA handle is not valid for ending update.");
+        return AppUpdateStatus::kErrorInvalidState;
+    }
+
+
+    SetState(FlowState::kFinalizing);
+
+    if (total_image_size_ != OTA_SIZE_UNKNOWN &&
+        bytes_written_ != total_image_size_) {
+      SetErrorAndAbort("Total bytes written (" + std::to_string(bytes_written_) +
+                       ") does not match expected image size (" +
+                       std::to_string(total_image_size_) + ").");
+      return AppUpdateStatus::kErrorImageSizeMismatch;
+    }
+
+    esp_err_t err = esp_ota_end(ota_handle_);
+    ota_handle_ = 0; 
+
+    if (err != ESP_OK) {
+      SetError("esp_ota_end failed. Image validation by IDF failed.", err);
+      return AppUpdateStatus::kErrorOtaEndFailed;
+    }
+
+    ESP_LOGI(kEspIdfUpdaterTag,
+             "esp_ota_end succeeded. Firmware image validated by IDF.");
+    SetState(FlowState::kReadyToApply);
+    return AppUpdateStatus::kSuccess;
+  }
+
+  AppUpdateStatus Apply(
+      std::function<void()> pre_restart_hook = nullptr) override {
+    if (current_state_ != FlowState::kReadyToApply) {
+      SetError("Not in READY_TO_APPLY state for applying update.");
+      return AppUpdateStatus::kErrorInvalidState;
+    }
+    if (update_partition_ == nullptr) {
+      if (total_image_size_ == 0 && bytes_written_ == 0) {
+          ESP_LOGW(kEspIdfUpdaterTag, "Apply called for a zero-byte update. No action.");
+          ResetInternalState();
+          return AppUpdateStatus::kSuccess; 
+      }
+      SetError("Update partition is not set for applying update.");
+      return AppUpdateStatus::kErrorInvalidState;
+    }
+
+    SetState(FlowState::kApplying);
+    esp_err_t err = esp_ota_set_boot_partition(update_partition_);
+    if (err != ESP_OK) {
+      SetError("esp_ota_set_boot_partition failed.", err);
+      return AppUpdateStatus::kErrorSetBootPartitionFailed;
+    }
+
+    ESP_LOGI(kEspIdfUpdaterTag, "Boot partition set to '%s'.",
+             update_partition_->label);
+
+    if (pre_restart_hook) {
+      ESP_LOGI(kEspIdfUpdaterTag, "Executing pre-restart hook...");
+      pre_restart_hook();
+      ESP_LOGI(kEspIdfUpdaterTag, "Pre-restart hook execution finished.");
+    }
+
+    ESP_LOGI(kEspIdfUpdaterTag, "Rebooting now...");
+    esp_restart();
+    // Should not be reached
+    SetError("esp_restart was called but did not reboot.");
+    return AppUpdateStatus::kErrorRebootFailed;
+  }
+
+  FlowState GetState() const override { return current_state_; }
+  std::string GetLastError() const override { return last_error_message_; }
+  size_t GetBytesWritten() const override { return bytes_written_; }
+
+  AppUpdateStatus Cancel() override {
+    ESP_LOGW(kEspIdfUpdaterTag, "User initiated cancel. Current state: %d",
+             static_cast<int>(current_state_));
+    FlowState state_before_cancel = current_state_;
+
+    ResetInternalState(); 
+
+    if (state_before_cancel != FlowState::kIdle &&
+        state_before_cancel != FlowState::kError) {
+      last_error_message_ = "Update canceled by user.";
+      ESP_LOGI(kEspIdfUpdaterTag, "%s", last_error_message_.c_str());
+    } else if (state_before_cancel == FlowState::kError) {
+      // If already in error, preserve the original error, or decide if
+      // "cancelled" takes precedence.
+      // For now, ResetInternalState clears it, so we explicitly set "cancelled".
+       last_error_message_ = "Update canceled by user (was previously in error state).";
+    }
+    return AppUpdateStatus::kErrorCancelled;
+  }
+
+  PartitionDetail GetRunningPartitionDetail() const override {
+      const esp_partition_t* running_part = esp_ota_get_running_partition();
+      return ToPartitionDetail(running_part);
+  }
+
+  PartitionDetail GetNextBootPartitionDetail() const override {
+      const esp_partition_t* boot_part = esp_ota_get_boot_partition();
+      return ToPartitionDetail(boot_part);
+  }
+
+
+ private:
+  void SetState(FlowState new_state) {
+    ESP_LOGD(kEspIdfUpdaterTag, "State transition from %d to %d",
+             static_cast<int>(current_state_), static_cast<int>(new_state));
+    current_state_ = new_state;
+  }
+
+  void SetErrorAndAbort(const std::string& error_message, esp_err_t esp_idf_err = ESP_OK) {
+    if (esp_idf_err != ESP_OK) {
+      last_error_message_ =
+          error_message + " (ESP-IDF err: " + esp_err_to_name(esp_idf_err) + ")";
+    } else {
+      last_error_message_ = error_message;
+    }
+    ESP_LOGE(kEspIdfUpdaterTag, "%s", last_error_message_.c_str());
+    
+    if (ota_handle_ != 0) {
+        ESP_LOGW(kEspIdfUpdaterTag, "Error occurred with active OTA handle %p, aborting.", (void*)ota_handle_);
+        esp_ota_abort(ota_handle_);
+        ota_handle_ = 0;
+    }
+    SetState(FlowState::kError);
+  }
+  
+  void SetError(const std::string& error_message) { // Overload for non-IDF errors
+      SetErrorAndAbort(error_message, ESP_OK);
+  }
+
+
+  void ResetInternalState() {
+    if (ota_handle_ != 0) {
+      ESP_LOGD(kEspIdfUpdaterTag, "ResetInternalState: Aborting active OTA handle %p", (void*)ota_handle_);
+      esp_ota_abort(ota_handle_);
+      ota_handle_ = 0;
+    }
+    update_partition_ = nullptr;
+    current_state_ = FlowState::kIdle;
+    last_error_message_.clear();
+    bytes_written_ = 0;
+    total_image_size_ = 0;
+  }
+  
+  // Removed CancelInternal as its logic is now part of ResetInternalState and SetErrorAndAbort
+
+  esp_ota_handle_t ota_handle_ = 0;
+  const esp_partition_t* update_partition_ = nullptr;
+  FlowState current_state_ = FlowState::kIdle;
+  std::string last_error_message_;
+  size_t bytes_written_ = 0;
+  size_t total_image_size_ = 0;
+};
+
+}  // anonymous namespace
+
+std::unique_ptr<AppUpdater> CreateAppUpdater() {
+  return std::make_unique<anonymous_namespace::EspIdfAppUpdater>();
+}
+
+}  // namespace platform
+
+-----------------------------------------------------------------------------------------------------------------
+
+// Copyright [2025] [Your Name or Company]
+// (Apache License header as before)
+
+#include <vector>
+#include <string>
+#include <cstdio> // For printf, sprintf
+
+#include "app_updater.h" 
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "esp_log.h"
+#include "nvs_flash.h"
+#include "mbedtls/sha256.h" // For application-level SHA256 check
+// #include "esp_wifi.h" // Example if pre_restart_hook needs it
+
+const char* kDummyFirmwareVersion = "3.0.4"; 
+const char* kDummyFirmwareExpectedSha256 = "f214a15753105da3933917477135509918211604424450946092156719901559";
+const size_t kDummyFirmwareTotalSize = 1024 * 10; 
+const char* kDummyTargetPlatform = "ESP32"; 
+
+const char* kMainTag = "MainApp"; 
+
+static bool GetDummyFirmwareChunk(size_t offset, uint8_t* buffer,
+                                  size_t buffer_size, size_t* bytes_read) {
+  if (kDummyFirmwareTotalSize == 0) {
+      *bytes_read = 0;
+      return true;
+  }
+  if (offset >= kDummyFirmwareTotalSize) {
+    *bytes_read = 0;
+    return true;
+  }
+  size_t remaining_total = kDummyFirmwareTotalSize - offset;
+  *bytes_read = (buffer_size < remaining_total) ? buffer_size : remaining_total;
+  for (size_t i = 0; i < *bytes_read; ++i) {
+    buffer[i] = static_cast<uint8_t>((offset + i) % 256);
+  }
+  return true;
+}
+
+void LogPartitionDetail(const char* title, const platform::AppUpdater::PartitionDetail& detail) {
+    if (detail.is_valid) {
+        ESP_LOGI(kMainTag, "%s: Label: '%s', Type: %lu, Subtype: %lu, Addr: 0x%08zx, Size: %zu, Encrypted: %s",
+                 title,
+                 detail.label.c_str(),
+                 detail.type_id,
+                 detail.subtype_id,
+                 detail.address,
+                 detail.size,
+                 detail.is_encrypted ? "Yes" : "No");
+    } else {
+        ESP_LOGI(kMainTag, "%s: Invalid partition data.", title);
+    }
+}
+
+// Example pre-restart cleanup function
+void ApplicationCleanupBeforeRestart() {
+    ESP_LOGW(kMainTag, "PRE-RESTART HOOK: Performing application cleanup...");
+    // Example: disconnect Wi-Fi, save critical data to NVS, close peripherals
+    // esp_wifi_disconnect();
+    // esp_wifi_stop();
+    // ESP_LOGI(kMainTag, "Wi-Fi disconnected.");
+    ESP_LOGI(kMainTag, "Simulating saving state to NVS...");
+    vTaskDelay(pdMS_TO_TICKS(500)); // Simulate some work
+    ESP_LOGW(kMainTag, "PRE-RESTART HOOK: Cleanup finished.");
+}
+
+
+void ApplicationUpdateTask(void* pvParameters) {
+  ESP_LOGI(kMainTag, "Application Update Task started.");
+
+  std::unique_ptr<platform::AppUpdater> updater =
+      platform::CreateAppUpdater();
+
+  if (!updater) {
+    ESP_LOGE(kMainTag, "Failed to create AppUpdater instance.");
+    vTaskDelete(nullptr);
+    return;
+  }
+
+  // Log current partition info
+  LogPartitionDetail("Running Partition", updater->GetRunningPartitionDetail());
+  LogPartitionDetail("Initial Boot Partition", updater->GetNextBootPartitionDetail());
+
+
+  platform::AppUpdater::Metadata metadata;
+  metadata.image_size = kDummyFirmwareTotalSize;
+  metadata.version_string = kDummyFirmwareVersion;
+  metadata.target_platform_identifier = kDummyTargetPlatform;
+
+  ESP_LOGI(kMainTag, "Attempting to begin update with AppUpdater metadata:");
+  ESP_LOGI(kMainTag, "  Version: %s", metadata.version_string.c_str());
+  ESP_LOGI(kMainTag, "  Target Platform: %s", metadata.target_platform_identifier.c_str());
+  ESP_LOGI(kMainTag, "  Image Size: %zu bytes", metadata.image_size);
+  ESP_LOGI(kMainTag, "Application expects SHA256: %s", kDummyFirmwareExpectedSha256);
+
+
+  platform::AppUpdateStatus status = updater->Begin(metadata);
+  if (status != platform::AppUpdateStatus::kSuccess) {
+    ESP_LOGE(kMainTag, "Updater Begin failed: %s (%s)",
+             platform::AppUpdater::StatusToString(status), 
+             updater->GetLastError().c_str());
+    vTaskDelete(nullptr);
+    return;
+  }
+  ESP_LOGI(kMainTag, "Updater Begin successful. State: %d",
+           static_cast<int>(updater->GetState()));
+
+  std::vector<uint8_t> chunk_buffer(4096);
+  size_t total_bytes_processed_for_hash = 0;
+  bool app_level_integrity_ok = true;
+
+  mbedtls_sha256_context sha256_ctx;
+  mbedtls_sha256_init(&sha256_ctx);
+  bool sha_init_ok = (mbedtls_sha256_starts_ret(&sha256_ctx, 0) == 0); 
+
+  if (!sha_init_ok && strlen(kDummyFirmwareExpectedSha256) > 0) {
+      ESP_LOGE(kMainTag, "Failed to start mbedtls_sha256 context for app-level check.");
+      app_level_integrity_ok = false; 
+  }
+
+  if (metadata.image_size == 0) {
+      ESP_LOGI(kMainTag, "Metadata indicates a zero-byte image. Skipping write loop.");
+      if (sha_init_ok && strlen(kDummyFirmwareExpectedSha256) > 0 &&
+          std::string(kDummyFirmwareExpectedSha256) != "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855") {
+          ESP_LOGE(kMainTag, "Expected hash provided for zero-byte image, but it's not the empty string hash.");
+          app_level_integrity_ok = false;
+      }
+  } else if (sha_init_ok || strlen(kDummyFirmwareExpectedSha256) == 0) { 
+      while (total_bytes_processed_for_hash < metadata.image_size) {
+        size_t bytes_this_chunk = 0;
+        if (!GetDummyFirmwareChunk(total_bytes_processed_for_hash, chunk_buffer.data(),
+                                   chunk_buffer.size(), &bytes_this_chunk)) {
+          ESP_LOGE(kMainTag, "Failed to get firmware chunk.");
+          status = platform::AppUpdateStatus::kErrorGeneric;
+          app_level_integrity_ok = false;
+          break;
+        }
+
+        if (bytes_this_chunk == 0) {
+          ESP_LOGI(kMainTag, "End of firmware data stream.");
+          break;
+        }
+
+        if (sha_init_ok && strlen(kDummyFirmwareExpectedSha256) > 0) { 
+            if (mbedtls_sha256_update_ret(&sha256_ctx, chunk_buffer.data(), bytes_this_chunk) != 0) {
+                ESP_LOGE(kMainTag, "Failed to update app-level SHA256 context.");
+                app_level_integrity_ok = false;
+                status = platform::AppUpdateStatus::kErrorGeneric; 
+                break;
+            }
+        }
+
+        status = updater->Write(chunk_buffer.data(), bytes_this_chunk);
+        if (status != platform::AppUpdateStatus::kSuccess) {
+          ESP_LOGE(kMainTag, "Updater Write failed: %s (%s)",
+                   platform::AppUpdater::StatusToString(status), updater->GetLastError().c_str());
+          app_level_integrity_ok = false; 
+          break;
+        }
+        total_bytes_processed_for_hash = updater->GetBytesWritten();
+        printf("Progress: %zu / %zu bytes\r", total_bytes_processed_for_hash, metadata.image_size);
+        vTaskDelay(pdMS_TO_TICKS(1));
+      }
+      printf("\n");
+  } else if (!sha_init_ok && strlen(kDummyFirmwareExpectedSha256) > 0) {
+      app_level_integrity_ok = false;
+      status = platform::AppUpdateStatus::kErrorGeneric; 
+      ESP_LOGE(kMainTag, "App-level SHA256 initialization failed, cannot proceed with writes for verification.");
+  }
+
+
+  if (status != platform::AppUpdateStatus::kSuccess || !app_level_integrity_ok) {
+    ESP_LOGE(kMainTag, "Firmware processing loop failed or integrity issue. Cancelling AppUpdater.");
+    updater->Cancel(); 
+    if(sha_init_ok) mbedtls_sha256_free(&sha256_ctx);
+    vTaskDelete(nullptr);
+    return;
+  }
+
+  ESP_LOGI(kMainTag, "All firmware data processed for hashing and written to updater. Bytes: %zu", updater->GetBytesWritten());
+
+  if (sha_init_ok && strlen(kDummyFirmwareExpectedSha256) > 0) {
+      unsigned char final_sha256_output[32];
+      if (mbedtls_sha256_finish_ret(&sha256_ctx, final_sha256_output) != 0) {
+          ESP_LOGE(kMainTag, "Failed to finalize app-level SHA256 calculation.");
+          app_level_integrity_ok = false;
+      } else {
+          char calculated_hex_hash[65];
+          for (int i = 0; i < 32; ++i) {
+            sprintf(calculated_hex_hash + (i * 2), "%02x", final_sha256_output[i]);
+          }
+          calculated_hex_hash[64] = '\0';
+          ESP_LOGI(kMainTag, "App-level Calculated SHA256: %s", calculated_hex_hash);
+          ESP_LOGI(kMainTag, "App-level Expected SHA256  : %s", kDummyFirmwareExpectedSha256);
+          std::string expected_hash_str_lower = kDummyFirmwareExpectedSha256;
+          std::transform(expected_hash_str_lower.begin(), expected_hash_str_lower.end(), expected_hash_str_lower.begin(), ::tolower);
+
+          if (std::string(calculated_hex_hash) != expected_hash_str_lower) {
+              ESP_LOGE(kMainTag, "App-level SHA256 Mismatch!");
+              app_level_integrity_ok = false;
+          } else {
+              ESP_LOGI(kMainTag, "App-level SHA256 Verified Successfully!");
+          }
+      }
+  } else {
+      ESP_LOGI(kMainTag, "App-level SHA256 verification skipped (no expected hash or SHA init failed).");
+  }
+  if(sha_init_ok) mbedtls_sha256_free(&sha256_ctx);
+
+
+  if (!app_level_integrity_ok) {
+    ESP_LOGE(kMainTag, "Application-level integrity check failed. Cancelling AppUpdater.");
+    updater->Cancel(); 
+    vTaskDelete(nullptr);
+    return;
+  }
+
+  ESP_LOGI(kMainTag, "App-level integrity checks passed (or skipped). Proceeding to AppUpdater End.");
+
+  status = updater->End();
+  if (status != platform::AppUpdateStatus::kSuccess) {
+    ESP_LOGE(kMainTag, "Updater End failed: %s (%s)",
+             platform::AppUpdater::StatusToString(status), updater->GetLastError().c_str());
+    updater->Cancel();
+    vTaskDelete(nullptr);
+    return;
+  }
+  ESP_LOGI(kMainTag, "Updater End successful. Platform image validation passed. State: %d",
+           static_cast<int>(updater->GetState()));
+
+  LogPartitionDetail("Next Boot Partition (after End)", updater->GetNextBootPartitionDetail());
+
+
+  ESP_LOGI(kMainTag, "Attempting to apply the update...");
+  // Pass the cleanup function to Apply()
+  status = updater->Apply(ApplicationCleanupBeforeRestart);
+  
+  if (status != platform::AppUpdateStatus::kSuccess) {
+    // This part of the log might not be reached if reboot is successful and immediate
+    // but useful if esp_ota_set_boot_partition failed before the hook or restart.
+    ESP_LOGE(kMainTag, "Updater Apply failed: %s (%s)",
+             platform::AppUpdater::StatusToString(status), updater->GetLastError().c_str());
+  } else {
+    // This log will likely not be seen if reboot is successful
+    ESP_LOGI(kMainTag,
+             "Updater Apply call succeeded, device should be rebooting after cleanup hook.");
+  }
+
+  vTaskDelete(nullptr);
+}
+
+extern "C" void app_main(void) {
+  ESP_LOGI(kMainTag, "Initializing NVS flash...");
+  esp_err_t ret = nvs_flash_init();
+  if (ret == ESP_ERR_NVS_NO_FREE_PAGES ||
+      ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+    ESP_ERROR_CHECK(nvs_flash_erase());
+    ret = nvs_flash_init();
+  }
+  ESP_ERROR_CHECK(ret);
+
+  ESP_LOGW(kMainTag, "Reminder: Ensure kDummyFirmwareExpectedSha256 ('%s') is correct for the dummy data if you expect SHA check to pass!", kDummyFirmwareExpectedSha256);
+  ESP_LOGW(kMainTag, "And kDummyTargetPlatform ('%s') matches your actual chip!", kDummyTargetPlatform);
+
+
+  ESP_LOGI(kMainTag, "Starting application update task example...");
+  xTaskCreate(&ApplicationUpdateTask, "app_update_task_main", 8192 * 2, nullptr, 5,
+              nullptr);
+
+  ESP_LOGI(kMainTag, "Main application loop running...");
+}
