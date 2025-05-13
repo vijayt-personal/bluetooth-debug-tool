@@ -1,0 +1,1162 @@
+// osal_mutex_freertos.cpp
+#include "osal_mutex.h"  // The public, agnostic header
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
+#include "esp_log.h" // For ESP-IDF logging
+
+namespace osal {
+namespace {  // Anonymous namespace for concrete implementation
+
+static const char* kLogTag = "OsalMutex"; // Generic OSAL component log tag
+
+class FreeRTOSMutex : public Mutex {
+ public:
+  FreeRTOSMutex() : mutex_handle_(nullptr) {
+    mutex_handle_ = xSemaphoreCreateMutex();
+    if (mutex_handle_ == nullptr) {
+      ESP_LOGE(kLogTag, "Failed to create FreeRTOS mutex!");
+      // In a production system, robust error handling here is critical.
+      // This might involve setting an internal error state, or if exceptions
+      // are used, throwing one. The factory function checks IsValid().
+    } else {
+      ESP_LOGD(kLogTag, "FreeRTOSMutex created: %p", (void*)mutex_handle_);
+    }
+  }
+
+  ~FreeRTOSMutex() override {
+    if (mutex_handle_ != nullptr) {
+      ESP_LOGD(kLogTag, "Deleting FreeRTOSMutex: %p", (void*)mutex_handle_);
+      vSemaphoreDelete(mutex_handle_);
+      mutex_handle_ = nullptr;
+    }
+  }
+
+  void Lock() override {
+    if (mutex_handle_ == nullptr) {
+      ESP_LOGE(kLogTag, "Lock() called on an uninitialized/invalid mutex!");
+      // Depending on error policy, could assert, panic, or return error status
+      // if interface allowed. For void, logging is key.
+      return;
+    }
+    xSemaphoreTake(mutex_handle_, portMAX_DELAY);
+  }
+
+  Status TryLock() override {
+    if (mutex_handle_ == nullptr) {
+      ESP_LOGE(kLogTag, "TryLock() called on an uninitialized/invalid mutex!");
+      return Status::kError;
+    }
+    if (xSemaphoreTake(mutex_handle_, 0) == pdTRUE) {
+      return Status::kOk;
+    }
+    return Status::kUnavailable;
+  }
+
+  Status TryLockFor(std::chrono::milliseconds timeout) override {
+    if (mutex_handle_ == nullptr) {
+      ESP_LOGE(kLogTag, "TryLockFor() called on an uninitialized/invalid mutex!");
+      return Status::kError;
+    }
+    if (timeout.count() < 0) {
+      ESP_LOGW(kLogTag, "TryLockFor called with negative timeout.");
+      return Status::kInvalidParam;
+    }
+
+    TickType_t ticks_to_wait = 0;
+    if (timeout.count() > 0) {
+        ticks_to_wait = pdMS_TO_TICKS(timeout.count());
+        // If timeout is small but positive, and rounds to 0 ticks,
+        // FreeRTOS treats xSemaphoreTake with 0 ticks as non-blocking.
+        // To ensure a minimal wait for small positive timeouts, ensure at least 1 tick.
+        if (ticks_to_wait == 0) {
+            ticks_to_wait = 1;
+        }
+    }
+    // If timeout.count() was 0, ticks_to_wait will remain 0 (non-blocking).
+
+    if (xSemaphoreTake(mutex_handle_, ticks_to_wait) == pdTRUE) {
+      return Status::kOk;
+    } else {
+      // If original timeout was 0 ms (so ticks_to_wait was 0), it's kUnavailable.
+      // Otherwise, it's a kTimeout.
+      return (timeout.count() == 0) ? Status::kUnavailable : Status::kTimeout;
+    }
+  }
+
+  void Unlock() override {
+    if (mutex_handle_ == nullptr) {
+      ESP_LOGE(kLogTag, "Unlock() called on an uninitialized/invalid mutex!");
+      return;
+    }
+    if (xSemaphoreGive(mutex_handle_) != pdTRUE) {
+      // This usually means the mutex wasn't locked by the calling task
+      // or xSemaphoreGive was called more times than xSemaphoreTake.
+      ESP_LOGW(kLogTag, "xSemaphoreGive failed on mutex %p. Check lock balancing.", (void*)mutex_handle_);
+    }
+  }
+
+  // Helper for the factory to check if underlying resource was created.
+  bool IsValid() const { return mutex_handle_ != nullptr; }
+
+ private:
+  SemaphoreHandle_t mutex_handle_;
+};
+
+}  // anonymous namespace
+
+// Factory Function DEFINITION
+std::unique_ptr<Mutex> CreateMutex() {
+  auto freertos_mutex = std::make_unique<FreeRTOSMutex>();
+  if (!freertos_mutex || !freertos_mutex->IsValid()) {
+    // The FreeRTOSMutex constructor already logged the specific FreeRTOS error.
+    ESP_LOGE(kLogTag, "Mutex factory: FreeRTOSMutex creation failed.");
+    return nullptr;
+  }
+  ESP_LOGD(kLogTag, "Mutex factory: Created FreeRTOSMutex instance.");
+  return freertos_mutex;
+}
+
+}  // namespace osal
+
+-----------------------------------------------------------------------------
+
+// osal_semaphore_freertos.cpp
+#include "osal_semaphore.h"
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
+#include "esp_log.h"
+
+namespace osal {
+namespace {  // Anonymous namespace
+
+static const char* kLogTag = "OsalSemaphore";
+
+class FreeRTOSSemaphore : public Semaphore {
+ public:
+  // Constructor for binary semaphore
+  explicit FreeRTOSSemaphore(bool initially_signaled) : semaphore_handle_(nullptr) {
+    semaphore_handle_ = xSemaphoreCreateBinary();
+    if (semaphore_handle_ == nullptr) {
+      ESP_LOGE(kLogTag, "Failed to create FreeRTOS binary semaphore!");
+    } else {
+      ESP_LOGD(kLogTag, "Binary semaphore created: %p", (void*)semaphore_handle_);
+      if (initially_signaled) {
+        if (xSemaphoreGive(semaphore_handle_) != pdTRUE) {
+           ESP_LOGE(kLogTag, "Failed to initially give binary semaphore %p!", (void*)semaphore_handle_);
+           // Consider deleting the semaphore if this is a critical failure
+           // vSemaphoreDelete(semaphore_handle_);
+           // semaphore_handle_ = nullptr;
+        } else {
+            ESP_LOGD(kLogTag, "Binary semaphore %p initially given.", (void*)semaphore_handle_);
+        }
+      }
+    }
+  }
+
+  // Constructor for counting semaphore
+  FreeRTOSSemaphore(uint32_t max_count, uint32_t initial_count)
+      : semaphore_handle_(nullptr) {
+    if (max_count == 0) {
+      ESP_LOGE(kLogTag, "max_count for counting semaphore cannot be 0.");
+      return; // IsValid() will be false
+    }
+    if (initial_count > max_count) {
+      ESP_LOGE(kLogTag, "initial_count (%u) > max_count (%u) for counting semaphore.",
+               initial_count, max_count);
+      return; // IsValid() will be false
+    }
+    semaphore_handle_ = xSemaphoreCreateCounting(max_count, initial_count);
+    if (semaphore_handle_ == nullptr) {
+      ESP_LOGE(kLogTag, "Failed to create FreeRTOS counting semaphore (max: %u, initial: %u)!",
+               max_count, initial_count);
+    } else {
+      ESP_LOGD(kLogTag, "Counting semaphore created: %p (max: %u, initial: %u)",
+               (void*)semaphore_handle_, max_count, initial_count);
+    }
+  }
+
+  ~FreeRTOSSemaphore() override {
+    if (semaphore_handle_ != nullptr) {
+      ESP_LOGD(kLogTag, "Deleting FreeRTOSSemaphore: %p", (void*)semaphore_handle_);
+      vSemaphoreDelete(semaphore_handle_);
+      semaphore_handle_ = nullptr;
+    }
+  }
+
+  Status Acquire(std::chrono::milliseconds timeout) override {
+    if (semaphore_handle_ == nullptr) {
+      ESP_LOGE(kLogTag, "Acquire() called on an uninitialized/invalid semaphore!");
+      return Status::kError;
+    }
+     if (timeout.count() < 0) {
+      ESP_LOGW(kLogTag, "Acquire called with negative timeout.");
+      return Status::kInvalidParam;
+    }
+
+    TickType_t ticks_to_wait = 0;
+    if (timeout.count() > 0) {
+        ticks_to_wait = pdMS_TO_TICKS(timeout.count());
+        if (ticks_to_wait == 0) { // Ensure minimal wait for small positive timeouts
+            ticks_to_wait = 1;
+        }
+    }
+    // If timeout.count() was 0, ticks_to_wait remains 0.
+
+    if (xSemaphoreTake(semaphore_handle_, ticks_to_wait) == pdTRUE) {
+      return Status::kOk;
+    } else {
+      return (timeout.count() == 0) ? Status::kUnavailable : Status::kTimeout;
+    }
+  }
+
+  Status Release() override {
+    if (semaphore_handle_ == nullptr) {
+      ESP_LOGE(kLogTag, "Release() called on an uninitialized/invalid semaphore!");
+      return Status::kError;
+    }
+    if (xSemaphoreGive(semaphore_handle_) == pdTRUE) {
+      return Status::kOk;
+    } else {
+      // For counting semaphores, this means it was already at its max count.
+      // For binary semaphores, this also means it was already given.
+      ESP_LOGW(kLogTag, "xSemaphoreGive failed on semaphore %p. May be at max count or already given.", (void*)semaphore_handle_);
+      return Status::kError; // Or a more specific status like kLimitReached/kAlreadyExists
+    }
+  }
+
+  uint32_t GetCount() const override {
+    if (semaphore_handle_ == nullptr) {
+      ESP_LOGE(kLogTag, "GetCount() called on an uninitialized/invalid semaphore!");
+      return 0;
+    }
+    return uxSemaphoreGetCount(semaphore_handle_);
+  }
+
+  bool IsValid() const { return semaphore_handle_ != nullptr; }
+
+ private:
+  SemaphoreHandle_t semaphore_handle_;
+};
+
+}  // anonymous namespace
+
+std::unique_ptr<Semaphore> CreateBinarySemaphore(bool initially_signaled) {
+  auto freertos_sem = std::make_unique<FreeRTOSSemaphore>(initially_signaled);
+  if (!freertos_sem || !freertos_sem->IsValid()) {
+    ESP_LOGE(kLogTag, "Binary semaphore factory: FreeRTOSSemaphore creation failed.");
+    return nullptr;
+  }
+  ESP_LOGD(kLogTag, "Binary semaphore factory: Created FreeRTOSSemaphore instance.");
+  return freertos_sem;
+}
+
+std::unique_ptr<Semaphore> CreateCountingSemaphore(uint32_t max_count,
+                                                 uint32_t initial_count) {
+  auto freertos_sem =
+      std::make_unique<FreeRTOSSemaphore>(max_count, initial_count);
+  if (!freertos_sem || !freertos_sem->IsValid()) {
+    ESP_LOGE(kLogTag, "Counting semaphore factory: FreeRTOSSemaphore creation failed.");
+    return nullptr;
+  }
+  ESP_LOGD(kLogTag, "Counting semaphore factory: Created FreeRTOSSemaphore instance.");
+  return freertos_sem;
+}
+
+}  // namespace osal
+
+--------------------------------------------------------------------------------------------------
+
+// osal_queue_freertos.cpp
+#include "osal_queue.h"
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
+#include "esp_log.h"
+
+namespace osal {
+namespace {  // Anonymous namespace
+
+static const char* kLogTag = "OsalQueue";
+
+class FreeRTOSQueue : public Queue {
+ public:
+  FreeRTOSQueue(size_t item_count, size_t item_size)
+      : queue_handle_(nullptr),
+        item_count_(item_count),
+        item_size_(item_size) {
+    if (item_count == 0 || item_size == 0) {
+        ESP_LOGE(kLogTag, "Invalid parameters for queue: item_count=%zu, item_size=%zu",
+                 item_count, item_size);
+        return; // IsValid() will be false
+    }
+    queue_handle_ = xQueueCreate(item_count, item_size);
+    if (queue_handle_ == nullptr) {
+      ESP_LOGE(kLogTag, "Failed to create FreeRTOS queue (count: %zu, size: %zu)!",
+               item_count, item_size);
+    } else {
+      ESP_LOGD(kLogTag, "FreeRTOSQueue created: %p (count: %zu, size: %zu)",
+               (void*)queue_handle_, item_count, item_size);
+    }
+  }
+
+  ~FreeRTOSQueue() override {
+    if (queue_handle_ != nullptr) {
+      ESP_LOGD(kLogTag, "Deleting FreeRTOSQueue: %p", (void*)queue_handle_);
+      vQueueDelete(queue_handle_);
+      queue_handle_ = nullptr;
+    }
+  }
+
+  Status Send(const void* item_ptr,
+              std::chrono::milliseconds timeout) override {
+    if (queue_handle_ == nullptr) {
+      ESP_LOGE(kLogTag, "Send() on uninitialized queue!");
+      return Status::kError;
+    }
+    if (item_ptr == nullptr) {
+      ESP_LOGW(kLogTag, "Send() called with null item_ptr.");
+      return Status::kInvalidParam;
+    }
+    if (timeout.count() < 0) {
+      ESP_LOGW(kLogTag, "Send() called with negative timeout.");
+      return Status::kInvalidParam;
+    }
+
+    TickType_t ticks_to_wait = 0;
+    if (timeout.count() > 0) {
+        ticks_to_wait = pdMS_TO_TICKS(timeout.count());
+        if (ticks_to_wait == 0) ticks_to_wait = 1;
+    }
+
+    if (xQueueSend(queue_handle_, item_ptr, ticks_to_wait) == pdTRUE) {
+      return Status::kOk;
+    } else {
+      return (timeout.count() == 0) ? Status::kUnavailable : Status::kTimeout;
+    }
+  }
+
+  Status Receive(void* buffer_ptr,
+                 std::chrono::milliseconds timeout) override {
+    if (queue_handle_ == nullptr) {
+      ESP_LOGE(kLogTag, "Receive() on uninitialized queue!");
+      return Status::kError;
+    }
+    if (buffer_ptr == nullptr) {
+      ESP_LOGW(kLogTag, "Receive() called with null buffer_ptr.");
+      return Status::kInvalidParam;
+    }
+     if (timeout.count() < 0) {
+      ESP_LOGW(kLogTag, "Receive() called with negative timeout.");
+      return Status::kInvalidParam;
+    }
+
+    TickType_t ticks_to_wait = 0;
+    if (timeout.count() > 0) {
+        ticks_to_wait = pdMS_TO_TICKS(timeout.count());
+        if (ticks_to_wait == 0) ticks_to_wait = 1;
+    }
+
+    if (xQueueReceive(queue_handle_, buffer_ptr, ticks_to_wait) == pdTRUE) {
+      return Status::kOk;
+    } else {
+      return (timeout.count() == 0) ? Status::kUnavailable : Status::kTimeout;
+    }
+  }
+
+  Status SendFromISR(const void* item_ptr,
+                     bool* higher_priority_task_woken) override {
+    if (queue_handle_ == nullptr) return Status::kError; // Should not happen if factory checks IsValid
+    if (item_ptr == nullptr) return Status::kInvalidParam;
+
+    BaseType_t task_woken_freertos = pdFALSE;
+    Status status;
+
+    if (xQueueSendFromISR(queue_handle_, item_ptr, &task_woken_freertos) == pdTRUE) {
+      status = Status::kOk;
+    } else {
+      // Queue is full
+      status = Status::kUnavailable;
+    }
+
+    if (higher_priority_task_woken != nullptr) {
+      *higher_priority_task_woken = (task_woken_freertos == pdTRUE);
+    }
+    return status;
+  }
+
+  Status ReceiveFromISR(void* buffer_ptr,
+                        bool* higher_priority_task_woken) override {
+    if (queue_handle_ == nullptr) return Status::kError;
+    if (buffer_ptr == nullptr) return Status::kInvalidParam;
+
+    BaseType_t task_woken_freertos = pdFALSE;
+    Status status;
+
+    if (xQueueReceiveFromISR(queue_handle_, buffer_ptr, &task_woken_freertos) == pdTRUE) {
+      status = Status::kOk;
+    } else {
+      // Queue is empty
+      status = Status::kUnavailable;
+    }
+
+    if (higher_priority_task_woken != nullptr) {
+      *higher_priority_task_woken = (task_woken_freertos == pdTRUE);
+    }
+    return status;
+  }
+
+  size_t GetMessageCount() const override {
+    if (queue_handle_ == nullptr) return 0;
+    return uxQueueMessagesWaiting(queue_handle_);
+  }
+
+  size_t GetCapacity() const override { return item_count_; }
+
+  size_t GetItemSize() const override { return item_size_; }
+
+  bool IsEmpty() const override {
+    if (queue_handle_ == nullptr) return true;
+    return uxQueueMessagesWaiting(queue_handle_) == 0;
+  }
+
+  bool IsFull() const override {
+    if (queue_handle_ == nullptr) return false; // Or true if uninitialized means "no space"
+    return uxQueueSpacesAvailable(queue_handle_) == 0;
+  }
+
+  Status Reset() override {
+    if (queue_handle_ == nullptr) {
+      ESP_LOGE(kLogTag, "Reset() on uninitialized queue!");
+      return Status::kError;
+    }
+    if (xQueueReset(queue_handle_) == pdPASS) {
+      return Status::kOk;
+    }
+    ESP_LOGE(kLogTag, "xQueueReset failed for queue %p.", (void*)queue_handle_);
+    return Status::kError;
+  }
+
+  bool IsValid() const { return queue_handle_ != nullptr; }
+
+ private:
+  QueueHandle_t queue_handle_;
+  const size_t item_count_;
+  const size_t item_size_;
+};
+
+}  // anonymous namespace
+
+std::unique_ptr<Queue> CreateQueue(size_t item_count, size_t item_size) {
+  auto freertos_queue = std::make_unique<FreeRTOSQueue>(item_count, item_size);
+  if (!freertos_queue || !freertos_queue->IsValid()) {
+    ESP_LOGE(kLogTag, "Queue factory: FreeRTOSQueue creation failed.");
+    return nullptr;
+  }
+  ESP_LOGD(kLogTag, "Queue factory: Created FreeRTOSQueue instance.");
+  return freertos_queue;
+}
+
+}  // namespace osal
+
+-------------------------------------------------------------------------------------------------
+
+// osal_timer_freertos.cpp
+#include "osal_timer.h"
+
+#include <string.h>  // For strncpy
+#include "freertos/FreeRTOS.h"
+#include "freertos/timers.h"
+#include "esp_log.h"
+
+namespace osal {
+namespace {  // Anonymous namespace
+
+static const char* kLogTag = "OsalTimer";
+
+// Forward declaration for the concrete class
+class FreeRTOSTimer;
+
+// Trampoline C-style function for FreeRTOS timer callback
+static void FreeRTOSTimerCallbackTrampoline(TimerHandle_t xTimer) {
+  // Retrieve the pointer to the FreeRTOSTimer object stored in the timer ID
+  FreeRTOSTimer* timer_obj =
+      static_cast<FreeRTOSTimer*>(pvTimerGetTimerID(xTimer));
+  if (timer_obj) {
+    timer_obj->InvokeCallback();
+  } else {
+    ESP_LOGE(kLogTag, "Timer callback invoked with null timer object ID (timer handle: %p)!", (void*)xTimer);
+  }
+}
+
+class FreeRTOSTimer : public Timer {
+ public:
+  FreeRTOSTimer(const char* name, std::chrono::milliseconds period,
+                TimerType type, Callback callback, void* callback_arg)
+      : timer_handle_(nullptr),
+        period_ms_(period),
+        type_(type),
+        user_callback_(std::move(callback)), // Move the std::function
+        user_callback_arg_(callback_arg),
+        is_active_manually_tracked_(false) { // Manual tracking for active state
+
+    if (period.count() <= 0) {
+        ESP_LOGE(kLogTag, "Timer period must be positive. Period: %lld ms, Name: %s",
+                 (long long)period.count(), name ? name : "Unnamed");
+        return; // IsValid() will be false
+    }
+    if (!user_callback_) { // Check if std::function is empty
+        ESP_LOGE(kLogTag, "Timer callback function cannot be null. Name: %s",
+                 name ? name : "Unnamed");
+        return; // IsValid() will be false
+    }
+
+    // Store the name, ensuring null termination and preventing buffer overflow
+    if (name != nullptr && name[0] != '\0') {
+        strncpy(name_buffer_, name, sizeof(name_buffer_) - 1);
+        name_buffer_[sizeof(name_buffer_) - 1] = '\0';
+    } else {
+        snprintf(name_buffer_, sizeof(name_buffer_), "OsalTimer@%p", static_cast<void*>(this));
+    }
+
+    TickType_t timer_period_ticks = pdMS_TO_TICKS(period_ms_.count());
+    if (timer_period_ticks == 0 && period_ms_.count() > 0) {
+        // Ensure minimum 1 tick period if milliseconds is > 0 but rounds to 0
+        timer_period_ticks = 1;
+        ESP_LOGW(kLogTag, "Timer period %lld ms (name: %s) rounded to %u ticks (min 1).",
+                 (long long)period_ms_.count(), name_buffer_, (unsigned int)timer_period_ticks);
+    }
+
+    UBaseType_t auto_reload = (type_ == TimerType::kPeriodic) ? pdTRUE : pdFALSE;
+
+    // Pass 'this' pointer as the timer ID, so the static callback can retrieve it
+    timer_handle_ = xTimerCreate(name_buffer_, timer_period_ticks, auto_reload,
+                                 static_cast<void*>(this),
+                                 FreeRTOSTimerCallbackTrampoline);
+
+    if (timer_handle_ == nullptr) {
+      ESP_LOGE(kLogTag, "Failed to create FreeRTOS timer. Name: %s", name_buffer_);
+    } else {
+      ESP_LOGD(kLogTag, "FreeRTOSTimer created: %p. Name: %s", (void*)timer_handle_, name_buffer_);
+    }
+  }
+
+  ~FreeRTOSTimer() override {
+    if (timer_handle_ != nullptr) {
+      ESP_LOGD(kLogTag, "Deleting FreeRTOSTimer: %p. Name: %s", (void*)timer_handle_, name_buffer_);
+      // Attempt to stop the timer before deleting.
+      // Use a non-blocking wait (0 ticks) as we are in a destructor.
+      // If the timer is running and its command cannot be processed immediately,
+      // xTimerDelete is documented to handle this.
+      xTimerStop(timer_handle_, 0); // Try to stop, don't block
+
+      if (xTimerDelete(timer_handle_, pdMS_TO_TICKS(100)) != pdPASS) { // Small timeout for delete
+          ESP_LOGE(kLogTag, "Failed to delete FreeRTOS timer %p. Name: %s", (void*)timer_handle_, name_buffer_);
+      }
+      timer_handle_ = nullptr;
+    }
+  }
+
+  Status Start() override {
+    if (timer_handle_ == nullptr) {
+      ESP_LOGE(kLogTag, "Start() on uninitialized timer. Name: %s", name_buffer_);
+      return Status::kError;
+    }
+    // Using 0 for xTicksToWait means it won't block if the timer command queue is full.
+    if (xTimerStart(timer_handle_, 0) == pdPASS) {
+      is_active_manually_tracked_ = true;
+      return Status::kOk;
+    }
+    ESP_LOGE(kLogTag, "Failed to start timer %p. Name: %s", (void*)timer_handle_, name_buffer_);
+    return Status::kError;
+  }
+
+  Status Stop() override {
+    if (timer_handle_ == nullptr) {
+        ESP_LOGE(kLogTag, "Stop() on uninitialized timer. Name: %s", name_buffer_);
+        return Status::kError;
+    }
+    // Check if it's already considered stopped to avoid unnecessary calls or error logs
+    if (xTimerIsTimerActive(timer_handle_) == pdFALSE) {
+        is_active_manually_tracked_ = false;
+        return Status::kOk;
+    }
+    if (xTimerStop(timer_handle_, 0) == pdPASS) {
+      is_active_manually_tracked_ = false;
+      return Status::kOk;
+    }
+    ESP_LOGE(kLogTag, "Failed to stop timer %p. Name: %s", (void*)timer_handle_, name_buffer_);
+    return Status::kError;
+  }
+
+  Status Reset() override {
+    if (timer_handle_ == nullptr) {
+        ESP_LOGE(kLogTag, "Reset() on uninitialized timer. Name: %s", name_buffer_);
+        return Status::kError;
+    }
+    // xTimerReset will start the timer if it was not active.
+    if (xTimerReset(timer_handle_, 0) == pdPASS) {
+      is_active_manually_tracked_ = true;
+      return Status::kOk;
+    }
+    ESP_LOGE(kLogTag, "Failed to reset timer %p. Name: %s", (void*)timer_handle_, name_buffer_);
+    return Status::kError;
+  }
+
+  Status ChangePeriod(std::chrono::milliseconds period) override {
+    if (timer_handle_ == nullptr) {
+        ESP_LOGE(kLogTag, "ChangePeriod() on uninitialized timer. Name: %s", name_buffer_);
+        return Status::kError;
+    }
+    if (period.count() <= 0) {
+        ESP_LOGW(kLogTag, "ChangePeriod() called with non-positive period. Name: %s", name_buffer_);
+        return Status::kInvalidParam;
+    }
+
+    TickType_t new_period_ticks = pdMS_TO_TICKS(period.count());
+    if (new_period_ticks == 0) new_period_ticks = 1; // Minimum 1 tick
+
+    if (xTimerChangePeriod(timer_handle_, new_period_ticks, 0) == pdPASS) {
+      period_ms_ = period;
+      // xTimerChangePeriod will start the timer if it was not active, given a non-zero block time.
+      // With 0 block time, its behavior on starting is less guaranteed if queue is full.
+      // It's safer to query actual state.
+      is_active_manually_tracked_ = (xTimerIsTimerActive(timer_handle_) != pdFALSE);
+      return Status::kOk;
+    }
+    ESP_LOGE(kLogTag, "Failed to change timer period for %p. Name: %s", (void*)timer_handle_, name_buffer_);
+    return Status::kError;
+  }
+
+  bool IsActive() const override {
+    if (timer_handle_ == nullptr) return false;
+    return (xTimerIsTimerActive(timer_handle_) != pdFALSE);
+  }
+
+  std::chrono::milliseconds GetPeriod() const override { return period_ms_; }
+
+  const char* GetName() const override { return name_buffer_; }
+
+  // Called by the static trampoline function
+  void InvokeCallback() {
+    if (user_callback_) {
+      ESP_LOGD(kLogTag, "Invoking callback for timer %s", name_buffer_);
+      user_callback_(user_callback_arg_);
+    }
+  }
+
+  bool IsValid() const { return timer_handle_ != nullptr; }
+
+ private:
+  TimerHandle_t timer_handle_;
+  std::chrono::milliseconds period_ms_;
+  TimerType type_;
+  Callback user_callback_;
+  void* user_callback_arg_;
+  // Use a fixed-size char array for the name, as FreeRTOS timer names are often limited.
+  // configMAX_TASK_NAME_LEN is often used for task names, timer names might be shorter
+  // or share similar constraints. Using a reasonable fixed size.
+  char name_buffer_[32]; // Max name length for timer (adjust if needed)
+  bool is_active_manually_tracked_; // To help track state after commands
+};
+
+}  // anonymous namespace
+
+std::unique_ptr<Timer> CreateTimer(const char* name,
+                                 std::chrono::milliseconds period,
+                                 TimerType type, Timer::Callback callback,
+                                 void* callback_arg) {
+  auto freertos_timer = std::make_unique<FreeRTOSTimer>(
+      name, period, type, std::move(callback), callback_arg);
+  if (!freertos_timer || !freertos_timer->IsValid()) {
+    ESP_LOGE(kLogTag, "Timer factory: FreeRTOSTimer creation failed. Name: %s", (name ? name : "Unnamed"));
+    return nullptr;
+  }
+  ESP_LOGD(kLogTag, "Timer factory: Created FreeRTOSTimer instance. Name: %s", (name ? name : freertos_timer->GetName()));
+  return freertos_timer;
+}
+
+}  // namespace osal
+
+--------------------------------------------------------------------------------------------------------------
+
+// osal_event_group_freertos.cpp
+#include "osal_event_group.h"
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/event_groups.h"
+#include "esp_log.h"
+
+namespace osal {
+namespace {  // Anonymous namespace
+
+static const char* kLogTag = "OsalEventGroup";
+
+class FreeRTOSEventGroup : public EventGroup {
+ public:
+  FreeRTOSEventGroup() : event_group_handle_(nullptr) {
+    event_group_handle_ = xEventGroupCreate();
+    if (event_group_handle_ == nullptr) {
+      ESP_LOGE(kLogTag, "Failed to create FreeRTOS event group!");
+    } else {
+      ESP_LOGD(kLogTag, "FreeRTOSEventGroup created: %p", (void*)event_group_handle_);
+    }
+  }
+
+  ~FreeRTOSEventGroup() override {
+    if (event_group_handle_ != nullptr) {
+      ESP_LOGD(kLogTag, "Deleting FreeRTOSEventGroup: %p", (void*)event_group_handle_);
+      vEventGroupDelete(event_group_handle_);
+      event_group_handle_ = nullptr;
+    }
+  }
+
+  EventBits SetBits(EventBits bits_to_set) override {
+    if (event_group_handle_ == nullptr) {
+        ESP_LOGE(kLogTag, "SetBits() on uninitialized event group!");
+        return 0; // Return 0 or defined error bits
+    }
+    return xEventGroupSetBits(event_group_handle_, bits_to_set);
+  }
+
+  EventBits ClearBits(EventBits bits_to_clear) override {
+    if (event_group_handle_ == nullptr) {
+        ESP_LOGE(kLogTag, "ClearBits() on uninitialized event group!");
+        return 0;
+    }
+    // FreeRTOS xEventGroupClearBits() returns the event bits value *before* the bits were cleared.
+    return xEventGroupClearBits(event_group_handle_, bits_to_clear);
+  }
+
+  EventBits WaitBits(EventBits bits_to_wait_for, bool clear_on_exit,
+                     bool wait_for_all,
+                     std::chrono::milliseconds timeout) override {
+    if (event_group_handle_ == nullptr) {
+        ESP_LOGE(kLogTag, "WaitBits() on uninitialized event group!");
+        return 0;
+    }
+    if (timeout.count() < 0) {
+        ESP_LOGW(kLogTag, "WaitBits() called with negative timeout.");
+        return 0; // Indicate error or invalid parameters
+    }
+
+    TickType_t ticks_to_wait = 0;
+    if (timeout.count() > 0) {
+        ticks_to_wait = pdMS_TO_TICKS(timeout.count());
+        if (ticks_to_wait == 0) ticks_to_wait = 1;
+    }
+    // If timeout.count() == 0, ticks_to_wait remains 0 (non-blocking check).
+
+    return xEventGroupWaitBits(
+        event_group_handle_, bits_to_wait_for,
+        clear_on_exit ? pdTRUE : pdFALSE,
+        wait_for_all ? pdTRUE : pdFALSE, ticks_to_wait);
+  }
+
+  Status SetBitsFromISR(EventBits bits_to_set,
+                        bool* higher_priority_task_woken) override {
+    if (event_group_handle_ == nullptr) {
+        ESP_LOGE(kLogTag, "SetBitsFromISR() on uninitialized event group!");
+        return Status::kError;
+    }
+
+    BaseType_t task_woken_freertos = pdFALSE;
+    // xEventGroupSetBitsFromISR returns the new value of the event group.
+    // It does not directly return an error status code like pdPASS/pdFAIL.
+    // We assume success if the handle is valid and the call is made.
+    xEventGroupSetBitsFromISR(event_group_handle_, bits_to_set, &task_woken_freertos);
+
+    if (higher_priority_task_woken != nullptr) {
+      *higher_priority_task_woken = (task_woken_freertos == pdTRUE);
+    }
+    return Status::kOk; // Assuming operation attempt is success.
+  }
+
+  EventBits GetBits() const override {
+    if (event_group_handle_ == nullptr) {
+        ESP_LOGE(kLogTag, "GetBits() on uninitialized event group!");
+        return 0;
+    }
+    // Can be called from ISR too
+    return xEventGroupGetBits(event_group_handle_);
+  }
+
+  bool IsValid() const { return event_group_handle_ != nullptr; }
+
+ private:
+  EventGroupHandle_t event_group_handle_;
+};
+
+}  // anonymous namespace
+
+std::unique_ptr<EventGroup> CreateEventGroup() {
+  auto freertos_eg = std::make_unique<FreeRTOSEventGroup>();
+  if (!freertos_eg || !freertos_eg->IsValid()) {
+    ESP_LOGE(kLogTag, "Event group factory: FreeRTOSEventGroup creation failed.");
+    return nullptr;
+  }
+  ESP_LOGD(kLogTag, "Event group factory: Created FreeRTOSEventGroup instance.");
+  return freertos_eg;
+}
+
+}  // namespace osal
+
+--------------------------------------------------------------------------------------------------
+
+// osal_task_freertos.cpp
+#include "osal_task.h"
+
+#include <string.h>  // For strncpy, strlen
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "esp_log.h" // For ESP-IDF logging
+
+namespace osal {
+namespace {  // Anonymous namespace for concrete implementation
+
+static const char* kLogTag = "OsalTask"; // Generic OSAL component log tag
+
+// Helper to map OSAL priorities to FreeRTOS priorities
+UBaseType_t MapOsalPriorityToFreeRtos(ThreadPriority priority) {
+  // configMAX_PRIORITIES is the number of priorities, so valid are 0 to N-1.
+  // This mapping is an example and should be tuned based on actual configMAX_PRIORITIES.
+  UBaseType_t max_freertos_priority = configMAX_PRIORITIES - 1;
+
+  // Handle edge case where FreeRTOS might be configured for only one priority level
+  if (max_freertos_priority == 0) {
+    if (priority != ThreadPriority::kPriorityLowest) {
+        ESP_LOGW(kLogTag, "FreeRTOS max priority is 0, mapping OSAL priority %d to 0.", static_cast<int>(priority));
+    }
+    return 0;
+  }
+
+  switch (priority) {
+    case ThreadPriority::kPriorityLowest:  return 0; // tskIDLE_PRIORITY is 0
+    case ThreadPriority::kPriority1:       return max_freertos_priority / 6; // Approximate
+    case ThreadPriority::kPriority2:       return max_freertos_priority / 3; // Approximate
+    case ThreadPriority::kPriority3:       return max_freertos_priority / 2; // Mid-point, "Normal"
+    case ThreadPriority::kPriority4:       return (max_freertos_priority * 2) / 3; // Approximate
+    case ThreadPriority::kPriority5:       return (max_freertos_priority * 5) / 6; // Approximate
+    case ThreadPriority::kPriorityHighest: return max_freertos_priority;
+    default:
+      ESP_LOGW(kLogTag, "Unhandled osal::ThreadPriority %d, defaulting to normal (RTOS prio: %lu).",
+               static_cast<int>(priority), (unsigned long)(max_freertos_priority / 2));
+      return max_freertos_priority / 2;
+  }
+}
+
+// Helper to map FreeRTOS priorities back to OSAL priorities (approximate)
+ThreadPriority MapFreeRtosPriorityToOsal(UBaseType_t freertos_priority) {
+    UBaseType_t max_freertos_priority = configMAX_PRIORITIES - 1;
+
+    if (max_freertos_priority == 0) return ThreadPriority::kPriorityLowest;
+
+    if (freertos_priority == 0) return ThreadPriority::kPriorityLowest;
+    if (freertos_priority >= max_freertos_priority) return ThreadPriority::kPriorityHighest;
+
+    // This is an approximate reverse mapping based on the forward mapping logic.
+    if (freertos_priority <= max_freertos_priority / 6) return ThreadPriority::kPriority1;
+    if (freertos_priority <= max_freertos_priority / 3) return ThreadPriority::kPriority2;
+    if (freertos_priority <= max_freertos_priority / 2) return ThreadPriority::kPriority3;
+    if (freertos_priority <= (max_freertos_priority * 2) / 3) return ThreadPriority::kPriority4;
+    // If freertos_priority < max_freertos_priority (and above prior threshold)
+    return ThreadPriority::kPriority5;
+}
+
+
+// Wrapper struct to hold user function and argument for FreeRTOS task
+struct TaskEntryPointArgs {
+  Task::EntryFunction user_function;
+  void* user_arg;
+  char task_name_copy[configMAX_TASK_NAME_LEN]; // To log name if task starts after OSAL obj is gone
+};
+
+// Trampoline C-style function for FreeRTOS task entry point
+static void FreeRTOSTaskEntryPoint(void* pvParameters) {
+  TaskEntryPointArgs* args = static_cast<TaskEntryPointArgs*>(pvParameters);
+  if (args == nullptr) {
+    ESP_LOGE(kLogTag, "FreeRTOSTaskEntryPoint received null pvParameters! Task cannot start.");
+    // This task will be stuck if it can't delete itself.
+    // If xTaskCreate succeeded, this is an issue.
+    // However, vTaskDelete(nullptr) should still work.
+    vTaskDelete(nullptr);
+    return; // Should not be reached
+  }
+
+  if (!args->user_function) {
+    ESP_LOGE(kLogTag, "FreeRTOSTaskEntryPoint for task '%s': user_function is null! Task self-deleting.", args->task_name_copy);
+    delete args; // Clean up allocated args
+    vTaskDelete(nullptr);
+    return; // Should not be reached
+  }
+
+  // Copy arguments to stack, then delete the heap-allocated struct
+  Task::EntryFunction exec_func = args->user_function;
+  void* exec_arg = args->user_arg;
+  char name_for_log[configMAX_TASK_NAME_LEN];
+  strncpy(name_for_log, args->task_name_copy, configMAX_TASK_NAME_LEN -1);
+  name_for_log[configMAX_TASK_NAME_LEN -1] = '\0';
+
+  delete args; // Args structure is no longer needed from the heap
+
+  ESP_LOGD(kLogTag, "Task '%s' (native handle: %p) starting user function.",
+           name_for_log, (void*)xTaskGetCurrentTaskHandle());
+
+  exec_func(exec_arg); // Execute the user's task function
+
+  ESP_LOGD(kLogTag, "Task '%s' (native handle: %p) user function returned. Task will self-delete.",
+           name_for_log, (void*)xTaskGetCurrentTaskHandle());
+
+  // If the task function returns, FreeRTOS requires it to be explicitly deleted.
+  vTaskDelete(nullptr); // Delete the calling task (itself).
+}
+
+class FreeRTOSTask : public Task {
+ public:
+  // Constructor takes an existing FreeRTOS task handle.
+  // This is used by the factory after xTaskCreate.
+  FreeRTOSTask(TaskHandle_t handle, const char* name)
+      : task_handle_(handle) {
+        if (name != nullptr && name[0] != '\0') {
+            strncpy(name_buffer_, name, sizeof(name_buffer_) - 1);
+            name_buffer_[sizeof(name_buffer_) - 1] = '\0';
+        } else {
+            // Try to get name from FreeRTOS if handle is valid, otherwise default
+            if (task_handle_ != nullptr) {
+                const char* rtos_name = pcTaskGetName(task_handle_); // Can be NULL if task is deleting
+                if (rtos_name != nullptr && rtos_name[0] != '\0') {
+                    strncpy(name_buffer_, rtos_name, sizeof(name_buffer_) - 1);
+                    name_buffer_[sizeof(name_buffer_) - 1] = '\0';
+                } else {
+                     snprintf(name_buffer_, sizeof(name_buffer_), "OsalTask@%p", static_cast<void*>(task_handle_));
+                }
+            } else {
+                 snprintf(name_buffer_, sizeof(name_buffer_), "InvalidOsalTask");
+            }
+        }
+
+        if (task_handle_ != nullptr) {
+            ESP_LOGD(kLogTag, "FreeRTOSTask wrapper created for handle %p, Name: '%s'", (void*)task_handle_, name_buffer_);
+        } else {
+            // This case should ideally be prevented by the factory returning nullptr
+            ESP_LOGE(kLogTag, "FreeRTOSTask wrapper created with NULL handle! Name set to: '%s'", name_buffer_);
+        }
+  }
+
+  ~FreeRTOSTask() override {
+    // The underlying FreeRTOS task self-deletes when its entry function (FreeRTOSTaskEntryPoint) returns.
+    // The OSAL Task C++ object's destructor is primarily for cleaning up this C++ wrapper.
+    // It should NOT attempt to delete task_handle_ here because:
+    // 1. The task might still be running. Deleting it abruptly via vTaskDelete from another context
+    //    can lead to resource leaks or undefined behavior if the task isn't prepared for it.
+    // 2. The task might have already self-deleted, making task_handle_ stale/invalid.
+    //    Calling vTaskDelete on a stale handle is dangerous.
+    // If an explicit "stop and join" or "force delete" mechanism is added to the OSAL Task interface,
+    // that would be the place to interact with vTaskDelete for other tasks.
+    ESP_LOGD(kLogTag, "Destroying FreeRTOSTask C++ wrapper for task '%s' (native handle was %p). Underlying RTOS task manages its own deletion upon function completion.",
+             name_buffer_, (void*)task_handle_);
+    task_handle_ = nullptr; // Invalidate our copy of the handle.
+  }
+
+  const char* GetName() const override {
+      return name_buffer_;
+  }
+
+  ThreadPriority GetPriority() const override {
+    if (task_handle_ == nullptr) {
+        ESP_LOGW(kLogTag, "GetPriority() on invalid/stale task handle for task originally named '%s'. Returning lowest.", name_buffer_);
+        return ThreadPriority::kPriorityLowest;
+    }
+    return MapFreeRtosPriorityToOsal(uxTaskPriorityGet(task_handle_));
+  }
+
+  Status SetPriority(ThreadPriority priority) override {
+    if (task_handle_ == nullptr) {
+        ESP_LOGE(kLogTag, "SetPriority() on invalid/stale task handle for task originally named '%s'.", name_buffer_);
+        return Status::kError; // Or kNotFound if handle is stale meaning task ended
+    }
+    UBaseType_t new_freertos_priority = MapOsalPriorityToFreeRtos(priority);
+    vTaskPrioritySet(task_handle_, new_freertos_priority);
+    ESP_LOGD(kLogTag, "Set priority for task '%s' (handle %p) to OSAL %d (RTOS %lu)",
+             name_buffer_, (void*)task_handle_, static_cast<int>(priority), (unsigned long)new_freertos_priority);
+    return Status::kOk;
+  }
+
+  Status Suspend() override {
+    if (task_handle_ == nullptr) {
+        ESP_LOGE(kLogTag, "Suspend() on invalid/stale task handle for task originally named '%s'.", name_buffer_);
+        return Status::kError;
+    }
+    vTaskSuspend(task_handle_);
+    ESP_LOGD(kLogTag, "Suspended task '%s' (handle %p)", name_buffer_, (void*)task_handle_);
+    return Status::kOk;
+  }
+
+  Status Resume() override {
+    if (task_handle_ == nullptr) {
+        ESP_LOGE(kLogTag, "Resume() on invalid/stale task handle for task originally named '%s'.", name_buffer_);
+        return Status::kError;
+    }
+    // xTaskResumeFromISR must be used if called from an ISR.
+    // This OSAL method is assumed to be called from task context by design.
+    // If Resume could be called from ISR, the interface would need a different method or context check.
+    if (xPortIsInISR()) {
+        ESP_LOGD(kLogTag, "Resuming task '%s' (handle %p) from ISR context.", name_buffer_, (void*)task_handle_);
+        BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+        xTaskResumeFromISR(task_handle_);
+        // If a context switch is required, portYIELD_FROM_ISR should be called by the ISR
+        // after all ISR processing is complete. This OSAL function can't do that.
+        // The boolean *pxHigherPriorityTaskWoken is typically for queue/sem FromISR functions.
+        // xTaskResumeFromISR itself returns BaseType_t indicating if task was unblocked.
+    } else {
+        ESP_LOGD(kLogTag, "Resuming task '%s' (handle %p) from task context.", name_buffer_, (void*)task_handle_);
+        vTaskResume(task_handle_);
+    }
+    return Status::kOk;
+  }
+
+  uint32_t GetStackHighWaterMark() const override {
+    if (task_handle_ == nullptr) {
+        ESP_LOGW(kLogTag, "GetStackHighWaterMark() on invalid/stale task handle for task originally named '%s'. Returning 0.", name_buffer_);
+        return 0;
+    }
+    // uxTaskGetStackHighWaterMark returns remaining stack in words (StackType_t units).
+    // Multiply by sizeof(StackType_t) to get bytes.
+    return uxTaskGetStackHighWaterMark(task_handle_) * sizeof(StackType_t);
+  }
+
+  void* GetNativeHandle() const override {
+    return static_cast<void*>(task_handle_);
+  }
+
+  bool IsValid() const {
+    // A task handle could become invalid if the task self-deletes.
+    // There isn't a standard FreeRTOS way to check if a TaskHandle_t is "stale"
+    // other than knowing the task's lifecycle.
+    // For this OSAL object, "IsValid" primarily means the handle was successfully obtained at creation.
+    return task_handle_ != nullptr;
+  }
+
+ private:
+  TaskHandle_t task_handle_;
+  // Store name locally as pcTaskGetName can be slow or task might be deleted making handle invalid.
+  char name_buffer_[configMAX_TASK_NAME_LEN];
+};
+
+}  // anonymous namespace
+
+// --- Static Task utility functions implementation ---
+void Task::Delay(std::chrono::milliseconds duration) {
+  if (duration.count() < 0) {
+      ESP_LOGW(kLogTag, "Task::Delay called with negative duration: %lld ms. No delay performed.", (long long)duration.count());
+      return;
+  }
+  TickType_t ticks_to_delay = 0;
+  if (duration.count() > 0) {
+      ticks_to_delay = pdMS_TO_TICKS(duration.count());
+      if (ticks_to_delay == 0) {
+          // Ensure a minimum delay of 1 tick if duration.count() > 0 but rounds to 0 ticks.
+          // This ensures the scheduler runs and other tasks get a chance.
+          ticks_to_delay = 1;
+      }
+  }
+  vTaskDelay(ticks_to_delay);
+}
+
+void Task::Yield() { taskYIELD(); }
+
+void Task::EnterCritical() { taskENTER_CRITICAL(); }
+
+void Task::ExitCritical() { taskEXIT_CRITICAL(); }
+
+
+// Factory Function
+std::unique_ptr<Task> CreateTask(const TaskParams& params) {
+  if (!params.entry_function) {
+    ESP_LOGE(kLogTag, "Task factory: entry_function cannot be null.");
+    return nullptr;
+  }
+
+  // ESP-IDF's xTaskCreate takes stack size in bytes.
+  // configMINIMAL_STACK_SIZE is in words. So, min_stack_bytes = configMINIMAL_STACK_SIZE * sizeof(StackType_t)
+  // A practical minimum for C++ tasks on ESP32 is often higher (e.g., 2048-4096 bytes).
+  // This check is illustrative; specific application needs dictate stack size.
+  uint32_t min_practical_stack_bytes = (configMINIMAL_STACK_SIZE * sizeof(StackType_t)) > 2048 ?
+                                       (configMINIMAL_STACK_SIZE * sizeof(StackType_t)) : 2048;
+  if (params.stack_size_bytes < min_practical_stack_bytes) {
+    ESP_LOGW(kLogTag, "Task factory: stack_size_bytes %lu for task '%s' is less than recommended minimum %u bytes. Proceeding, but monitor stack usage.",
+             (unsigned long)params.stack_size_bytes, params.name ? params.name : "UnnamedOsal", (unsigned int)min_practical_stack_bytes);
+  }
+   if (params.stack_size_bytes == 0) {
+        ESP_LOGE(kLogTag, "Task factory: stack_size_bytes for task '%s' cannot be zero.", params.name ? params.name : "UnnamedOsal");
+        return nullptr;
+    }
+
+
+  // TaskEntryPointArgs must live until the new task starts and copies them.
+  // It's allocated on the heap and FreeRTOSTaskEntryPoint is responsible for deleting it.
+  TaskEntryPointArgs* entry_args = new (std::nothrow) TaskEntryPointArgs;
+  if (!entry_args) {
+    ESP_LOGE(kLogTag, "Task factory: Failed to allocate memory for TaskEntryPointArgs for task '%s'.", params.name ? params.name : "UnnamedOsal");
+    return nullptr;
+  }
+  entry_args->user_function = params.entry_function;
+  entry_args->user_arg = params.arg;
+  if (params.name) {
+    strncpy(entry_args->task_name_copy, params.name, configMAX_TASK_NAME_LEN -1);
+    entry_args->task_name_copy[configMAX_TASK_NAME_LEN-1] = '\0';
+  } else {
+    strcpy(entry_args->task_name_copy, "UnnamedOsalInArgs");
+  }
+
+
+  TaskHandle_t task_handle = nullptr;
+  BaseType_t result = xTaskCreate(
+      FreeRTOSTaskEntryPoint,                     // Task function (trampoline)
+      params.name ? params.name : "UnnamedOsal",  // Task name for RTOS
+      params.stack_size_bytes,                    // Stack depth in BYTES for ESP-IDF xTaskCreate
+      static_cast<void*>(entry_args),             // Parameters for task (TaskEntryPointArgs*)
+      MapOsalPriorityToFreeRtos(params.priority), // Priority
+      &task_handle);                              // Task handle output
+
+  if (result != pdPASS || task_handle == nullptr) {
+    ESP_LOGE(kLogTag, "Task factory: Failed to create FreeRTOS task. Name: '%s', FreeRTOS Error Code: %ld",
+             params.name ? params.name : "UnnamedOsal", (long)result);
+    delete entry_args;  // IMPORTANT: Clean up allocated entry_args if task creation itself failed.
+    return nullptr;
+  }
+
+  // If xTaskCreate succeeded, entry_args is now effectively owned by the new task's
+  // lifecycle (it will be deleted by FreeRTOSTaskEntryPoint).
+
+  auto freertos_task_obj = std::make_unique<FreeRTOSTask>(task_handle, params.name);
+  // The FreeRTOSTask constructor logs if task_handle is somehow null,
+  // but xTaskCreate's success should mean task_handle is valid.
+  // This check on the wrapper is mostly for the wrapper's internal state if it had complex construction.
+  if (!freertos_task_obj || !freertos_task_obj->IsValid()) {
+     ESP_LOGE(kLogTag, "Task factory: Failed to create FreeRTOSTask C++ wrapper object for task '%s' even though xTaskCreate succeeded. This is unexpected. Deleting underlying FreeRTOS task.",
+             params.name ? params.name : "UnnamedOsal");
+    // The FreeRTOS task was created. If the C++ wrapper fails (e.g. C++ heap exhausted for the wrapper itself),
+    // we should delete the orphaned FreeRTOS task.
+    vTaskDelete(task_handle);
+    // entry_args in this specific error path: The created task might start and try to access
+    // entry_args after vTaskDelete is called on its handle. This is a tricky race.
+    // Ideally, FreeRTOSTask construction should be no-fail if task_handle is valid.
+    // If entry_args is not deleted here, and the task is deleted before it runs/deletes entry_args, it's a leak.
+    // If task runs and then its handle is deleted, it will try to delete args.
+    // It's safer if the FreeRTOSTask constructor can't fail in a way that make_unique returns nullptr
+    // *after* xTaskCreate has succeeded and task_handle is valid.
+    // Given make_unique, this would only be if FreeRTOSTask constructor throws,
+    // or if `new FreeRTOSTask` returns nullptr (if nothrow new used implicitly by make_unique variant).
+    // Assuming standard `make_unique` which throws `std::bad_alloc`.
+    return nullptr;
+  }
+
+  ESP_LOGI(kLogTag, "Task factory: Successfully created FreeRTOS task '%s' (OSAL obj: %p, native handle: %p)",
+           freertos_task_obj->GetName(), static_cast<void*>(freertos_task_obj.get()), (void*)task_handle);
+  return freertos_task_obj;
+}
+
+}  // namespace osal
+-------------------------------------------------
