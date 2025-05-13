@@ -1,0 +1,878 @@
+// osal_status.h
+#ifndef OSAL_STATUS_H_
+#define OSAL_STATUS_H_
+
+/**
+ * @file osal_status.h
+ * @brief Defines common status codes for OSAL operations.
+ */
+
+namespace osal {
+
+/**
+ * @brief Enumerates the possible status codes returned by OSAL functions.
+ *
+ * This enumeration provides a platform-agnostic way to represent the outcome
+ * of OSAL operations.
+ */
+enum class Status {
+  kOk,             ///< Operation completed successfully.
+  kError,          ///< A generic or unspecified error occurred.
+  kTimeout,        ///< The operation timed out before completion.
+  kInvalidParam,   ///< An invalid parameter was provided to the function.
+  kOutOfMemory,    ///< The operation failed due to insufficient memory.
+  kAlreadyExists,  ///< The resource being created already exists.
+  kNotFound,       ///< The requested resource was not found.
+  kUnavailable,    ///< The resource is temporarily unavailable (e.g., mutex
+                   ///< locked, queue full/empty without timeout).
+  kNotSupported,   ///< The requested operation is not supported by the
+                   ///< underlying implementation.
+  kBusy,           ///< The resource is busy and cannot perform the operation
+                   ///< at this time.
+};
+
+}  // namespace osal
+
+#endif  // OSAL_STATUS_H_
+
+-------------------------------------------------------------------------
+
+// osal_mutex.h
+#ifndef OSAL_MUTEX_H_
+#define OSAL_MUTEX_H_
+
+#include <chrono>
+#include <memory>  // For std::unique_ptr
+
+#include "osal_status.h"
+
+/**
+ * @file osal_mutex.h
+ * @brief Abstract interface for a mutual exclusion (Mutex) primitive.
+ */
+
+namespace osal {
+
+/**
+ * @brief Provides an abstract interface for a mutual exclusion lock (Mutex).
+ *
+ * A Mutex is used to protect shared resources from concurrent access by
+ * multiple threads. Only one thread can own the mutex at any given time.
+ * This interface defines non-recursive mutex behavior.
+ */
+class Mutex {
+ public:
+  /**
+   * @brief Virtual destructor.
+   * Ensures proper cleanup of derived concrete mutex implementations.
+   */
+  virtual ~Mutex() = default;
+
+  /**
+   * @brief Acquires the mutex lock.
+   *
+   * If the mutex is already locked by another thread, the calling thread will
+   * block until the mutex becomes available.
+   */
+  virtual void Lock() = 0;
+
+  /**
+   * @brief Attempts to acquire the mutex lock without blocking.
+   *
+   * @return Status::kOk if the mutex was successfully acquired.
+   * @return Status::kUnavailable if the mutex is currently locked by another
+   * thread.
+   * @return Status::kError for other underlying system errors.
+   */
+  virtual Status TryLock() = 0;
+
+  /**
+   * @brief Attempts to acquire the mutex lock, blocking for a specified
+   * duration.
+   *
+   * @param timeout The maximum duration to wait for the lock.
+   * @return Status::kOk if the mutex was successfully acquired.
+   * @return Status::kTimeout if the timeout duration expired before the mutex
+   * could be acquired.
+   * @return Status::kError for other underlying system errors.
+   */
+  virtual Status TryLockFor(std::chrono::milliseconds timeout) = 0;
+
+  /**
+   * @brief Releases the mutex lock.
+   *
+   * The mutex must be currently owned by the calling thread.
+   */
+  virtual void Unlock() = 0;
+
+ protected:
+  /**
+   * @brief Default constructor.
+   * Protected to prevent direct instantiation of the abstract class.
+   */
+  Mutex() = default;
+
+  // Disallow copy and move operations.
+  Mutex(const Mutex&) = delete;
+  Mutex& operator=(const Mutex&) = delete;
+  Mutex(Mutex&&) = delete;
+  Mutex& operator=(Mutex&&) = delete;
+};
+
+/**
+ * @brief Factory function to create a platform-specific Mutex instance.
+ *
+ * The caller receives ownership of the created Mutex object, encapsulated
+ * in a std::unique_ptr for automatic memory management.
+ *
+ * @return A std::unique_ptr containing the created Mutex object, or
+ * std::unique_ptr(nullptr) if creation failed.
+ */
+std::unique_ptr<Mutex> CreateMutex();
+
+}  // namespace osal
+
+#endif  // OSAL_MUTEX_H_
+
+-------------------------------------------------------------------------
+
+// osal_semaphore.h
+#ifndef OSAL_SEMAPHORE_H_
+#define OSAL_SEMAPHORE_H_
+
+#include <chrono>
+#include <cstdint>
+#include <memory>  // For std::unique_ptr
+
+#include "osal_status.h"
+
+/**
+ * @file osal_semaphore.h
+ * @brief Abstract interface for Semaphore primitives (binary and counting).
+ */
+
+namespace osal {
+
+/**
+ * @brief Provides an abstract interface for a semaphore.
+ *
+ * Semaphores are synchronization primitives that can be used to control access
+ * to a shared resource or to signal the occurrence of an event. This interface
+ * supports both binary and counting semaphores, distinguished at creation time.
+ */
+class Semaphore {
+ public:
+  /**
+   * @brief Virtual destructor.
+   * Ensures proper cleanup of derived concrete semaphore implementations.
+   */
+  virtual ~Semaphore() = default;
+
+  /**
+   * @brief Acquires (takes or waits for) the semaphore.
+   *
+   * If the semaphore's internal count is greater than zero, the count is
+   * decremented, and the function returns immediately. If the count is zero,
+   * the calling thread blocks until the semaphore becomes available or the
+   * specified timeout elapses.
+   *
+   * @param timeout The maximum duration to wait for the semaphore.
+   * A zero timeout means try once and return immediately.
+   * @return Status::kOk if the semaphore was successfully acquired.
+   * @return Status::kTimeout if the timeout duration expired.
+   * @return Status::kUnavailable if timeout was zero and semaphore was not
+   * available.
+   * @return Status::kError for other underlying system errors.
+   */
+  virtual Status Acquire(std::chrono::milliseconds timeout) = 0;
+
+  /**
+   * @brief Releases (gives or posts) the semaphore.
+   *
+   * Increments the semaphore's internal count. If any threads are blocked
+   * waiting for this semaphore, one of them will be unblocked.
+   *
+   * @return Status::kOk if the semaphore was successfully released.
+   * @return Status::kError if releasing would cause the count to exceed its
+   * maximum defined limit (for counting semaphores) or other errors.
+   */
+  virtual Status Release() = 0;
+
+  /**
+   * @brief Gets the current count of the semaphore.
+   *
+   * @return The current semaphore count.
+   * @note The value returned is a snapshot.
+   */
+  virtual uint32_t GetCount() const = 0;
+
+ protected:
+  /**
+   * @brief Default constructor.
+   * Protected to prevent direct instantiation of the abstract class.
+   */
+  Semaphore() = default;
+
+  // Disallow copy and move operations.
+  Semaphore(const Semaphore&) = delete;
+  Semaphore& operator=(const Semaphore&) = delete;
+  Semaphore(Semaphore&&) = delete;
+  Semaphore& operator=(Semaphore&&) = delete;
+};
+
+/**
+ * @brief Factory function to create a platform-specific binary Semaphore.
+ *
+ * @param initially_signaled If true, the semaphore is created with a count of 1
+ * (signaled state). If false, it's created with a count of 0.
+ * @return A std::unique_ptr containing the created binary Semaphore object, or
+ * std::unique_ptr(nullptr) if creation failed.
+ */
+std::unique_ptr<Semaphore> CreateBinarySemaphore(bool initially_signaled);
+
+/**
+ * @brief Factory function to create a platform-specific counting Semaphore.
+ *
+ * @param max_count The maximum count for the semaphore. Must be > 0.
+ * @param initial_count The initial count for the semaphore. Must be <=
+ * max_count.
+ * @return A std::unique_ptr containing the created counting Semaphore object, or
+ * std::unique_ptr(nullptr) if creation failed.
+ */
+std::unique_ptr<Semaphore> CreateCountingSemaphore(uint32_t max_count,
+                                                 uint32_t initial_count);
+
+}  // namespace osal
+
+#endif  // OSAL_SEMAPHORE_H_
+
+--------------------------------------------------------------------------------
+
+// osal_queue.h
+#ifndef OSAL_QUEUE_H_
+#define OSAL_QUEUE_H_
+
+#include <chrono>
+#include <cstddef>  // For size_t
+#include <cstdint>
+#include <memory>   // For std::unique_ptr
+
+#include "osal_status.h"
+
+/**
+ * @file osal_queue.h
+ * @brief Abstract interface for a thread-safe message Queue.
+ */
+
+namespace osal {
+
+/**
+ * @brief Provides an abstract interface for a thread-safe message queue.
+ *
+ * Queues are used for inter-thread communication, allowing fixed-size data
+ * items to be sent from one thread and received by another in a FIFO manner.
+ */
+class Queue {
+ public:
+  /**
+   * @brief Virtual destructor.
+   * Ensures proper cleanup of derived concrete queue implementations.
+   */
+  virtual ~Queue() = default;
+
+  /**
+   * @brief Sends an item to the back of the queue.
+   *
+   * The item pointed to by `item_ptr` is copied into the queue.
+   * If the queue is full, this call blocks until space is available or timeout.
+   *
+   * @param item_ptr Pointer to the item to be sent. Must not be nullptr.
+   * @param timeout The maximum duration to wait if the queue is full.
+   * @return Status::kOk if the item was successfully sent.
+   * @return Status::kTimeout if timeout expired (queue remained full).
+   * @return Status::kUnavailable if timeout was zero and queue was full.
+   * @return Status::kInvalidParam if `item_ptr` is nullptr or timeout is
+   * negative.
+   * @return Status::kError for other underlying system errors.
+   */
+  virtual Status Send(const void* item_ptr,
+                      std::chrono::milliseconds timeout) = 0;
+
+  /**
+   * @brief Receives an item from the front of the queue.
+   *
+   * The received item is copied into the buffer pointed to by `buffer_ptr`.
+   * If the queue is empty, this call blocks until an item is available or
+   * timeout.
+   *
+   * @param buffer_ptr Pointer to a buffer for the received item. Must not be
+   * nullptr.
+   * @param timeout The maximum duration to wait if the queue is empty.
+   * @return Status::kOk if an item was successfully received.
+   * @return Status::kTimeout if timeout expired (queue remained empty).
+   * @return Status::kUnavailable if timeout was zero and queue was empty.
+   * @return Status::kInvalidParam if `buffer_ptr` is nullptr or timeout is
+   * negative.
+   * @return Status::kError for other underlying system errors.
+   */
+  virtual Status Receive(void* buffer_ptr,
+                         std::chrono::milliseconds timeout) = 0;
+
+  /**
+   * @brief Sends an item to the back of the queue from an ISR.
+   *
+   * This version is safe for ISR context and must not block.
+   *
+   * @param item_ptr Pointer to the item to be sent. Must not be nullptr.
+   * @param[out] higher_priority_task_woken Optional. If not nullptr, set to
+   * true if sending unblocked a higher priority task.
+   * @return Status::kOk if the item was successfully sent.
+   * @return Status::kUnavailable if the queue is full.
+   * @return Status::kInvalidParam if `item_ptr` is nullptr.
+   * @return Status::kError for other underlying system errors.
+   */
+  virtual Status SendFromISR(const void* item_ptr,
+                             bool* higher_priority_task_woken) = 0;
+
+  /**
+   * @brief Receives an item from the front of the queue from an ISR.
+   *
+   * This version is safe for ISR context and must not block.
+   *
+   * @param buffer_ptr Pointer to the buffer for the received item. Must not be
+   * nullptr.
+   * @param[out] higher_priority_task_woken Optional. If not nullptr, set to
+   * true if receiving unblocked a higher priority task.
+   * @return Status::kOk if an item was successfully received.
+   * @return Status::kUnavailable if the queue is empty.
+   * @return Status::kInvalidParam if `buffer_ptr` is nullptr.
+   * @return Status::kError for other underlying system errors.
+   */
+  virtual Status ReceiveFromISR(void* buffer_ptr,
+                                bool* higher_priority_task_woken) = 0;
+
+  /**
+   * @brief Returns the number of items currently stored in the queue.
+   * @return The number of items in the queue.
+   */
+  virtual size_t GetMessageCount() const = 0;
+
+  /**
+   * @brief Returns the maximum number of items the queue can hold.
+   * @return The capacity of the queue.
+   */
+  virtual size_t GetCapacity() const = 0;
+
+  /**
+   * @brief Returns the size (in bytes) of each item stored in the queue.
+   * @return The item size in bytes.
+   */
+  virtual size_t GetItemSize() const = 0;
+
+  /**
+   * @brief Checks if the queue is currently empty.
+   * @return True if the queue contains no items, false otherwise.
+   */
+  virtual bool IsEmpty() const = 0;
+
+  /**
+   * @brief Checks if the queue is currently full.
+   * @return True if the queue is at its maximum capacity, false otherwise.
+   */
+  virtual bool IsFull() const = 0;
+
+  /**
+   * @brief Resets the queue to its initial empty state, discarding all items.
+   * @return Status::kOk if the queue was successfully reset.
+   * @return Status::kError for underlying system errors.
+   */
+  virtual Status Reset() = 0;
+
+ protected:
+  /**
+   * @brief Default constructor.
+   * Protected to prevent direct instantiation of the abstract class.
+   */
+  Queue() = default;
+
+  // Disallow copy and move operations.
+  Queue(const Queue&) = delete;
+  Queue& operator=(const Queue&) = delete;
+  Queue(Queue&&) = delete;
+  Queue& operator=(Queue&&) = delete;
+};
+
+/**
+ * @brief Factory function to create a platform-specific Queue instance.
+ *
+ * @param item_count The maximum number of items the queue can hold. Must be > 0.
+ * @param item_size The size (in bytes) of each item in the queue. Must be > 0.
+ * @return A std::unique_ptr containing the created Queue object, or
+ * std::unique_ptr(nullptr) if creation failed.
+ */
+std::unique_ptr<Queue> CreateQueue(size_t item_count, size_t item_size);
+
+}  // namespace osal
+
+#endif  // OSAL_QUEUE_H_
+
+-------------------------------------------------------------------------------------
+
+// osal_timer.h
+#ifndef OSAL_TIMER_H_
+#define OSAL_TIMER_H_
+
+#include <chrono>
+#include <cstdint>
+#include <functional>  // For std::function
+#include <memory>      // For std::unique_ptr
+#include <string>      // For std::string, though const char* for name
+
+#include "osal_status.h"
+
+/**
+ * @file osal_timer.h
+ * @brief Abstract interface for software Timer primitives.
+ */
+
+namespace osal {
+
+/**
+ * @brief Defines the operational type of a software timer.
+ */
+enum class TimerType {
+  kOneShot,  ///< The timer will fire once then stop.
+  kPeriodic  ///< The timer will fire repeatedly at its period.
+};
+
+/**
+ * @brief Provides an abstract interface for a software timer.
+ *
+ * Software timers execute a user-defined callback function upon expiration.
+ * Timer callbacks typically execute in a dedicated timer service task/thread.
+ */
+class Timer {
+ public:
+  /**
+   * @brief Defines the signature for the timer callback function.
+   * @param timer_arg A user-defined argument passed at timer creation.
+   */
+  using Callback = std::function<void(void* timer_arg)>;
+
+  /**
+   * @brief Virtual destructor.
+   * Ensures proper cleanup, potentially stopping the timer if active.
+   */
+  virtual ~Timer() = default;
+
+  /**
+   * @brief Starts or restarts the timer.
+   * If already running, its expiry time is typically reset.
+   * @return Status::kOk if the timer was successfully started/restarted.
+   * @return Status::kError for underlying system errors.
+   */
+  virtual Status Start() = 0;
+
+  /**
+   * @brief Stops the timer.
+   * If already stopped, this function typically has no effect.
+   * @return Status::kOk if the timer was successfully stopped or was already
+   * stopped.
+   * @return Status::kError for underlying system errors.
+   */
+  virtual Status Stop() = 0;
+
+  /**
+   * @brief Resets the timer.
+   * Reloads the timer with its original period and restarts it if it was
+   * running, or prepares it for a future Start if stopped.
+   * @return Status::kOk if the timer was successfully reset.
+   * @return Status::kError for underlying system errors.
+   */
+  virtual Status Reset() = 0;
+
+  /**
+   * @brief Changes the period of the timer.
+   * The effect on a running timer (e.g., immediate, after next expiry) is
+   * implementation-dependent.
+   * @param period The new period for the timer. Must be positive.
+   * @return Status::kOk if the period was successfully changed.
+   * @return Status::kInvalidParam if the period is non-positive.
+   * @return Status::kError for other underlying system errors.
+   */
+  virtual Status ChangePeriod(std::chrono::milliseconds period) = 0;
+
+  /**
+   * @brief Checks if the timer is currently active (running).
+   * @return True if the timer is active, false otherwise.
+   */
+  virtual bool IsActive() const = 0;
+
+  /**
+   * @brief Gets the configured period of the timer.
+   * @return The timer period.
+   */
+  virtual std::chrono::milliseconds GetPeriod() const = 0;
+
+  /**
+   * @brief Gets the name assigned to the timer, if any.
+   * @return A C-string representing the timer's name (e.g., for debugging).
+   * May be nullptr or empty. Lifetime managed by the Timer.
+   */
+  virtual const char* GetName() const = 0;
+
+ protected:
+  /**
+   * @brief Default constructor.
+   * Protected to prevent direct instantiation of the abstract class.
+   */
+  Timer() = default;
+
+  // Disallow copy and move operations.
+  Timer(const Timer&) = delete;
+  Timer& operator=(const Timer&) = delete;
+  Timer(Timer&&) = delete;
+  Timer& operator=(Timer&&) = delete;
+};
+
+/**
+ * @brief Factory function to create a platform-specific software Timer.
+ *
+ * @param name A descriptive name for the timer (can be nullptr or empty).
+ * @param period The period for the timer. Must be positive.
+ * @param type Specifies whether the timer is kOneShot or kPeriodic.
+ * @param callback The function to be executed when the timer expires. Must not
+ * be an empty std::function.
+ * @param callback_arg A user-defined argument passed to the `callback`.
+ * @return A std::unique_ptr containing the created Timer object, or
+ * std::unique_ptr(nullptr) if creation failed.
+ */
+std::unique_ptr<Timer> CreateTimer(const char* name,
+                                 std::chrono::milliseconds period,
+                                 TimerType type, Timer::Callback callback,
+                                 void* callback_arg);
+
+}  // namespace osal
+
+#endif  // OSAL_TIMER_H_
+
+------------------------------------------------------------------------------------
+
+// osal_event_group.h
+#ifndef OSAL_EVENT_GROUP_H_
+#define OSAL_EVENT_GROUP_H_
+
+#include <chrono>
+#include <cstdint>
+#include <memory>  // For std::unique_ptr
+
+#include "osal_status.h"
+
+/**
+ * @file osal_event_group.h
+ * @brief Abstract interface for Event Group primitives.
+ */
+
+namespace osal {
+
+/**
+ * @brief Defines the type used for event bits within an event group.
+ * Each bit typically represents a distinct event flag.
+ */
+using EventBits = uint32_t;
+
+/**
+ * @brief Provides an abstract interface for an event group.
+ *
+ * Event groups allow tasks to wait for a combination of one or more events
+ * (represented by bits) to occur.
+ */
+class EventGroup {
+ public:
+  /**
+   * @brief Virtual destructor.
+   * Ensures proper cleanup of derived concrete event group implementations.
+   */
+  virtual ~EventGroup() = default;
+
+  /**
+   * @brief Sets one or more event bits in the event group.
+   * Unblocks tasks whose wait conditions are now met.
+   * @param bits_to_set A bitmask of the event bits to set.
+   * @return The state of event group bits *after* the set operation.
+   * A return of 0 on error might be platform specific; checking
+   * an additional status may be more robust if the API allowed.
+   */
+  virtual EventBits SetBits(EventBits bits_to_set) = 0;
+
+  /**
+   * @brief Clears one or more event bits in the event group.
+   * @param bits_to_clear A bitmask of the event bits to clear.
+   * @return The state of event group bits *before* the clear operation (common
+   * RTOS behavior).
+   */
+  virtual EventBits ClearBits(EventBits bits_to_clear) = 0;
+
+  /**
+   * @brief Waits for a specific combination of event bits to be set.
+   * Blocks the calling task until specified bits are set or timeout.
+   *
+   * @param bits_to_wait_for The bitmask of event bits to wait for.
+   * @param clear_on_exit If true, bits that caused the wait to complete are
+   * atomically cleared before returning.
+   * @param wait_for_all If true, waits for *all* bits in `bits_to_wait_for`.
+   * If false, waits for *any* bit.
+   * @param timeout The maximum duration to wait. Zero means check once.
+   * @return The state of event group bits when the function returns.
+   * Caller must check if the desired bits are set, especially on
+   * timeout. A return value of 0 often indicates a timeout or error in
+   * underlying APIs if no bits were set that met the condition.
+   */
+  virtual EventBits WaitBits(EventBits bits_to_wait_for, bool clear_on_exit,
+                             bool wait_for_all,
+                             std::chrono::milliseconds timeout) = 0;
+
+  /**
+   * @brief Sets one or more event bits in the event group from an ISR.
+   * This version is safe for ISR context and must not block.
+   * @param bits_to_set A bitmask of the event bits to set.
+   * @param[out] higher_priority_task_woken Optional. If not nullptr, set to
+   * true if setting bits unblocked a higher priority task.
+   * @return Status::kOk if bits were attempted to be set (actual bit change
+   * depends on underlying OS).
+   * @return Status::kError for underlying system errors (e.g., invalid handle).
+   */
+  virtual Status SetBitsFromISR(EventBits bits_to_set,
+                                bool* higher_priority_task_woken) = 0;
+
+  /**
+   * @brief Gets the current value of all bits in the event group.
+   * @return The current state of all event bits.
+   */
+  virtual EventBits GetBits() const = 0;
+
+ protected:
+  /**
+   * @brief Default constructor.
+   * Protected to prevent direct instantiation of the abstract class.
+   */
+  EventGroup() = default;
+
+  // Disallow copy and move operations.
+  EventGroup(const EventGroup&) = delete;
+  EventGroup& operator=(const EventGroup&) = delete;
+  EventGroup(EventGroup&&) = delete;
+  EventGroup& operator=(EventGroup&&) = delete;
+};
+
+/**
+ * @brief Factory function to create a platform-specific EventGroup instance.
+ *
+ * The event group is initialized with all bits cleared.
+ * @return A std::unique_ptr containing the created EventGroup object, or
+ * std::unique_ptr(nullptr) if creation failed.
+ */
+std::unique_ptr<EventGroup> CreateEventGroup();
+
+}  // namespace osal
+
+#endif  // OSAL_EVENT_GROUP_H_
+
+-----------------------------------------------------------------------------------
+
+// osal_task.h
+#ifndef OSAL_TASK_H_
+#define OSAL_TASK_H_
+
+#include <chrono>
+#include <cstdint>
+#include <functional>  // For std::function
+#include <memory>      // For std::unique_ptr
+#include <string>      // For std::string if TaskParams used std::string for name
+
+#include "osal_status.h"
+
+/**
+ * @file osal_task.h
+ * @brief Abstract interface for Task (Thread) management and utilities.
+ */
+
+namespace osal {
+
+/**
+ * @brief Defines abstract priority levels for tasks using an ordinal scale.
+ *
+ * These OSAL-defined priorities will be mapped to platform-specific numerical
+ * priority values by the underlying OSAL implementation.
+ */
+enum class ThreadPriority {
+  kPriorityLowest,  ///< Absolute lowest application-level priority.
+  kPriority1,       ///< Low priority level.
+  kPriority2,       ///< Below a typical normal priority.
+  kPriority3,       ///< A medium, standard, or default priority level.
+  kPriority4,       ///< Above a typical normal priority.
+  kPriority5,       ///< High priority level.
+  kPriorityHighest  ///< Highest application-level priority for critical tasks.
+};
+
+/**
+ * @brief Provides an abstract interface representing a task or thread.
+ *
+ * Defines methods to control/query a task. Creation is via a factory.
+ * Includes static utilities for the currently executing task.
+ */
+class Task {
+ public:
+  /**
+   * @brief Defines the signature for a task's main entry function.
+   * @param arg A user-defined argument passed to the task at creation.
+   */
+  using EntryFunction = std::function<void(void* arg)>;
+
+  /**
+   * @brief Virtual destructor.
+   * Proper cleanup of task resources is complex; implementations should handle
+   * underlying OS task state appropriately.
+   */
+  virtual ~Task() = default;
+
+  /**
+   * @brief Retrieves the name assigned to this task instance.
+   * @return A C-string representing the task's name. Lifetime managed by Task.
+   */
+  virtual const char* GetName() const = 0;
+
+  /**
+   * @brief Retrieves the current OSAL priority of this task.
+   * @return The current abstract `ThreadPriority` of the task.
+   */
+  virtual ThreadPriority GetPriority() const = 0;
+
+  /**
+   * @brief Sets the OSAL priority of this task.
+   * @param priority The new abstract `ThreadPriority` for the task.
+   * @return Status::kOk if priority was set successfully.
+   * @return Status::kInvalidParam if priority level is not supported.
+   * @return Status::kError for other underlying system errors.
+   */
+  virtual Status SetPriority(ThreadPriority priority) = 0;
+
+  /**
+   * @brief Suspends the execution of this task.
+   * @return Status::kOk if the task was successfully suspended.
+   * @return Status::kError if the task could not be suspended.
+   */
+  virtual Status Suspend() = 0;
+
+  /**
+   * @brief Resumes a previously suspended task.
+   * @return Status::kOk if the task was successfully resumed.
+   * @return Status::kError if the task could not be resumed.
+   */
+  virtual Status Resume() = 0;
+
+  /**
+   * @brief Gets the minimum amount of free stack space (stack high water mark)
+   * for this task since it started, in bytes.
+   * A smaller number indicates more stack usage.
+   * @return The minimum free stack space in bytes. Returns 0 if not supported,
+   * task not running, or error.
+   */
+  virtual uint32_t GetStackHighWaterMark() const = 0;
+
+  /**
+   * @brief Retrieves an opaque handle representing the underlying native OS
+   * task.
+   *
+   * @warning This method provides access to the platform-specific task
+   * handle (e.g., `TaskHandle_t` in FreeRTOS). Its use breaks the
+   * OSAL abstraction and should be reserved for situations where direct
+   * interaction with OS-specific APIs (not covered by this OSAL) is
+   * absolutely necessary. The caller is responsible for correctly
+   * casting this `void*` to the appropriate native handle type and
+   * ensuring its proper use according to the underlying OS's rules.
+   *
+   * @return An opaque pointer (void*) to the native OS task handle, or
+   * nullptr if the OSAL task is not valid or a native handle is
+   * not applicable/available.
+   */
+  virtual void* GetNativeHandle() const = 0;
+
+  // --- Static utility functions for the calling task ---
+
+  /**
+   * @brief Delays the execution of the *calling* task for a specified duration.
+   * The task enters a blocked state, not consuming CPU.
+   * @param duration The minimum time for the calling task to delay.
+   */
+  static void Delay(std::chrono::milliseconds duration);
+
+  /**
+   * @brief Yields the CPU, allowing the OS scheduler to run another task.
+   */
+  static void Yield();
+
+  /**
+   * @brief Enters a critical section for the calling task's core/CPU.
+   * Typically disables task preemption. Keep critical sections short.
+   * Must be balanced with ExitCritical().
+   */
+  static void EnterCritical();
+
+  /**
+   * @brief Exits a critical section previously entered by EnterCritical().
+   * Typically re-enables task preemption.
+   */
+  static void ExitCritical();
+
+ protected:
+  /**
+   * @brief Default constructor.
+   * Protected to prevent direct instantiation of the abstract class.
+   */
+  Task() = default;
+
+  // Disallow copy and move operations.
+  Task(const Task&) = delete;
+  Task& operator=(const Task&) = delete;
+  Task(Task&&) = delete;
+  Task& operator=(Task&&) = delete;
+};
+
+/**
+ * @brief Structure containing parameters for creating a new task.
+ */
+struct TaskParams {
+  /** @brief A descriptive name for the task (null-terminated C-string).
+   * Can be empty or nullptr for a default name.
+   */
+  const char* name = "OsalTask";
+
+  /** @brief The function pointer to the task's main entry routine. */
+  Task::EntryFunction entry_function;
+
+  /** @brief A void pointer argument to be passed to the entry_function. */
+  void* arg = nullptr;
+
+  /** @brief The desired OSAL priority for the new task. */
+  ThreadPriority priority = ThreadPriority::kPriority3;
+
+  /** @brief The stack size for the task, in bytes. */
+  uint32_t stack_size_bytes = 4096; // Example default
+};
+
+/**
+ * @brief Factory function to create and start a new platform-specific Task.
+ *
+ * @param params Parameters for task creation (name, entry function, argument,
+ * priority, stack size).
+ * @return A std::unique_ptr containing the created Task object, or
+ * std::unique_ptr(nullptr) if task creation failed.
+ */
+std::unique_ptr<Task> CreateTask(const TaskParams& params);
+
+}  // namespace osal
+
+#endif  // OSAL_TASK_H_
+
+-----------------------------------------------------------------------------------
