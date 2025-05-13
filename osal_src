@@ -1160,3 +1160,257 @@ std::unique_ptr<Task> CreateTask(const TaskParams& params) {
 
 }  // namespace osal
 -------------------------------------------------
+
+#include <iostream> // For std::cout, std::cerr for example purposes
+#include <vector>   // For some examples
+#include <string>   // For std::string
+#include <thread>   // For std::this_thread::sleep_for in main loop simulation
+
+// Include all OSAL headers
+#include "osal_status.h"
+#include "osal_mutex.h"
+#include "osal_semaphore.h"
+#include "osal_queue.h"
+#include "osal_timer.h"
+#include "osal_event_group.h"
+#include "osal_task.h"
+
+// For ESP-IDF, app_main is the entry point
+extern "C" void app_main() {
+    std::cout << "--- OSAL Usage Examples Initializing ---" << std::endl;
+
+    // --- 1. Mutex Usage Example ---
+    std::cout << "\n[Mutex Example]" << std::endl;
+    std::unique_ptr<osal::Mutex> my_mutex = osal::CreateMutex();
+    int shared_data = 0;
+
+    if (my_mutex) {
+        std::cout << "Mutex created. Locking..." << std::endl;
+        my_mutex->Lock();
+        std::cout << "Mutex locked. Accessing shared data." << std::endl;
+        shared_data = 42;
+        // Simulating some work
+        osal::Task::Delay(std::chrono::milliseconds(10));
+        std::cout << "Shared data set to: " << shared_data << std::endl;
+        my_mutex->Unlock();
+        std::cout << "Mutex unlocked." << std::endl;
+
+        // Example with TryLockFor
+        std::cout << "Attempting TryLockFor (10ms)..." << std::endl;
+        osal::Status lock_status = my_mutex->TryLockFor(std::chrono::milliseconds(10));
+        if (lock_status == osal::Status::kOk) {
+            std::cout << "TryLockFor acquired." << std::endl;
+            // ... critical section ...
+            my_mutex->Unlock();
+            std::cout << "TryLockFor released." << std::endl;
+        } else {
+            std::cout << "TryLockFor failed or timed out (Status: " << static_cast<int>(lock_status) << ")" << std::endl;
+        }
+    } else {
+        std::cerr << "Failed to create Mutex!" << std::endl;
+    }
+
+    // --- 2. Semaphore Usage Example (Binary) ---
+    std::cout << "\n[Binary Semaphore Example]" << std::endl;
+    std::unique_ptr<osal::Semaphore> signal_semaphore = osal::CreateBinarySemaphore(false); // Initially not signaled
+
+    if (signal_semaphore) {
+        std::cout << "Binary Semaphore created. Waiting for signal (timeout 100ms)..." << std::endl;
+        osal::Status sem_status = signal_semaphore->Acquire(std::chrono::milliseconds(100));
+        if (sem_status == osal::Status::kOk) {
+            std::cout << "Signal acquired unexpectedly (should timeout)." << std::endl;
+        } else if (sem_status == osal::Status::kTimeout || sem_status == osal::Status::kUnavailable) {
+            std::cout << "Correctly timed out or unavailable as semaphore was not released." << std::endl;
+        }
+
+        std::cout << "Releasing binary semaphore..." << std::endl;
+        signal_semaphore->Release();
+        std::cout << "Waiting for signal again (should succeed now)..." << std::endl;
+        sem_status = signal_semaphore->Acquire(std::chrono::milliseconds(10));
+        if (sem_status == osal::Status::kOk) {
+            std::cout << "Signal acquired successfully after release!" << std::endl;
+        } else {
+            std::cerr << "Failed to acquire binary semaphore after release!" << std::endl;
+        }
+    } else {
+        std::cerr << "Failed to create Binary Semaphore!" << std::endl;
+    }
+
+    // --- 3. Semaphore Usage Example (Counting) ---
+    std::cout << "\n[Counting Semaphore Example]" << std::endl;
+    // Max 3 resources, initially 2 available
+    std::unique_ptr<osal::Semaphore> resource_semaphore = osal::CreateCountingSemaphore(3, 2);
+    if (resource_semaphore) {
+        std::cout << "Counting Semaphore created (Max:3, Initial:2). Current count: " << resource_semaphore->GetCount() << std::endl;
+        resource_semaphore->Acquire(std::chrono::milliseconds(0)); // Acquire 1
+        std::cout << "Acquired 1. Count: " << resource_semaphore->GetCount() << std::endl;
+        resource_semaphore->Acquire(std::chrono::milliseconds(0)); // Acquire 2
+        std::cout << "Acquired 2. Count: " << resource_semaphore->GetCount() << std::endl;
+
+        std::cout << "Attempting to acquire 3rd (should be unavailable/timeout)..." << std::endl;
+        osal::Status status = resource_semaphore->Acquire(std::chrono::milliseconds(10));
+        if (status == osal::Status::kOk) {
+            std::cerr << "Error: Acquired 3rd resource when only 2 were initially available!" << std::endl;
+        } else {
+            std::cout << "Correctly failed/timed out acquiring 3rd resource. Status: " << static_cast<int>(status) << std::endl;
+        }
+        resource_semaphore->Release();
+        std::cout << "Released 1. Count: " << resource_semaphore->GetCount() << std::endl;
+    } else {
+        std::cerr << "Failed to create Counting Semaphore!" << std::endl;
+    }
+
+
+    // --- 4. Queue Usage Example ---
+    std::cout << "\n[Queue Example]" << std::endl;
+    struct MessageData {
+        int id;
+        float value;
+    };
+    std::unique_ptr<osal::Queue> my_queue = osal::CreateQueue(5, sizeof(MessageData)); // Queue of 5 MessageData items
+
+    if (my_queue) {
+        std::cout << "Queue created (Capacity: " << my_queue->GetCapacity()
+                  << ", ItemSize: " << my_queue->GetItemSize() << " bytes)." << std::endl;
+
+        MessageData msg_to_send = {1, 10.5f};
+        std::cout << "Sending message { id: " << msg_to_send.id << ", value: " << msg_to_send.value << " }" << std::endl;
+        osal::Status send_status = my_queue->Send(&msg_to_send, std::chrono::milliseconds(10));
+        if (send_status == osal::Status::kOk) {
+            std::cout << "Message sent. Messages waiting: " << my_queue->GetMessageCount() << std::endl;
+        } else {
+            std::cerr << "Failed to send message!" << std::endl;
+        }
+
+        MessageData msg_received;
+        std::cout << "Receiving message..." << std::endl;
+        osal::Status recv_status = my_queue->Receive(&msg_received, std::chrono::milliseconds(100));
+        if (recv_status == osal::Status::kOk) {
+            std::cout << "Message received: { id: " << msg_received.id << ", value: " << msg_received.value << " }" << std::endl;
+        } else {
+            std::cerr << "Failed to receive message or timed out! Status: " << static_cast<int>(recv_status) << std::endl;
+        }
+    } else {
+        std::cerr << "Failed to create Queue!" << std::endl;
+    }
+
+    // --- 5. Timer Usage Example (Periodic) ---
+    std::cout << "\n[Timer Example]" << std::endl;
+    static int timer_callback_count = 0; // Static for lambda capture or accessible by callback
+    const char* timer_name_arg = "PeriodicSensorTimer";
+
+    std::unique_ptr<osal::Timer> my_periodic_timer = osal::CreateTimer(
+        timer_name_arg,
+        std::chrono::milliseconds(500), // 500 ms period
+        osal::TimerType::kPeriodic,
+        [](void* arg) { // Lambda as callback
+            timer_callback_count++;
+            const char* name = static_cast<const char*>(arg);
+            std::cout << "Timer '" << (name ? name : "Unnamed") << "' Tick! Count: " << timer_callback_count << std::endl;
+        },
+        (void*)timer_name_arg // Pass the name as the argument to the callback
+    );
+
+    if (my_periodic_timer) {
+        std::cout << "Periodic Timer '" << my_periodic_timer->GetName() << "' created. Starting..." << std::endl;
+        my_periodic_timer->Start();
+        std::cout << "Waiting for timer to tick a few times (main thread delays)..." << std::endl;
+        osal::Task::Delay(std::chrono::milliseconds(2100)); // Let it tick ~4 times
+
+        std::cout << "Stopping periodic timer..." << std::endl;
+        my_periodic_timer->Stop();
+        std::cout << "Periodic timer stopped. Final count: " << timer_callback_count << std::endl;
+    } else {
+        std::cerr << "Failed to create Periodic Timer!" << std::endl;
+    }
+
+    // --- 6. Event Group Example ---
+    std::cout << "\n[Event Group Example]" << std::endl;
+    std::unique_ptr<osal::EventGroup> my_event_group = osal::CreateEventGroup();
+    const osal::EventBits EVENT_A_DONE = (1 << 0);
+    const osal::EventBits EVENT_B_DONE = (1 << 1);
+    const osal::EventBits ALL_EVENTS_DONE = EVENT_A_DONE | EVENT_B_DONE;
+
+    if (my_event_group) {
+        std::cout << "Event Group created. Initial bits: 0x" << std::hex << my_event_group->GetBits() << std::dec << std::endl;
+
+        // Simulate another task setting Event A
+        std::cout << "Simulating Event A occurring..." << std::endl;
+        my_event_group->SetBits(EVENT_A_DONE);
+        std::cout << "Bits after setting Event A: 0x" << std::hex << my_event_group->GetBits() << std::dec << std::endl;
+
+        std::cout << "Waiting for ALL_EVENTS_DONE (Event A & B) with 100ms timeout..." << std::endl;
+        osal::EventBits received_bits = my_event_group->WaitBits(
+            ALL_EVENTS_DONE,
+            true, // Clear on exit
+            true, // Wait for ALL bits
+            std::chrono::milliseconds(100)
+        );
+
+        if ((received_bits & ALL_EVENTS_DONE) == ALL_EVENTS_DONE) {
+            std::cout << "All events received! Bits after wait: 0x" << std::hex << received_bits << std::dec << std::endl;
+             std::cout << "Event group bits after clear-on-exit: 0x" << std::hex << my_event_group->GetBits() << std::dec << std::endl;
+        } else {
+            std::cout << "Timed out or not all events received. Received bits: 0x"
+                      << std::hex << received_bits << ". Current group bits: 0x" << my_event_group->GetBits() << std::dec << std::endl;
+            // Simulate Event B occurring now
+            std::cout << "Simulating Event B occurring..." << std::endl;
+            my_event_group->SetBits(EVENT_B_DONE); // Note: Event A might have been cleared if WaitBits partially succeeded and cleared. Re-set A if needed or handle logic carefully.
+                                                   // For this example, assume WaitBits timed out and didn't clear.
+             std::cout << "Bits after setting Event B: 0x" << std::hex << my_event_group->GetBits() << std::dec << std::endl;
+        }
+    } else {
+        std::cerr << "Failed to create Event Group!" << std::endl;
+    }
+
+
+    // --- 7. Task Usage Example ---
+    std::cout << "\n[Task Example]" << std::endl;
+    static int app_task_arg_value = 77; // Static or ensure lifetime
+    osal::TaskParams task_params;
+    task_params.name = "MyWorkerTask";
+    task_params.stack_size_bytes = 3072;
+    task_params.priority = osal::ThreadPriority::kPriority3;
+    task_params.arg = &app_task_arg_value;
+    task_params.entry_function = [](void* arg) {
+        int task_id = *static_cast<int*>(arg);
+        std::cout << "OSAL Task '" << pcTaskGetName(nullptr) << "' (ID " << task_id << ") executing." << std::endl;
+        for (int i = 0; i < 3; ++i) {
+            std::cout << "OSAL Task '" << pcTaskGetName(nullptr) << "' loop " << i
+                      << ". Stack HWM (current task): " << osal::Task::GetCurrentTaskStackHighWaterMark() << " bytes."
+                      << std::endl;
+            osal::Task::Delay(std::chrono::milliseconds(300));
+        }
+        std::cout << "OSAL Task '" << pcTaskGetName(nullptr) << "' (ID " << task_id << ") finishing." << std::endl;
+        // Task self-deletes after this function returns (due to vTaskDelete(nullptr) in trampoline)
+    };
+
+    std::unique_ptr<osal::Task> worker_task = osal::CreateTask(task_params);
+
+    if (worker_task) {
+        std::cout << "Worker Task '" << worker_task->GetName() << "' created." << std::endl;
+        // You can interact with worker_task object here if needed (e.g., GetPriority)
+        // Example of using GetNativeHandle (use with extreme caution)
+        void* native_h = worker_task->GetNativeHandle();
+        std::cout << "Worker Task native handle (void*): " << native_h << std::endl;
+        // To use it with FreeRTOS: TaskHandle_t rtos_h = static_cast<TaskHandle_t>(native_h);
+        // Then call FreeRTOS specific API: vTaskSuspend(rtos_h); etc.
+        // But prefer OSAL methods: worker_task->Suspend();
+
+        // To monitor main task (app_main) stack
+        std::cout << "app_main stack HWM (static method): " << osal::Task::GetCurrentTaskStackHighWaterMark() << " bytes" << std::endl;
+
+    } else {
+        std::cerr << "Failed to create Worker Task!" << std::endl;
+    }
+
+    // Let the worker task run for a bit
+    std::cout << "Main: Waiting for worker task to do some work..." << std::endl;
+    osal::Task::Delay(std::chrono::seconds(2)); // Allow worker task to run and finish
+
+
+    std::cout << "\n--- OSAL Usage Examples Finished ---" << std::endl;
+    // The std::unique_ptr for each OSAL object will go out of scope here,
+    // and their destructors will be called, releasing underlying FreeRTOS resources.
+    // Tasks created by osal::CreateTask are designed to self-delete when their function ends.
+}
