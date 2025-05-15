@@ -653,3 +653,166 @@ void JobManager::StartTrackReset(const rapidjson::Document& job_doc) {
 
 }  // namespace jobs
 }  // namespace test
+
+-----------------------------------------------------------------------------------
+
+// --- In your CloudComm.cpp ---
+
+#include "visium/cloud_communication.h" // Assuming this is your CloudComm header
+#include "platform/storage/file_system.h" // For FileSystem type
+#include "esp_log.h" // For ESP_LOGx macros
+
+// Other necessary includes for CloudComm (MQTT client, RapidJSON, etc.)
+
+namespace visium {
+
+// (Assuming other parts of CloudComm, like constructor, LoadMqttConfigs, etc. are defined)
+
+// Constructor for CloudComm
+CloudComm::CloudComm(platform::storage::FileSystem& file_manager)
+    : file_manager_(file_manager),      // Initialize reference member
+      aws_mqtt_client_(),               // Default construct MQTT client
+      job_manager_()                    // JobManager is also default-constructed here
+                                        // (its constructor is simple)
+{
+    thing_name_[0] = '\0'; // Initialize thing_name_ buffer
+    current_state_.store(State::UNINITIALIZED);
+    // ... other CloudComm constructor initializations ...
+    ESP_LOGI(kTag, "CloudComm instance created.");
+}
+
+bool CloudComm::Initialize() {
+    ESP_LOGI(kTag, "CloudComm: Initializing...");
+
+    State expected_uninitialized = State::UNINITIALIZED;
+    if (!current_state_.compare_exchange_strong(expected_uninitialized, State::CONNECTING /* or some intermediate state */)) {
+        ESP_LOGW(kTag, "CloudComm: Already initialized or in an unexpected state (%d).", static_cast<int>(current_state_.load()));
+        return (current_state_.load() != State::UNINITIALIZED && current_state_.load() != State::WAITING_TO_RETRY); // Or appropriate logic
+    }
+
+    // 1. Load essential configurations, including the thing_name_ (device_id)
+    if (!LoadMqttConfigs()) { // This method should populate this->thing_name_
+        ESP_LOGE(kTag, "CloudComm: Failed to load MQTT configurations.");
+        current_state_.store(State::UNINITIALIZED); // Revert state
+        return false;
+    }
+
+    // 2. Initialize the underlying MQTT client (aws_mqtt_client_)
+    //    (Code for client_config_internal, loading certs, and aws_mqtt_client_.Initialize(...))
+    //    ... (this part is from your original CloudComm code) ...
+    //    if (!aws_mqtt_client_.Initialize(client_config_internal)) {
+    //        ESP_LOGE(kTag, "CloudComm: Failed to initialize underlying AwsIotMqttClient.");
+    //        current_state_.store(State::UNINITIALIZED); // Revert state
+    //        return false;
+    //    }
+
+    // 3. Define the PublishJobStatusCallback lambda
+    //    This lambda captures 'this' to call a member function of CloudComm
+    //    which handles the actual MQTT publishing.
+    visium::jobs::PublishJobStatusCallback publish_cb =
+        [this](const std::string& job_id, const std::string& operation,
+               const std::string& status, const std::string& status_details) -> bool {
+        // Delegate to a CloudComm member function that does the actual publishing
+        return this->PublishJobUpdateMessage(job_id, operation, status,
+                                             status_details);
+    };
+
+    // 4. Call Init() on the job_manager_ member, passing dependencies
+    //    - &file_manager_: Pointer to the FileSystem instance.
+    //    - std::string(thing_name_): The device ID loaded by LoadMqttConfigs().
+    //    - publish_cb: The callback lambda defined above.
+    job_manager_.Init(&file_manager_, std::string(thing_name_), publish_cb);
+
+    // 5. Set up common MQTT client callbacks (OnConnected, OnDisconnected, etc.)
+    //    and specific subscriptions for JobManager.
+    //    (Code for aws_mqtt_client_.SetOnConnectedCallback, etc.)
+    //    ...
+    //    if (!CommonInitializeSetup()) { // This might include shadow subscriptions
+    //         ESP_LOGE(kTag, "CloudComm: Common MQTT setup failed.");
+    //         // aws_mqtt_client_.Disconnect(); // Attempt cleanup
+    //         current_state_.store(State::UNINITIALIZED); // Revert state
+    //         return false;
+    //    }
+
+    if (!SubscribeToJobTopicsInternal()) { // This method subscribes to job topics
+                                           // and routes messages to job_manager_
+        ESP_LOGE(kTag, "CloudComm: Failed to subscribe to job topics.");
+        // aws_mqtt_client_.Disconnect(); // Attempt cleanup
+        current_state_.store(State::UNINITIALIZED); // Revert state
+        return false;
+    }
+
+    // If all initializations are successful
+    current_state_.store(State::DISCONNECTED); // Ready to connect
+    ESP_LOGI(kTag, "CloudComm: Initialized successfully for Thing: %s. Ready to connect.", thing_name_);
+    return true;
+}
+
+// The PublishJobUpdateMessage method (which is called by the callback)
+bool CloudComm::PublishJobUpdateMessage(const std::string& job_id,
+                                        const std::string& operation,
+                                        const std::string& status,
+                                        const std::string& status_details) {
+    if (!IsConnected()) { // IsConnected() checks current_state_
+        ESP_LOGW(kTag,
+                 "CloudComm: Cannot publish job update for %s, not connected.",
+                 job_id.c_str());
+        return false;
+    }
+    if (thing_name_[0] == '\0') {
+        ESP_LOGE(kTag,
+                 "CloudComm: Thing Name not available for publishing job update "
+                 "for %s.",
+                 job_id.c_str());
+        return false;
+    }
+
+    // Construct the job update topic
+    // Example for custom topic:
+    std::string job_update_topic = "lit/prod/" + std::string(thing_name_) + "/job/update";
+    // Example for standard AWS IoT Jobs topic:
+    // std::string job_update_topic = "$aws/things/" + std::string(thing_name_) +
+    //                               "/jobs/" + job_id + "/update";
+
+    // Create JSON payload for the job update
+    rapidjson::Document update_payload_doc;
+    update_payload_doc.SetObject();
+    rapidjson::Document::AllocatorType& allocator =
+        update_payload_doc.GetAllocator();
+
+    update_payload_doc.AddMember(
+        "jobId", rapidjson::Value(job_id.c_str(), allocator).Move(), allocator);
+    update_payload_doc.AddMember(
+        "operation", rapidjson::Value(operation.c_str(), allocator).Move(),
+        allocator); // Send the operation name from JobManager's context
+    update_payload_doc.AddMember(
+        "status", rapidjson::Value(status.c_str(), allocator).Move(), allocator);
+    if (!status_details.empty()) {
+        update_payload_doc.AddMember(
+            "statusDetails",
+            rapidjson::Value(status_details.c_str(), allocator).Move(),
+            allocator);
+    }
+    // You might add other fields as required by your backend or AWS IoT Jobs
+    // (e.g., timestamp, expectedVersion, executionNumber)
+    // For example:
+    // update_payload_doc.AddMember("timestamp", GetCurrentTimestampMs(), allocator);
+
+
+    rapidjson::StringBuffer buffer;
+    rapidjson::Writer<rapidjson::StringBuffer> writer(buffer);
+    update_payload_doc.Accept(writer);
+
+    ESP_LOGI(kTag, "CloudComm: Publishing job update to %s: %s",
+             job_update_topic.c_str(), buffer.GetString());
+
+    // Use the underlying MQTT client to publish
+    return aws_mqtt_client_.Publish(
+        job_update_topic.c_str(),
+        reinterpret_cast<const uint8_t*>(buffer.GetString()), buffer.GetSize(),
+        1 /* QoS 1 */, false /* retain */);
+}
+
+// ... (other CloudComm methods like LoadMqttConfigs, SubscribeToJobTopicsInternal, IsConnected, etc.)
+
+} // namespace visium
