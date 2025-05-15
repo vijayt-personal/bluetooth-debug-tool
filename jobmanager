@@ -1,0 +1,655 @@
+// Copyright [Your Company/Name] [Year]
+// All Rights Reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#ifndef test_JOBS_JOB_MANAGER_H_
+#define test_JOBS_JOB_MANAGER_H_
+
+#include <functional>
+#include <optional>
+#include <string>
+#include <string_view>
+
+#include "rapidjson/document.h"
+
+// Forward declarations
+namespace platform {
+namespace storage {
+class FileSystem;
+}  // namespace storage
+}  // namespace platform
+
+namespace TEST{
+namespace jobs {
+
+/**
+ * @brief Callback function type for publishing job status updates.
+ *
+ * This callback is invoked by the JobManager to inform the cloud communication
+ * layer about changes in a job's status.
+ *
+ * @param jobId The unique identifier of the job.
+ * @param operation The name of the operation being performed for the job. This
+ * should come from the JobManager's active job context.
+ * @param status The new status of the job (e.g., "ACCEPTED", "IN_PROGRESS",
+ * "SUCCEEDED", "FAILED").
+ * @param statusDetails A string providing additional details about the status,
+ * especially for "FAILED" or "REJECTED" states.
+ * @return True if the publish request was successfully queued or sent, false
+ * otherwise.
+ */
+using PublishJobStatusCallback = std::function<bool(
+    const std::string& jobId, const std::string& operation,
+    const std::string& status, const std::string& statusDetails)>;
+
+/**
+ * @class JobManager
+ * @brief Manages the lifecycle of jobs received from the cloud.
+ *
+ * This class is responsible for handling incoming job notifications,
+ * parsing job documents, dispatching actions based on the job operation,
+ * managing the state of the active job (in-memory), and reporting status
+ * updates back to the cloud via a registered callback. It assumes only one
+ * job can be active at a time.
+ */
+class JobManager {
+ public:
+  /**
+   * @brief Constructs a JobManager instance.
+   */
+  explicit JobManager();
+
+  // Disable copy and move semantics
+  JobManager(const JobManager&) = delete;
+  JobManager& operator=(const JobManager&) = delete;
+  JobManager(JobManager&&) = delete;
+  JobManager& operator=(JobManager&&) = delete;
+
+  /**
+   * @brief Initializes the JobManager.
+   *
+   * Must be called before any other methods. Sets up dependencies.
+   *
+   * @param fs Pointer to the platform's file system interface. Used for any
+   * potential future needs for minimal state persistence (e.g., specific
+   * flags not covered by standard OTA mechanisms). Can be nullptr if
+   * no such persistence is required by any job type.
+   * @param device_id The unique identifier (e.g., Thing Name) of this device.
+   * @param publish_callback A callback function that the JobManager will use to
+   * send job status updates to the cloud.
+   */
+  void Init(platform::storage::FileSystem* fs, const std::string& device_id,
+            PublishJobStatusCallback publish_callback);
+
+  /**
+   * @brief Handles an incoming job notification payload.
+   *
+   * This is the primary entry point for new job messages received from the MQTT
+   * broker. It parses the payload and routes it for processing.
+   *
+   * @param topic The MQTT topic on which the notification was received.
+   * (Currently unused by this implementation but provided for context).
+   * @param payload_str A string_view موسيقى the raw JSON payload of the job
+   * notification.
+   */
+  void HandleJobNotification(const std::string& topic,
+                             std::string_view payload_str);
+
+ private:
+  /**
+   * @struct ActiveJobInfo
+   * @brief Stores in-memory information about the currently active job.
+   *
+   * This state is volatile and will be lost on device reboot. The JobManager
+   * uses this to distinguish between new job messages, echoes of current job
+   * states, and post-reboot scenarios.
+   */
+  struct ActiveJobInfo {
+    std::string job_id;        ///< Unique identifier of the active job.
+    std::string operation;     ///< Name of the operation being performed.
+    std::string status;  ///< Current device-side status (e.g., "ACCEPTED",
+                         ///< "IN_PROGRESS").
+  };
+
+  /**
+   * @brief Parses the job document and routes it to the appropriate
+   * handler based on its effective status.
+   * @param job_doc The parsed RapidJSON document representing the job.
+   * @param status_to_process The effective status of the job (either from the
+   * document or defaulted to "QUEUED").
+   */
+  void ProcessJobDocument(const rapidjson::Document& job_doc,
+                          const char* status_to_process);
+
+  /**
+   * @brief Dispatches a new job action (e.g., for jobs in "QUEUED" state).
+   *
+   * Sets the job as active, publishes "ACCEPTED" and "IN_PROGRESS" statuses,
+   * and then calls the appropriate `Start...` method for the operation.
+   *
+   * @param job_doc The parsed RapidJSON document representing the new job.
+   */
+  void DispatchNewJobAction(const rapidjson::Document& job_doc);
+
+  /**
+   * @brief Handles a job document that indicates an "IN_PROGRESS" state from
+   * the server.
+   *
+   * This is typically called after a device reboot when the retained job message
+   * is received. It determines the actual state of the operation (e.g., OTA
+   * verification) and publishes the final status.
+   *
+   * @param job_doc The parsed RapidJSON document.
+   */
+  void DispatchInProgressJobCheck(const rapidjson::Document& job_doc);
+
+  // --- Action Starting Methods ---
+
+  /** @brief Initiates a firmware update (OTA). */
+  void StartFirmwareUpdate(const rapidjson::Document& job_doc);
+  /** @brief Initiates a device power cycle (reboot). */
+  void StartPowerCycle(const rapidjson::Document& job_doc);
+  /** @brief Initiates a factory reset. */
+  void StartFactoryReset(const rapidjson::Document& job_doc);
+  /** @brief Initiates a track reset operation. */
+  void StartTrackReset(const rapidjson::Document& job_doc);
+
+  /**
+   * @brief Publishes a job status update using the registered callback.
+   *
+   * @param job_id ID of the job.
+   * @param operation Operation name (usually from `active_job_info_`).
+   * @param status New status to report.
+   * @param status_details Optional details, especially for failures.
+   */
+  void PublishJobStatusWrapper(const char* job_id, const char* operation,
+                               const char* status,
+                               const char* status_details = nullptr);
+
+  // Member Variables
+  std::optional<ActiveJobInfo> active_job_info_;  ///< In-memory state of the current job.
+  platform::storage::FileSystem* file_manager_ptr_ = nullptr;  ///< Pointer to platform file system.
+  std::string device_id_;  ///< Device identifier (Thing Name).
+  PublishJobStatusCallback publish_status_cb_ = nullptr;  ///< Callback for publishing status.
+
+  static const char* kTag;  ///< Logging tag for this class.
+};
+
+}  // namespace jobs
+}  // namespace test
+#endif  // test_JOBS_JOB_MANAGER_H_
+
+-----------------------------------------------------------------------------------
+
+// Copyright [Your Company/Name] [Year]
+// All Rights Reserved.
+// ... (Apache License Header as in .h file) ...
+
+#include "test/jobs/job_manager.h" // Use project-style include path
+
+#include <cstdio>   // For snprintf, etc. (used by ESP_LOGx indirectly)
+#include <cstring>  // For strcmp, strncpy
+#include <vector>   // For std::vector (used for mutable payload buffer)
+
+// ESP-IDF specific includes
+#include "esp_log.h"
+#include "esp_ota_ops.h"
+#include "esp_system.h"
+
+// RapidJSON error string utility
+#include "rapidjson/error/en.h"
+
+// Assuming test::version::test_FW_VERSION is defined in a project header
+// Example: #include "test/version/version.h"
+namespace test {
+namespace version {
+// This should be defined in your actual version file/system
+extern const char* const test_FW_VERSION = "0.0.0-dev";
+}  // namespace version
+}  // namespace test
+
+namespace test {
+namespace jobs {
+
+// Initialize static const char* for logging tag
+const char* JobManager::kTag = "JobManager";
+
+JobManager::JobManager()
+    : active_job_info_(std::nullopt),
+      file_manager_ptr_(nullptr),
+      publish_status_cb_(nullptr) {}
+
+void JobManager::Init(platform::storage::FileSystem* fs,
+                      const std::string& device_id,
+                      PublishJobStatusCallback publish_callback) {
+  file_manager_ptr_ = fs;
+  device_id_ = device_id;
+  publish_status_cb_ = std::move(publish_callback);
+  active_job_info_.reset();  // Ensure state is clear on init
+
+  ESP_LOGI(kTag, "Initialized for device ID: %s", device_id_.c_str());
+}
+
+void JobManager::PublishJobStatusWrapper(const char* job_id,
+                                         const char* operation,
+                                         const char* status,
+                                         const char* status_details) {
+  if (publish_status_cb_) {
+    std::string details_str = status_details ? std::string(status_details) : "";
+    if (!publish_status_cb_(std::string(job_id), std::string(operation),
+                            std::string(status), details_str)) {
+      ESP_LOGE(kTag, "Publish callback returned false for job %s, status %s",
+               job_id, status);
+    }
+  } else {
+    ESP_LOGE(kTag,
+             "Publish callback not registered! Cannot send status for job %s.",
+             job_id);
+  }
+}
+
+void JobManager::HandleJobNotification(const std::string& topic,
+                                       std::string_view payload_str) {
+  ESP_LOGD(kTag, "Handling notification on topic '%s', payload size %zu",
+           topic.c_str(), payload_str.length());
+
+  rapidjson::Document job_doc;
+  // Create a null-terminated buffer for parsing, as RapidJSON C-string API
+  // (Parse(const char*)) expects it.
+  std::vector<char> payload_buffer(payload_str.begin(), payload_str.end());
+  payload_buffer.push_back('\0');
+  job_doc.Parse(payload_buffer.data());
+
+  if (job_doc.HasParseError()) {
+    ESP_LOGE(kTag, "Failed to parse job document JSON. Error: %s (offset %zu)",
+             rapidjson::GetParseError_En(job_doc.GetParseError()),
+             job_doc.GetErrorOffset());
+    // Cannot reliably get jobId if the root document fails to parse.
+    return;
+  }
+
+  if (!job_doc.IsObject()) {
+    ESP_LOGE(kTag, "Job document is not a JSON object.");
+    return;  // Cannot proceed
+  }
+
+  // Validate presence of essential fields: jobId and operation
+  if (!job_doc.HasMember("jobId") || !job_doc["jobId"].IsString() ||
+      !job_doc.HasMember("operation") || !job_doc["operation"].IsString()) {
+    ESP_LOGE(kTag,
+             "Job document missing essential fields (jobId, operation).");
+
+    const char* temp_job_id = "UNKNOWN_JOB_ID";
+    if (job_doc.HasMember("jobId") && job_doc["jobId"].IsString()) {
+      temp_job_id = job_doc["jobId"].GetString();
+    }
+    // Operation might be missing, so can't reliably provide it for REJECTED
+    PublishJobStatusWrapper(temp_job_id, "UNKNOWN_OPERATION", "REJECTED",
+                            "Malformed job document structure");
+    return;
+  }
+
+  // Handle potentially missing 'status' field - default to "QUEUED"
+  const char* status_to_process;
+  char default_status_buffer[20] = "QUEUED";  // Default status
+
+  if (job_doc.HasMember("status") && job_doc["status"].IsString()) {
+    status_to_process = job_doc["status"].GetString();
+  } else {
+    const char* job_id_for_log = job_doc["jobId"].GetString();
+    ESP_LOGI(kTag,
+             "Job document for ID '%s' missing 'status' field. Defaulting to "
+             "'%s'.",
+             job_id_for_log, default_status_buffer);
+    status_to_process = default_status_buffer;
+  }
+
+  ProcessJobDocument(job_doc, status_to_process);
+}
+
+void JobManager::ProcessJobDocument(const rapidjson::Document& job_doc,
+                                    const char* status_to_process) {
+  // These are safe due to checks in HandleJobNotification
+  const char* job_id_from_doc = job_doc["jobId"].GetString();
+  const char* operation_from_doc = job_doc["operation"].GetString();
+
+  ESP_LOGI(kTag, "Processing Job: ID='%s', Op='%s', EffectiveStatus='%s'",
+           job_id_from_doc, operation_from_doc, status_to_process);
+
+  // Check for terminal states first
+  if (strcmp(status_to_process, "SUCCEEDED") == 0 ||
+      strcmp(status_to_process, "FAILED") == 0 ||
+      strcmp(status_to_process, "REJECTED") == 0 ||
+      strcmp(status_to_process, "TIMED_OUT") == 0 ||
+      strcmp(status_to_process, "CANCELED") == 0) {
+    ESP_LOGI(
+        kTag,
+        "Job '%s' has terminal effective status '%s'. Clearing local active "
+        "job if it matches.",
+        job_id_from_doc, status_to_process);
+    if (active_job_info_ && active_job_info_->job_id == job_id_from_doc) {
+      active_job_info_.reset();
+    }
+    return;
+  }
+
+  if (strcmp(status_to_process, "QUEUED") == 0) {
+    if (active_job_info_ && active_job_info_->job_id != job_id_from_doc) {
+      ESP_LOGW(
+          kTag,
+          "New QUEUED job '%s' received, replacing previous active job '%s' "
+          "(%s).",
+          job_id_from_doc, active_job_info_->job_id.c_str(),
+          active_job_info_->status.c_str());
+    } else if (active_job_info_ &&
+               active_job_info_->job_id == job_id_from_doc) {
+      ESP_LOGW(
+          kTag,
+          "Job '%s' re-received as QUEUED. Current local status '%s'. "
+          "Restarting processing.",
+          job_id_from_doc, active_job_info_->status.c_str());
+    }
+    active_job_info_.reset();  // Ensure a clean slate for this job
+    DispatchNewJobAction(job_doc);
+
+  } else if (strcmp(status_to_process, "IN_PROGRESS") == 0) {
+    if (active_job_info_ &&
+        active_job_info_->job_id == job_id_from_doc &&
+        active_job_info_->operation == operation_from_doc &&
+        active_job_info_->status == "IN_PROGRESS") {
+      ESP_LOGD(
+          kTag,
+          "IN_PROGRESS echo for current active job '%s'. No reboot detected. "
+          "Ignoring.",
+          job_id_from_doc);
+    } else {
+      if (!active_job_info_) {
+        ESP_LOGI(
+            kTag,
+            "Job '%s' IN_PROGRESS received. No prior in-memory state (implies "
+            "reboot).",
+            job_id_from_doc);
+      } else {
+        ESP_LOGI(kTag,
+                 "Job '%s' IN_PROGRESS received. Prior in-memory: ID='%s', "
+                 "Op='%s', Status='%s'. Processing as state change/reboot.",
+                 job_id_from_doc, active_job_info_->job_id.c_str(),
+                 active_job_info_->operation.c_str(),
+                 active_job_info_->status.c_str());
+      }
+      active_job_info_ =
+          ActiveJobInfo{std::string(job_id_from_doc),
+                        std::string(operation_from_doc), "IN_PROGRESS"};
+      DispatchInProgressJobCheck(job_doc);
+    }
+  } else {
+    ESP_LOGW(kTag, "Unhandled effective job status '%s' for job '%s'.",
+             status_to_process, job_id_from_doc);
+    PublishJobStatusWrapper(job_id_from_doc, operation_from_doc, "REJECTED",
+                            "Unknown/unhandled job status from server");
+    if (active_job_info_ && active_job_info_->job_id == job_id_from_doc) {
+      active_job_info_.reset();
+    }
+  }
+}
+
+void JobManager::DispatchNewJobAction(const rapidjson::Document& job_doc) {
+  const char* job_id = job_doc["jobId"].GetString();
+  const char* operation = job_doc["operation"].GetString();
+
+  ESP_LOGI(kTag, "Dispatching new job action for ID='%s', Op='%s'.", job_id,
+           operation);
+
+  active_job_info_ =
+      ActiveJobInfo{std::string(job_id), std::string(operation), "ACCEPTED"};
+  PublishJobStatusWrapper(job_id, operation, "ACCEPTED");
+
+  // This check should ideally not fail if logic is correct
+  if (!active_job_info_) {
+     ESP_LOGE(kTag, "Critical: active_job_info_ null after setting ACCEPTED for job '%s'. Recovering.", job_id);
+     active_job_info_ = ActiveJobInfo{std::string(job_id), std::string(operation), "IN_PROGRESS"};
+  } else {
+      active_job_info_->status = "IN_PROGRESS";
+  }
+  PublishJobStatusWrapper(job_id, operation, "IN_PROGRESS");
+
+  // Dispatch to specific handlers
+  if (strcmp(operation, "FIRMWARE_UPDATE") == 0) {
+    StartFirmwareUpdate(job_doc);
+  } else if (strcmp(operation, "TRACK_RESET") == 0) {
+    StartTrackReset(job_doc);
+  } else if (strcmp(operation, "POWER_CYCLE") == 0) {
+    StartPowerCycle(job_doc);
+  } else if (strcmp(operation, "FACTORY_RESET") == 0) {
+    StartFactoryReset(job_doc);
+  } else {
+    ESP_LOGE(kTag, "Unknown operation '%s' for new job '%s'.", operation,
+             job_id);
+    PublishJobStatusWrapper(job_id, operation, "FAILED",
+                            "Unknown operation type");
+    active_job_info_.reset();  // Clear the failed job
+  }
+}
+
+void JobManager::DispatchInProgressJobCheck(
+    const rapidjson::Document& job_doc) {
+  // This function assumes active_job_info_ is already set to IN_PROGRESS
+  // for this job_doc by the caller (ProcessJobDocument).
+  if (!active_job_info_) {
+    ESP_LOGE(kTag, "DispatchInProgressJobCheck called with no active job info!");
+    return;
+  }
+
+  const char* job_id = active_job_info_->job_id.c_str();
+  const char* operation = active_job_info_->operation.c_str();
+
+  const rapidjson::Value* payload = nullptr;
+  if (job_doc.HasMember("payload") && job_doc["payload"].IsObject()) {
+    payload = &job_doc["payload"];
+  }
+
+  ESP_LOGI(kTag,
+           "Dispatching IN_PROGRESS check for job '%s', operation '%s'.",
+           job_id, operation);
+
+  if (strcmp(operation, "FIRMWARE_UPDATE") == 0) {
+    if (!payload || !payload->HasMember("firmwareVersion") ||
+        !(*payload)["firmwareVersion"].IsString()) {
+      ESP_LOGE(
+          kTag,
+          "FIRMWARE_UPDATE job '%s' IN_PROGRESS missing 'firmwareVersion' in "
+          "payload.",
+          job_id);
+      PublishJobStatusWrapper(
+          job_id, operation, "FAILED",
+          "IN_PROGRESS: Missing firmwareVersion for verification");
+      active_job_info_.reset();
+      return;
+    }
+    const char* target_version = (*payload)["firmwareVersion"].GetString();
+    char current_version_str[32];  // Ensure size is adequate
+    strncpy(current_version_str, test::version::test_FW_VERSION,
+            sizeof(current_version_str) - 1);
+    current_version_str[sizeof(current_version_str) - 1] = '\0';
+
+    if (strcmp(current_version_str, target_version) == 0) {
+      ESP_LOGI(
+          kTag,
+          "Firmware version '%s' matches target for job '%s'. Reporting "
+          "SUCCEEDED.",
+          current_version_str, job_id);
+      PublishJobStatusWrapper(job_id, operation, "SUCCEEDED",
+                              "Firmware update verified.");
+      active_job_info_.reset();
+    } else {
+      esp_ota_img_states_t ota_state = ESP_OTA_IMG_UNDEFINED;
+      const esp_partition_t* running_partition =
+          esp_ota_get_running_partition();
+      if (running_partition != nullptr) {
+        esp_err_t err =
+            esp_ota_get_state_partition(running_partition, &ota_state);
+        if (err != ESP_OK) {
+          ESP_LOGE(kTag,
+                   "Failed to get OTA state for job '%s', err=0x%x. Assuming "
+                   "problematic state.",
+                   job_id, err);
+          ota_state = ESP_OTA_IMG_ABORTED;
+        }
+      } else {
+        ESP_LOGE(kTag, "Could not get running partition for job '%s'.", job_id);
+        ota_state = ESP_OTA_IMG_ABORTED;  // Critical error if no running partition
+      }
+
+      if (ota_state == ESP_OTA_IMG_PENDING_VERIFY) {
+        ESP_LOGE(
+            kTag,
+            "Job '%s': OTA PENDING_VERIFY, but current version '%s' != target "
+            "'%s'. Reporting FAILED.",
+            job_id, current_version_str, target_version);
+        // Consider esp_ota_mark_app_invalid_rollback_and_reboot() here
+        PublishJobStatusWrapper(
+            job_id, operation, "FAILED",
+            "Post-OTA verification failed: version mismatch in PENDING_VERIFY "
+            "state.");
+        active_job_info_.reset();
+      } else {
+        ESP_LOGW(kTag,
+                 "Job '%s': Firmware version '%s' != target '%s'. Not "
+                 "PENDING_VERIFY (state: %d). Update likely failed/interrupted. "
+                 "Reporting FAILED.",
+                 job_id, current_version_str, target_version, ota_state);
+        PublishJobStatusWrapper(job_id, operation, "FAILED",
+                                "Firmware update state inconsistent on reboot.");
+        active_job_info_.reset();
+      }
+    }
+  } else if (strcmp(operation, "POWER_CYCLE") == 0) {
+    ESP_LOGI(kTag, "POWER_CYCLE job '%s' found IN_PROGRESS. Reporting SUCCEEDED.",
+             job_id);
+    PublishJobStatusWrapper(job_id, operation, "SUCCEEDED",
+                            "Power cycle completed.");
+    active_job_info_.reset();
+  } else if (strcmp(operation, "FACTORY_RESET") == 0) {
+    ESP_LOGI(kTag,
+             "FACTORY_RESET job '%s' found IN_PROGRESS. Reporting SUCCEEDED.",
+             job_id);
+    PublishJobStatusWrapper(job_id, operation, "SUCCEEDED",
+                            "Factory reset presumed completed.");
+    active_job_info_.reset();
+  } else {  // For TRACK_RESET or other non-reboot operations
+    ESP_LOGW(
+        kTag,
+        "Non-reboot operation '%s' for job '%s' found IN_PROGRESS after "
+        "reboot. Implies interruption. Reporting FAILED.",
+        operation, job_id);
+    PublishJobStatusWrapper(job_id, operation, "FAILED",
+                            "Operation interrupted by unexpected reboot.");
+    active_job_info_.reset();
+  }
+}
+
+// --- Action Starting Method Implementations ---
+
+void JobManager::StartFirmwareUpdate(const rapidjson::Document& job_doc) {
+  if (!active_job_info_) {
+    ESP_LOGE(kTag, "StartFirmwareUpdate called with no active job!");
+    return;
+  }
+  const char* job_id = active_job_info_->job_id.c_str();
+  const char* operation = active_job_info_->operation.c_str();
+
+  if (!job_doc.HasMember("payload") || !job_doc["payload"].IsObject() ||
+      !job_doc["payload"].HasMember("firmwareUrl") ||
+      !job_doc["payload"]["firmwareUrl"].IsString() ||
+      !job_doc["payload"].HasMember("firmwareVersion") ||
+      !job_doc["payload"]["firmwareVersion"].IsString()) {
+    ESP_LOGE(kTag,
+             "FIRMWARE_UPDATE job '%s' missing required payload fields "
+             "(firmwareUrl, firmwareVersion).",
+             job_id);
+    PublishJobStatusWrapper(job_id, operation, "FAILED",
+                            "Missing required payload fields for OTA.");
+    active_job_info_.reset();
+    return;
+  }
+  // const char* url = job_doc["payload"]["firmwareUrl"].GetString();
+  // const char* version_target =
+  // job_doc["payload"]["firmwareVersion"].GetString();
+
+  ESP_LOGI(kTag,
+           "Initiating OTA process for job '%s'. (Simulation: will call "
+           "esp_restart).",
+           job_id);
+  // TODO: Implement actual OTA task creation and management.
+  // This task would handle download, flash, esp_ota_set_boot_partition.
+  // If any step *before* esp_restart fails, that task must ensure
+  // PublishJobStatusWrapper(..., "FAILED", ...) is called and
+  // active_job_info_ is reset (thread-safely, e.g., via event to main task).
+  esp_restart();  // Simulate reboot after OTA set_boot_partition
+}
+
+void JobManager::StartPowerCycle(const rapidjson::Document& job_doc) {
+  if (!active_job_info_) {
+    ESP_LOGE(kTag, "StartPowerCycle called with no active job!");
+    return;
+  }
+  ESP_LOGI(kTag, "Executing POWER_CYCLE for job '%s'. Rebooting...",
+           active_job_info_->job_id.c_str());
+  esp_restart();
+}
+
+void JobManager::StartFactoryReset(const rapidjson::Document& job_doc) {
+  if (!active_job_info_) {
+    ESP_LOGE(kTag, "StartFactoryReset called with no active job!");
+    return;
+  }
+  ESP_LOGI(
+      kTag,
+      "Executing FACTORY_RESET for job '%s'. (Simulating reboot after reset "
+      "actions).",
+      active_job_info_->job_id.c_str());
+  // TODO: Implement actual factory reset procedure.
+  // WARNING: Ensure device identity for MQTT is preserved or restored if this
+  // job is expected to report SUCCEEDED after reset.
+  esp_restart();
+}
+
+void JobManager::StartTrackReset(const rapidjson::Document& job_doc) {
+  if (!active_job_info_) {
+    ESP_LOGE(kTag, "StartTrackReset called with no active job!");
+    return;
+  }
+  const char* job_id = active_job_info_->job_id.c_str();
+  const char* operation = active_job_info_->operation.c_str();
+
+  ESP_LOGI(kTag, "Executing TRACK_RESET for job '%s'.", job_id);
+  // const rapidjson::Value* payload = job_doc.HasMember("payload") ?
+  // &job_doc["payload"] : nullptr;
+  // ... perform actual track reset logic ...
+  bool success = true;  // Placeholder for actual track reset success/failure
+
+  if (success) {
+    ESP_LOGI(kTag, "TRACK_RESET for job '%s' SUCCEEDED.", job_id);
+    PublishJobStatusWrapper(job_id, operation, "SUCCEEDED",
+                            "Track reset completed successfully.");
+  } else {
+    ESP_LOGE(kTag, "TRACK_RESET for job '%s' FAILED.", job_id);
+    PublishJobStatusWrapper(job_id, operation, "FAILED",
+                            "Track reset operation failed.");
+  }
+  active_job_info_.reset();  // Job is complete (or failed), clear active state.
+}
+
+}  // namespace jobs
+}  // namespace test
