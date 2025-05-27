@@ -3,7 +3,7 @@
  * @brief Defines the HttpsClient class for HTTPS communication using the PIMPL idiom.
  * The public interface is platform-agnostic; implementation details are hidden.
  * @author Gemini
- * @date 2025-05-27 Current time is Tuesday, May 27, 2025 at 12:43:46 PM IST.
+ * @date 2025-05-27 Current time is Tuesday, May 27, 2025 at 2:33:12 PM IST.
  */
 #ifndef HTTPS_CLIENT_H
 #define HTTPS_CLIENT_H
@@ -31,22 +31,11 @@ class HttpsClient {
 public:
     // --- Public Nested Types and Constants ---
 
-    /**
-     * @brief Maximum supported length for a full URL passed to request methods.
-     * Implementations use this to size internal buffers for URLs.
-     */
+    /** @brief Maximum supported length for a full URL passed to request methods. */
     static constexpr size_t kMaxUrlLength = 2048;
-
-    /**
-     * @brief Maximum supported length for an HTTP header key name.
-     * Used by implementations for internal buffers when processing header keys.
-     */
+    /** @brief Maximum supported length for an HTTP header key name. */
     static constexpr size_t kMaxHeaderKeyLen = 64;
-
-    /**
-     * @brief Maximum supported length for an HTTP header value.
-     * Used by implementations for internal buffers when processing header values.
-     */
+    /** @brief Maximum supported length for an HTTP header value. */
     static constexpr size_t kMaxHeaderValueLen = 512;
 
     /**
@@ -83,94 +72,57 @@ public:
 
     /**
      * @brief Converts an HttpsClient::Status enum value to a descriptive string literal.
-     * Useful for logging and debugging.
      * @param status The status code to convert.
      * @return A null-terminated string describing the status. Never returns null.
      */
     static const char* StatusToString(Status status);
 
-    /**
-     * @brief Callback function type for receiving response body data in chunks.
-     * @param data Pointer to the data chunk received. This pointer is only valid for the duration of the callback. Not null-terminated.
-     * @param len Length of the data chunk in bytes.
-     * @param user_context User-provided context pointer (from Config::user_context at the time of Open).
-     * @return HttpsClient::Status Should return HttpsClient::Status::kOk on success.
-     * Returning any other status will signal an error to the client and attempt to abort the request.
-     */
+    /** @brief Callback for receiving response body data. */
     using DataReceivedCallback =
         std::function<Status(const char* data, size_t len, void* user_context)>;
-
-    /**
-     * @brief Callback function type for providing request body data in chunks for streaming uploads.
-     * @param buffer Buffer to write the chunk data into.
-     * @param max_len Maximum number of bytes that can be written into the buffer (typically equals the configured TX buffer size).
-     * @param user_context User-provided context pointer (from Config::user_context at the time of Open).
-     * @return int The number of bytes written into the buffer (must be <= max_len).
-     * Return 0 to indicate the end of data (EOF). All data specified by Content-Length must have been sent.
-     * Return a negative value to indicate an error condition, which will abort the upload.
-     */
+    /** @brief Callback for providing request body data for streaming. */
     using DataProviderCallback =
         std::function<int(char* buffer, size_t max_len, void* user_context)>;
 
-    /**
-     * @brief Configuration structure used when calling Open().
-     * Contains settings for the HTTPS client instance.
-     */
+    /** @brief Configuration for the HttpsClient. */
     struct Config {
-        /** @brief RX buffer size for the underlying HTTP implementation. Affects max chunk size for received data/headers. Must be > 0. */
-        size_t buffer_size_rx_bytes = 4096;
-        /** @brief TX buffer size for the underlying HTTP implementation. Affects stream upload chunk buffer size. Must be > 0. */
-        size_t buffer_size_tx_bytes = 4096;
-        /** @brief Set to true to enable server certificate verification (recommended for production). */
-        bool verify_server = true;
-        /** @brief Pointer to the server's root CA certificate(s) in PEM format. Required if verify_server is true and not relying on a system trust store/bundle. String must persist for the lifetime of the client or until Close(). */
-        const char* server_cert_pem = nullptr;
-        /** @brief Overall timeout for connection and request processing, in milliseconds. */
-        int timeout_ms = 10000;
-        /** @brief TCP Keep-Alive: Idle time in seconds before sending keep-alive probes. */
-        int keep_alive_idle_sec = 5;
-        /** @brief TCP Keep-Alive: Interval in seconds between keep-alive probes. */
-        int keep_alive_interval_sec = 5;
-        /** @brief TCP Keep-Alive: Number of probes to send before timing out. */
-        int keep_alive_count = 3;
-        /** @brief Optional user context pointer passed unmodified to all callbacks (DataReceivedCallback, DataProviderCallback). This context is set during Open(). */
+        size_t buffer_size_rx_bytes = 4096; ///< RX buffer size for underlying implementation.
+        size_t buffer_size_tx_bytes = 4096; ///< TX buffer size for underlying implementation.
+        bool verify_server = true;          ///< Enable server certificate verification.
+        const char* server_cert_pem = nullptr; ///< Server's root CA certificate in PEM format.
+        int timeout_ms = 10000;             ///< Connection and request timeout in milliseconds.
+        int keep_alive_idle_sec = 5;        ///< TCP Keep-Alive idle time in seconds.
+        int keep_alive_interval_sec = 5;    ///< TCP Keep-Alive interval in seconds.
+        int keep_alive_count = 3;           ///< TCP Keep-Alive number of probes.
+        /** @brief User context pointer for callbacks, set during Open(). */
         void* user_context = nullptr;
     };
 
-    /**
-     * @brief Structure to hold response information obtained after an HTTP request.
-     */
+    /** @brief Holds response information. */
     struct ResponseInfo {
-        /** @brief HTTP status code returned by the server (e.g., 200, 404). */
-        int status_code = 0;
-        /** @brief Content-Length value from the response headers. Is -1 if not present (e.g., chunked encoding or HEAD request with no Content-Length). */
-        long long content_length = -1;
-        /** @brief Flag indicating if the server sent a 'Connection: close' header. */
-        bool connection_close = false;
+        int status_code = 0;                ///< HTTP status code from server.
+        long long content_length = -1;      ///< Content-Length from response headers.
+        bool connection_close = false;      ///< True if 'Connection: close' was received.
     };
 
-    /** @brief Type alias for HTTP request headers, represented as a map of string views.
-     * The string views must point to valid memory for the duration of the request call.
-     */
+    /** @brief Type for HTTP request headers. */
     using Headers = std::map<std::string_view, std::string_view>;
 
     // --- Constructor and Destructor ---
     /**
      * @brief Constructs an HttpsClient instance.
-     * The client is not yet ready for requests until Open() is called.
+     * The client is not ready for requests until Open() is successfully called.
      */
     HttpsClient();
     /**
-     * @brief Destroys the HttpsClient instance.
-     * Automatically calls Close() to release any underlying resources if the client was open.
-     * @note The definition is in the .cpp file to allow `std::unique_ptr<PlatformHttpClientImpl>` to see the full definition of `PlatformHttpClientImpl`.
+     * @brief Destroys the HttpsClient instance and cleans up resources.
+     * Automatically calls Close() if the client was open.
+     * @note The definition is in the .cpp file to allow `std::unique_ptr<PlatformHttpClientImpl>`
+     * to correctly delete the `PlatformHttpClientImpl` object (which requires `PlatformHttpClientImpl` to be a complete type).
      */
     ~HttpsClient();
 
     // --- Rule of Five/Six: Non-Copyable and Non-Movable ---
-    // PIMPL often makes copying/moving complex if not handled by smart pointers correctly.
-    // For this client, let's make it non-copyable and non-movable for simplicity.
-    // If move semantics are needed, they would require careful implementation of the PIMPL's ownership.
     HttpsClient(const HttpsClient&) = delete;
     HttpsClient& operator=(const HttpsClient&) = delete;
     HttpsClient(HttpsClient&&) = delete;
@@ -179,57 +131,48 @@ public:
     // --- Public API Methods ---
 
     /**
-     * @brief Initializes the client and underlying resources based on the provided configuration.
-     * This method is BLOCKING.
+     * @brief Initializes the client and underlying resources. BLOCKING.
      * @param config Configuration settings for this client instance.
-     * @return Status::kOk on success, or an appropriate error status otherwise.
+     * @return Status::kOk on success, or an error status otherwise.
      */
     Status Open(const Config& config);
 
     /**
-     * @brief Closes any open connection and releases all associated underlying resources.
-     * This method can be BLOCKING, depending on the underlying implementation's cleanup process.
-     * It is safe to call Close() even if the client is already closed or was never opened.
-     * @return Status::kOk on successful closure (or if already closed), or an error status on cleanup failure.
+     * @brief Closes any open connection and releases resources. BLOCKING (potentially).
+     * Safe to call even if already closed or never opened.
+     * @return Status::kOk on success, or an error status on cleanup failure.
      */
     Status Close();
 
     /**
-     * @brief Performs an HTTP HEAD request to the specified URL.
-     * This retrieves only the headers from the server, not the message body.
-     * This method is BLOCKING.
-     * @param url The full URL for the request (e.g., "https://example.com/resource"). Must be <= HttpsClient::kMaxUrlLength.
-     * @param headers A map of additional request headers to send. Keys/values should adhere to kMaxHeaderKeyLen/ValueLen.
-     * @param response_info Pointer to a ResponseInfo struct where response details (status code, content length, etc.) will be stored. This argument cannot be nullptr for HEAD.
-     * @return Status::kOk if the request cycle completed successfully at the transport/protocol level.
-     * Check `response_info->status_code` for the actual HTTP success (e.g., 200).
-     * Returns other status codes on failure (e.g., network error, timeout).
+     * @brief Performs an HTTP HEAD request to retrieve headers. BLOCKING.
+     * @param url The full URL. Must be <= HttpsClient::kMaxUrlLength.
+     * @param headers Additional request headers.
+     * @param response_info Pointer to store response details. Cannot be nullptr for HEAD.
+     * @return Status::kOk on transport/protocol success. Check response_info->status_code for HTTP success.
      */
     Status Head(std::string_view url, const Headers& headers, ResponseInfo* response_info);
 
     /**
-     * @brief Performs an HTTP GET request to the specified URL.
-     * This method is BLOCKING.
-     * @param url The full URL for the request. Must be <= HttpsClient::kMaxUrlLength.
-     * @param headers A map of additional request headers.
-     * @param on_data_received Callback function to handle incoming response body data chunks. Can be nullptr if the body is to be ignored (though some data might still be buffered internally).
-     * @param response_info Optional pointer to a ResponseInfo struct to store response details.
-     * @return Status::kOk if the request cycle completed successfully at the transport/protocol level.
-     * Check `response_info->status_code` (if provided) for HTTP success.
+     * @brief Performs an HTTP GET request. BLOCKING.
+     * @param url The full URL. Must be <= HttpsClient::kMaxUrlLength.
+     * @param headers Additional request headers.
+     * @param on_data_received Callback for response body chunks. Can be nullptr.
+     * @param response_info Optional pointer to store response details.
+     * @return Status::kOk on transport/protocol success. Check response_info->status_code.
      */
     Status Get(std::string_view url, const Headers& headers,
                DataReceivedCallback on_data_received,
                ResponseInfo* response_info = nullptr);
 
     /**
-     * @brief Performs an HTTP POST request with a non-streaming (full buffer) body.
-     * This method is BLOCKING.
-     * @param url The full URL for the request. Must be <= HttpsClient::kMaxUrlLength.
-     * @param headers A map of additional request headers (e.g., "Content-Type").
-     * @param post_data The entire request body data as a string view.
+     * @brief Performs an HTTP POST request. BLOCKING.
+     * @param url The full URL. Must be <= HttpsClient::kMaxUrlLength.
+     * @param headers Additional request headers (e.g., "Content-Type").
+     * @param post_data The entire request body.
      * @param on_data_received Callback for response body chunks. Can be nullptr.
-     * @param response_info Optional pointer to a ResponseInfo struct.
-     * @return Status::kOk if the request cycle completed successfully. Check `response_info->status_code`.
+     * @param response_info Optional pointer to store response details.
+     * @return Status::kOk on transport/protocol success. Check response_info->status_code.
      */
     Status Post(std::string_view url, const Headers& headers,
                 std::string_view post_data,
@@ -237,15 +180,14 @@ public:
                 ResponseInfo* response_info = nullptr);
 
     /**
-     * @brief Performs an HTTP POST request with a streaming request body.
-     * This method is BLOCKING for the duration of the stream.
-     * @param url The full URL for the request. Must be <= HttpsClient::kMaxUrlLength.
-     * @param headers A map of additional request headers. MUST include "Content-Length" matching `total_body_length`.
-     * @param total_body_length The total size in bytes of the request body to be streamed.
-     * @param data_provider Callback function to provide request body data in chunks. Must not be nullptr.
+     * @brief Performs an HTTP POST request with a streaming request body. BLOCKING.
+     * @param url The full URL. Must be <= HttpsClient::kMaxUrlLength.
+     * @param headers Additional request headers (MUST include "Content-Length").
+     * @param total_body_length Total size in bytes of the request body.
+     * @param data_provider Callback to provide request body chunks. Must not be nullptr.
      * @param on_data_received Callback for response body chunks. Can be nullptr.
-     * @param response_info Optional pointer to a ResponseInfo struct.
-     * @return Status::kOk if the request/response cycle completed successfully. Check `response_info->status_code`.
+     * @param response_info Optional pointer to store response details.
+     * @return Status::kOk on transport/protocol success. Check response_info->status_code.
      */
     Status PostStream(std::string_view url, const Headers& headers,
                       size_t total_body_length,
@@ -254,14 +196,13 @@ public:
                       ResponseInfo* response_info = nullptr);
 
     /**
-     * @brief Performs an HTTP PUT request with a non-streaming (full buffer) body.
-     * This method is BLOCKING.
-     * @param url The full URL for the request. Must be <= HttpsClient::kMaxUrlLength.
-     * @param headers A map of additional request headers.
-     * @param put_data The entire request body data.
+     * @brief Performs an HTTP PUT request. BLOCKING.
+     * @param url The full URL. Must be <= HttpsClient::kMaxUrlLength.
+     * @param headers Additional request headers.
+     * @param put_data The entire request body.
      * @param on_data_received Callback for response body chunks. Can be nullptr.
-     * @param response_info Optional pointer to a ResponseInfo struct.
-     * @return Status::kOk if the request cycle completed successfully. Check `response_info->status_code`.
+     * @param response_info Optional pointer to store response details.
+     * @return Status::kOk on transport/protocol success. Check response_info->status_code.
      */
     Status Put(std::string_view url, const Headers& headers,
                std::string_view put_data,
@@ -269,15 +210,14 @@ public:
                ResponseInfo* response_info = nullptr);
 
     /**
-     * @brief Performs an HTTP PUT request with a streaming request body.
-     * This method is BLOCKING for the duration of the stream.
-     * @param url The full URL for the request. Must be <= HttpsClient::kMaxUrlLength.
-     * @param headers A map of additional request headers. MUST include "Content-Length".
+     * @brief Performs an HTTP PUT request with a streaming request body. BLOCKING.
+     * @param url The full URL. Must be <= HttpsClient::kMaxUrlLength.
+     * @param headers Additional request headers (MUST include "Content-Length").
      * @param total_body_length The total size in bytes of the request body.
-     * @param data_provider Callback function to provide request body chunks. Must not be nullptr.
+     * @param data_provider Callback to provide request body chunks. Must not be nullptr.
      * @param on_data_received Callback for response body chunks. Can be nullptr.
-     * @param response_info Optional pointer to a ResponseInfo struct.
-     * @return Status::kOk if the request/response cycle completed successfully. Check `response_info->status_code`.
+     * @param response_info Optional pointer to store response details.
+     * @return Status::kOk on transport/protocol success. Check response_info->status_code.
      */
     Status PutStream(std::string_view url, const Headers& headers,
                      size_t total_body_length,
@@ -286,14 +226,13 @@ public:
                      ResponseInfo* response_info = nullptr);
 
     /**
-     * @brief Performs an HTTP PATCH request with a non-streaming (full buffer) body.
-     * This method is BLOCKING.
-     * @param url The full URL for the request. Must be <= HttpsClient::kMaxUrlLength.
-     * @param headers A map of additional request headers.
+     * @brief Performs an HTTP PATCH request. BLOCKING.
+     * @param url The full URL. Must be <= HttpsClient::kMaxUrlLength.
+     * @param headers Additional request headers.
      * @param patch_data The entire request body data.
      * @param on_data_received Callback for response body chunks. Can be nullptr.
-     * @param response_info Optional pointer to a ResponseInfo struct.
-     * @return Status::kOk if the request cycle completed successfully. Check `response_info->status_code`.
+     * @param response_info Optional pointer to store response details.
+     * @return Status::kOk on transport/protocol success. Check response_info->status_code.
      */
     Status Patch(std::string_view url, const Headers& headers,
                  std::string_view patch_data,
@@ -305,7 +244,7 @@ private:
      * @class PlatformHttpClientImpl
      * @brief Forward declaration for the PIMPL pattern.
      * The actual definition of this class is hidden in the .cpp file
-     * and contains platform-specific implementation details.
+     * and contains platform-specific implementation details (e.g., for ESP32).
      */
     class PlatformHttpClientImpl;
     /**
@@ -316,14 +255,14 @@ private:
 
 #endif // HTTPS_CLIENT_H
 
-------------------------------------------------------------------------------------
+------------------------------------------------------------------------------------------------------
 
-  /**
+/**
  * @file https_client.cpp
  * @brief Implements the HttpsClient class using the PIMPL idiom.
  * The HttpsClient::PlatformHttpClientImpl class encapsulates ESP-IDF specific details.
  * @author Gemini
- * @date 2025-05-26 Current time is Monday, May 26, 2025 at 6:42:39 AM IST.
+ * @date 2025-05-27 Current time is Tuesday, May 27, 2025 at 2:33:12 PM IST.
  */
 #include "https_client.h" // Public interface
 
@@ -343,18 +282,19 @@ private:
 #define ESP32_PLATFORM
 #endif
 
-#ifdef ESP32_PLATFORM
-#include "esp_crt_bundle.h"
+#ifdef ESP32_PLATFORM // Only include if ESP32 platform is targeted
+#include "esp_crt_bundle.h" // For esp_crt_bundle_attach
 #endif
-#include "errno.h"
+#include "errno.h" // For POSIX error codes, potentially
 
-// Logging Tag for the implementation
+// Logging Tag for the implementation details
 static const char* TAG_IMPL = "HttpsClientImpl";
 
 // --- HttpsClient::PlatformHttpClientImpl Definition ---
 class HttpsClient::PlatformHttpClientImpl {
 public:
-    // --- Types needed by Impl (can alias from HttpsClient or be direct) ---
+    // Use HttpsClient's public types for clarity and consistency
+    // These are already accessible via HttpsClient:: but can be aliased for brevity within Impl
     using Status = HttpsClient::Status;
     using HttpMethod = HttpsClient::HttpMethod;
     using Config = HttpsClient::Config;
@@ -363,34 +303,39 @@ public:
     using DataReceivedCallback = HttpsClient::DataReceivedCallback;
     using DataProviderCallback = HttpsClient::DataProviderCallback;
 
-    // Context for ESP-IDF event handler
-    struct RequestContext {
-        DataReceivedCallback on_data_received_cb = nullptr;
-        void* user_context_from_config = nullptr; // From HttpsClient::Config
-        ResponseInfo* response_info_ptr_user = nullptr;   // Points to user's ResponseInfo
+    /**
+     * @brief Internal context passed to the ESP-IDF event handler.
+     * This struct is specific to the PlatformHttpClientImpl.
+     */
+    struct ImplRequestContext {
+        DataReceivedCallback on_data_received_cb = nullptr;    ///< User's callback for data
+        void* user_context_from_config = nullptr;            ///< User context from HttpsClient::Config
+        ResponseInfo* response_info_ptr_user = nullptr;      ///< Points to user's HttpsClient::ResponseInfo struct
     };
 
     esp_http_client_handle_t esp_client_handle_ = nullptr;
-    RequestContext current_request_ctx_;
-    size_t tx_buffer_size_ = 0;
-    // Config current_config_; // Store a copy of the config used at Open() if needed across calls after Open
+    ImplRequestContext current_request_ctx_; // Holds context for the current request
+    size_t tx_buffer_size_ = 0;          // Stored from Config for stream uploads
 
     PlatformHttpClientImpl() = default;
 
     ~PlatformHttpClientImpl() {
         if (esp_client_handle_) {
-            Close(); // Ensure cleanup
+            ESP_LOGI(TAG_IMPL, "PlatformHttpClientImpl destructor: Cleaning up open client handle.");
+            Close(); // Ensure underlying client is cleaned up
         }
     }
 
     Status Open(const Config& config) {
-        if (esp_client_handle_) { ESP_LOGW(TAG_IMPL, "PlatformHttpClientImpl::Open: Already open."); return Status::kAlreadyInitialized; }
+        if (esp_client_handle_) {
+            ESP_LOGW(TAG_IMPL, "Open: Client already initialized.");
+            return Status::kAlreadyInitialized;
+        }
         if (config.buffer_size_rx_bytes == 0 || config.buffer_size_tx_bytes == 0) {
-            ESP_LOGE(TAG_IMPL, "PlatformHttpClientImpl::Open: Buffer sizes must be non-zero.");
+            ESP_LOGE(TAG_IMPL, "Open: Buffer sizes must be non-zero.");
             return Status::kInvalidArgument;
         }
 
-        // current_config_ = config; // Store if needed for other methods that don't receive it
         tx_buffer_size_ = config.buffer_size_tx_bytes;
 
         esp_http_client_config_t esp_config = {};
@@ -402,61 +347,58 @@ public:
         esp_config.keep_alive_idle = config.keep_alive_idle_sec;
         esp_config.keep_alive_interval = config.keep_alive_interval_sec;
         esp_config.keep_alive_count = config.keep_alive_count;
-
-        current_request_ctx_ = {}; // Reset context for Open
+        
+        current_request_ctx_ = {}; // Reset context for this Open call
         current_request_ctx_.user_context_from_config = config.user_context;
-        esp_config.user_data = &current_request_ctx_;
-        esp_config.event_handler = PlatformHttpClientImpl::PlatformEventHandler; // Static member
+        esp_config.user_data = &current_request_ctx_; // Pass address of Impl's RequestContext
+        esp_config.event_handler = PlatformHttpClientImpl::PlatformEventHandler; // Use static member
 
         if (config.verify_server) {
             esp_config.cert_pem = config.server_cert_pem;
             esp_config.skip_cert_common_name_check = false;
-            #if defined(ESP32_PLATFORM) && ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(4,0,0) // Check IDF version for crt_bundle_attach
-                #ifdef CONFIG_ESP_TLS_CRT_BUNDLE_ATTACH
-                    esp_config.crt_bundle_attach = esp_crt_bundle_attach;
-                #else
-                    if (!config.server_cert_pem) {
-                        ESP_LOGE(TAG_IMPL, "Open: Server verification ON, but no server_cert_pem and CRT bundle N/A.");
-                        return Status::kInvalidArgument;
-                    }
-                #endif
-            #else // Older IDF or non-ESP32 where bundle might not be available/used this way
-                 if (!config.server_cert_pem) {
-                    ESP_LOGE(TAG_IMPL, "Open: Server verification ON, but no server_cert_pem provided.");
-                    return Status::kInvalidArgument;
-                 }
+            #if defined(ESP32_PLATFORM) && defined(CONFIG_ESP_TLS_CRT_BUNDLE_ATTACH)
+                esp_config.crt_bundle_attach = esp_crt_bundle_attach;
+                ESP_LOGI(TAG_IMPL, "Open: ESP-TLS CRT Bundle Attach enabled via Kconfig.");
+            #else
+                // If CRT bundle is not used/available, server_cert_pem becomes more critical
+                if (!config.server_cert_pem) {
+                    ESP_LOGW(TAG_IMPL, "Open: Server verification ON, but no server_cert_pem provided and CRT bundle not used/available.");
+                    // Depending on strictness, could return kInvalidArgument here.
+                    // For now, allow proceeding, esp_http_client_init might fail later if cert is truly needed.
+                }
             #endif
         } else {
-            ESP_LOGW(TAG_IMPL, "PlatformHttpClientImpl::Open: Server certificate verification is DISABLED.");
+            ESP_LOGW(TAG_IMPL, "Open: Server certificate verification is DISABLED.");
             esp_config.cert_pem = nullptr;
             esp_config.skip_cert_common_name_check = true;
         }
 
         esp_client_handle_ = esp_http_client_init(&esp_config);
         if (!esp_client_handle_) {
-            ESP_LOGE(TAG_IMPL, "PlatformHttpClientImpl::Open: esp_http_client_init failed.");
-            tx_buffer_size_ = 0;
+            ESP_LOGE(TAG_IMPL, "Open: esp_http_client_init failed.");
+            tx_buffer_size_ = 0; 
             return Status::kFail;
         }
-        ESP_LOGI(TAG_IMPL, "PlatformHttpClientImpl opened successfully.");
+        ESP_LOGI(TAG_IMPL, "PlatformHttpClientImpl opened successfully (ESP32).");
         return Status::kOk;
     }
 
     Status Close() {
         esp_err_t err = ESP_OK;
         if (esp_client_handle_) {
+            // Detach user_data before cleanup to avoid potential use-after-free if handler is called during cleanup
+            esp_http_client_set_user_data(esp_client_handle_, nullptr);
             err = esp_http_client_cleanup(esp_client_handle_);
             esp_client_handle_ = nullptr;
             tx_buffer_size_ = 0;
             if (err != ESP_OK) {
-                ESP_LOGE(TAG_IMPL, "PlatformHttpClientImpl::Close: esp_http_client_cleanup failed: %s", esp_err_to_name(err));
+                ESP_LOGE(TAG_IMPL, "Close: esp_http_client_cleanup failed: %s", esp_err_to_name(err));
             }
         } else {
-            ESP_LOGD(TAG_IMPL, "PlatformHttpClientImpl::Close: Client already closed or never opened.");
+            ESP_LOGD(TAG_IMPL, "Close: Client was already closed or never opened.");
         }
-        // Reset context for safety, though it's mostly set per-request
-        current_request_ctx_ = {};
-        ESP_LOGI(TAG_IMPL, "PlatformHttpClientImpl closed.");
+        current_request_ctx_ = {}; // Reset context
+        if (err == ESP_OK) { ESP_LOGI(TAG_IMPL, "PlatformHttpClientImpl closed."); }
         return MapEspErrorToStatus(err);
     }
 
@@ -468,29 +410,27 @@ public:
             return Status::kNotInitialized;
         }
 
-        // current_request_ctx_.on_data_received_cb is set by the public Get/Post methods
+        // current_request_ctx_.on_data_received_cb is set by public methods like Get, Post, etc.
         current_request_ctx_.response_info_ptr_user = response_info_user;
-
-        if (response_info_user) {
-            // Reset user's ResponseInfo for this new request
-            response_info_user->status_code = 0;
-            response_info_user->content_length = -1;
-            response_info_user->connection_close = false;
+        
+        if (response_info_user) { 
+            *response_info_user = {}; // Reset user's ResponseInfo
         }
 
-        esp_err_t err;
+        esp_err_t err_esp;
         std::array<char, HttpsClient::kMaxUrlLength> url_buffer;
         int len = snprintf(url_buffer.data(), url_buffer.size(), "%.*s", (int)url.length(), url.data());
         if (len < 0 || static_cast<size_t>(len) >= url_buffer.size()) {
-            ESP_LOGE(TAG_IMPL, "URL '%.*s' (len %zu) exceeds max length %zu.", (int)url.length(), url.data(), url.length(), HttpsClient::kMaxUrlLength - 1);
+            ESP_LOGE(TAG_IMPL, "PerformRequestInternal: URL '%.*s' (len %zu) exceeds max length %zu.",
+                     (int)url.length(), url.data(), url.length(), HttpsClient::kMaxUrlLength - 1);
             return Status::kBufferTooSmall;
         }
 
-        err = esp_http_client_set_url(esp_client_handle_, url_buffer.data());
-        if (err != ESP_OK) { ESP_LOGE(TAG_IMPL, "set_url failed: %s", esp_err_to_name(err)); return MapEspErrorToStatus(err); }
+        err_esp = esp_http_client_set_url(esp_client_handle_, url_buffer.data());
+        if (err_esp != ESP_OK) { ESP_LOGE(TAG_IMPL, "PerformRequestInternal: set_url failed: %s", esp_err_to_name(err_esp)); return MapEspErrorToStatus(err_esp); }
 
-        err = esp_http_client_set_method(esp_client_handle_, MapHttpMethodToEsp(method_enum));
-        if (err != ESP_OK) { ESP_LOGE(TAG_IMPL, "set_method failed: %s", esp_err_to_name(err)); return MapEspErrorToStatus(err); }
+        err_esp = esp_http_client_set_method(esp_client_handle_, MapHttpMethodToEsp(method_enum));
+        if (err_esp != ESP_OK) { ESP_LOGE(TAG_IMPL, "PerformRequestInternal: set_method failed: %s", esp_err_to_name(err_esp)); return MapEspErrorToStatus(err_esp); }
 
         std::array<char, HttpsClient::kMaxHeaderKeyLen> hk_buf;
         std::array<char, HttpsClient::kMaxHeaderValueLen> hv_buf;
@@ -499,16 +439,16 @@ public:
             snprintf(hv_buf.data(), hv_buf.size(), "%.*s", (int)h.second.length(), h.second.data());
             if (strnlen(hk_buf.data(), hk_buf.size()) >= hk_buf.size() - 1) { ESP_LOGW(TAG_IMPL, "Header key truncated: %.*s", (int)h.first.length(), h.first.data()); }
             if (strnlen(hv_buf.data(), hv_buf.size()) >= hv_buf.size() - 1) { ESP_LOGW(TAG_IMPL, "Header value for '%.*s' truncated.", (int)h.first.length(), h.first.data()); }
-            err = esp_http_client_set_header(esp_client_handle_, hk_buf.data(), hv_buf.data());
-            if (err != ESP_OK) { ESP_LOGE(TAG_IMPL, "set_header '%s' failed: %s", hk_buf.data(), esp_err_to_name(err)); return MapEspErrorToStatus(err); }
+            err_esp = esp_http_client_set_header(esp_client_handle_, hk_buf.data(), hv_buf.data());
+            if (err_esp != ESP_OK) { ESP_LOGE(TAG_IMPL, "PerformRequestInternal: set_header '%s' failed: %s", hk_buf.data(), esp_err_to_name(err_esp)); return MapEspErrorToStatus(err_esp); }
         }
 
         if (!request_body.empty()) {
-            err = esp_http_client_set_post_field(esp_client_handle_, request_body.data(), request_body.length());
-            if (err != ESP_OK) { ESP_LOGE(TAG_IMPL, "set_post_field failed: %s", esp_err_to_name(err)); return MapEspErrorToStatus(err); }
+            err_esp = esp_http_client_set_post_field(esp_client_handle_, request_body.data(), request_body.length());
+            if (err_esp != ESP_OK) { ESP_LOGE(TAG_IMPL, "PerformRequestInternal: set_post_field failed: %s", esp_err_to_name(err_esp)); return MapEspErrorToStatus(err_esp); }
             char* ct_val = nullptr;
             if (esp_http_client_get_header(esp_client_handle_, "Content-Type", &ct_val) != ESP_OK || ct_val == nullptr) {
-                ESP_LOGD(TAG_IMPL, "Auto-setting Content-Type to application/octet-stream for non-empty body.");
+                ESP_LOGD(TAG_IMPL, "PerformRequestInternal: Auto-setting Content-Type to application/octet-stream for non-empty body.");
                 esp_http_client_set_header(esp_client_handle_, "Content-Type", "application/octet-stream");
             }
             if (ct_val) free(ct_val);
@@ -518,15 +458,14 @@ public:
             bool te_present = (esp_http_client_get_header(esp_client_handle_, "Transfer-Encoding", &te_val) == ESP_OK && te_val != nullptr);
             if (cl_val) free(cl_val); if (te_val) free(te_val);
             if (!cl_present && !te_present) {
-                ESP_LOGD(TAG_IMPL, "Auto-setting Content-Length: 0 for empty body on method %d", static_cast<int>(method_enum));
+                ESP_LOGD(TAG_IMPL, "PerformRequestInternal: Auto-setting Content-Length: 0 for empty body on method %d.", static_cast<int>(method_enum));
                 esp_http_client_set_header(esp_client_handle_, "Content-Length", "0");
             }
         }
+        
+        err_esp = esp_http_client_perform(esp_client_handle_);
+        Status status = MapEspErrorToStatus(err_esp);
 
-        err = esp_http_client_perform(esp_client_handle_);
-        Status status = MapEspErrorToStatus(err);
-
-        // Final population of response_info_user, ensures it's set even if events didn't fully capture (e.g. error before events)
         if (response_info_user) {
             response_info_user->status_code = esp_http_client_get_status_code(esp_client_handle_);
             response_info_user->content_length = esp_http_client_get_content_length(esp_client_handle_);
@@ -539,8 +478,9 @@ public:
             int http_code = response_info_user ? response_info_user->status_code : esp_http_client_get_status_code(esp_client_handle_);
             ESP_LOGE(TAG_IMPL, "PerformRequestInternal failed: %s. HTTP Status (if available): %d", HttpsClient::StatusToString(status), http_code);
         }
-        current_request_ctx_.response_info_ptr_user = nullptr; // Clear after this request
-        current_request_ctx_.on_data_received_cb = nullptr; // Clear callback after this request
+        
+        current_request_ctx_.response_info_ptr_user = nullptr; 
+        current_request_ctx_.on_data_received_cb = nullptr;
         return status;
     }
 
@@ -552,7 +492,7 @@ public:
         if (tx_buffer_size_ == 0) { ESP_LOGE(TAG_IMPL, "StreamUpload: TX buffer size is 0."); return Status::kNotInitialized; }
 
         current_request_ctx_.response_info_ptr_user = response_info_user;
-        // current_request_ctx_.on_data_received_cb is set by the public PostStream/PutStream methods
+        // current_request_ctx_.on_data_received_cb is set by public PostStream/PutStream
 
         if (response_info_user) { *response_info_user = {}; }
 
@@ -570,11 +510,13 @@ public:
         for(const auto& h : headers){
             snprintf(hk_buf.data(),hk_buf.size(),"%.*s",(int)h.first.length(),h.first.data());
             snprintf(hv_buf.data(),hv_buf.size(),"%.*s",(int)h.second.length(),h.second.data());
+            if (strnlen(hk_buf.data(), hk_buf.size()) >= hk_buf.size() - 1) { ESP_LOGW(TAG_IMPL, "StreamUpload: Header key truncated."); }
+            if (strnlen(hv_buf.data(), hv_buf.size()) >= hv_buf.size() - 1) { ESP_LOGW(TAG_IMPL, "StreamUpload: Header value truncated."); }
             if(strcasecmp(hk_buf.data(),"Content-Length")==0) cl_found=true;
             esp_http_client_set_header(esp_client_handle_,hk_buf.data(),hv_buf.data());
         }
         if(!cl_found) { ESP_LOGE(TAG_IMPL, "StreamUpload: Content-Length header missing."); return Status::kInvalidArgument; }
-        char* ct_val=nullptr; if(esp_http_client_get_header(esp_client_handle_,"Content-Type",&ct_val)!=ESP_OK||ct_val==nullptr){esp_http_client_set_header(esp_client_handle_,"Content-Type","application/octet-stream");} if(ct_val) free(ct_val);
+        char* ct_val=nullptr; if(esp_http_client_get_header(esp_client_handle_,"Content-Type",&ct_val)!=ESP_OK||ct_val==nullptr){ ESP_LOGD(TAG_IMPL, "StreamUpload: Auto-setting Content-Type to application/octet-stream."); esp_http_client_set_header(esp_client_handle_,"Content-Type","application/octet-stream");} if(ct_val) free(ct_val);
 
         err_esp = esp_http_client_open(esp_client_handle_, total_body_length);
         if (err_esp != ESP_OK) {
@@ -582,12 +524,14 @@ public:
             ESP_LOGE(TAG_IMPL, "StreamUpload: esp_http_client_open failed: %s", esp_err_to_name(err_esp));
             return MapEspErrorToStatus(err_esp);
         }
-
+        
         std::vector<char> chunk_buffer;
-        try { chunk_buffer.resize(tx_buffer_size_); }
-        catch (const std::bad_alloc&) {
-            ESP_LOGE(TAG_IMPL, "StreamUpload: Failed to allocate chunk_buffer.");
-            esp_http_client_close(esp_client_handle_); // Attempt to close if open failed partially
+        // Note: If C++ exceptions are disabled (-fno-exceptions), std::bad_alloc from resize()
+        // will likely lead to std::terminate (e.g., abort()). Ensure sufficient heap.
+        chunk_buffer.resize(tx_buffer_size_);
+        if (chunk_buffer.capacity() < tx_buffer_size_ && tx_buffer_size_ > 0) {
+            ESP_LOGE(TAG_IMPL, "StreamUpload: Chunk buffer vector allocation/resize failed (capacity %zu < requested %zu).", chunk_buffer.capacity(), tx_buffer_size_);
+            esp_http_client_close(esp_client_handle_); 
             return Status::kNoMemory;
         }
 
@@ -595,32 +539,31 @@ public:
         size_t bytes_sent_total = 0;
         while (bytes_sent_total < total_body_length) {
             int bytes_in_chunk = data_provider(chunk_buffer.data(), chunk_buffer.size(), current_request_ctx_.user_context_from_config);
-            if (bytes_in_chunk < 0) { ESP_LOGE(TAG_IMPL, "StreamUpload: data_provider error."); op_status = Status::kStreamError; break; }
-            if (bytes_in_chunk == 0) { // EOF from provider
-                if (bytes_sent_total < total_body_length) { ESP_LOGE(TAG_IMPL, "StreamUpload: data_provider EOF before all data sent."); op_status = Status::kStreamError; }
-                break;
+            if (bytes_in_chunk < 0) { ESP_LOGE(TAG_IMPL, "StreamUpload: data_provider error %d.", bytes_in_chunk); op_status = Status::kStreamError; break; }
+            if (bytes_in_chunk == 0) { 
+                if (bytes_sent_total < total_body_length) { ESP_LOGE(TAG_IMPL, "StreamUpload: data_provider EOF before all data sent (%zu/%zu).", bytes_sent_total, total_body_length); op_status = Status::kStreamError; }
+                break; 
             }
             size_t current_chunk_size = static_cast<size_t>(bytes_in_chunk);
-            // Optional: clamp current_chunk_size if > chunk_buffer.size() or > remaining total_body_length
-            if (current_chunk_size > chunk_buffer.size()) current_chunk_size = chunk_buffer.size();
-            if (bytes_sent_total + current_chunk_size > total_body_length) current_chunk_size = total_body_length - bytes_sent_total;
-            if (current_chunk_size == 0) break;
-
+            if (current_chunk_size > chunk_buffer.size()) { ESP_LOGW(TAG_IMPL, "StreamUpload: Provider chunk %zu > buffer %zu, using buffer capacity.", current_chunk_size, chunk_buffer.size()); current_chunk_size = chunk_buffer.size(); }
+            if (bytes_sent_total + current_chunk_size > total_body_length) { ESP_LOGW(TAG_IMPL, "StreamUpload: Provider chunk %zu + sent %zu > total %zu, clamping.", current_chunk_size, bytes_sent_total, total_body_length); current_chunk_size = total_body_length - bytes_sent_total; }
+            if (current_chunk_size == 0) { if (bytes_sent_total < total_body_length) { ESP_LOGE(TAG_IMPL, "StreamUpload: Zero chunk write planned before completion."); op_status=Status::kStreamError;} break; }
 
             int written_bytes = esp_http_client_write(esp_client_handle_, chunk_buffer.data(), current_chunk_size);
-            if (written_bytes < 0) { ESP_LOGE(TAG_IMPL, "StreamUpload: esp_http_client_write error %d", written_bytes); op_status = MapEspErrorToStatus(static_cast<esp_err_t>(written_bytes)); break; }
-            if (static_cast<size_t>(written_bytes) != current_chunk_size) { ESP_LOGW(TAG_IMPL, "StreamUpload: Partial write %d of %zu", written_bytes, current_chunk_size); op_status = Status::kConnectionError; break; }
+            if (written_bytes < 0) { ESP_LOGE(TAG_IMPL, "StreamUpload: esp_http_client_write error %d (%s)", written_bytes, esp_err_to_name(static_cast<esp_err_t>(written_bytes))); op_status = MapEspErrorToStatus(static_cast<esp_err_t>(written_bytes)); break; }
+            if (static_cast<size_t>(written_bytes) != current_chunk_size) { ESP_LOGW(TAG_IMPL, "StreamUpload: Partial write %d of %zu. Connection issue?", written_bytes, current_chunk_size); op_status = Status::kConnectionError; break; }
             bytes_sent_total += written_bytes;
+            ESP_LOGD(TAG_IMPL, "StreamUpload: Sent chunk %d bytes, total %zu/%zu", written_bytes, bytes_sent_total, total_body_length);
         }
 
         if (op_status == Status::kOk && bytes_sent_total != total_body_length) {
-            ESP_LOGE(TAG_IMPL, "StreamUpload: Sent %zu bytes, expected %zu.", bytes_sent_total, total_body_length);
+            ESP_LOGE(TAG_IMPL, "StreamUpload: Data sent %zu bytes does not match Content-Length %zu.", bytes_sent_total, total_body_length);
             op_status = Status::kStreamError;
         }
 
-        if (op_status == Status::kOk) {
+        if (op_status == Status::kOk) { 
             long long response_len = esp_http_client_fetch_headers(esp_client_handle_);
-            if (response_len < 0) {
+            if (response_len < 0) { 
                 op_status = MapEspErrorToStatus(static_cast<esp_err_t>(response_len));
                 if(response_info_user) response_info_user->status_code = esp_http_client_get_status_code(esp_client_handle_);
                 ESP_LOGE(TAG_IMPL, "StreamUpload: fetch_headers failed: %s", HttpsClient::StatusToString(op_status));
@@ -629,42 +572,92 @@ public:
                     response_info_user->status_code = esp_http_client_get_status_code(esp_client_handle_);
                     response_info_user->content_length = response_len;
                 }
+                ESP_LOGI(TAG_IMPL, "StreamUpload: Headers fetched. HTTP Status: %d, Response Content-Length: %lld",
+                         response_info_user ? response_info_user->status_code : esp_http_client_get_status_code(esp_client_handle_), response_len);
             }
         }
-
-        esp_http_client_close(esp_client_handle_); // Always close after esp_http_client_open sequence
+        
+        esp_http_client_close(esp_client_handle_); 
         current_request_ctx_.response_info_ptr_user = nullptr;
         current_request_ctx_.on_data_received_cb = nullptr;
         return op_status;
     }
 
-    // Static helper functions for ESP-IDF specifics
-    static esp_err_t PlatformEventHandler(esp_http_client_event_t *evt) {
-        RequestContext* req_ctx = static_cast<RequestContext*>(evt->user_data);
-        if (!req_ctx) { ESP_LOGE(TAG_IMPL, "PlatformEventHandler: Context is null"); return ESP_FAIL; }
+    // --- Static Helper Functions for ESP-IDF specifics ---
+    static esp_http_client_method_t MapHttpMethodToEsp(HttpMethod method) {
+        switch (method) {
+            case HttpMethod::kGet:   return HTTP_METHOD_GET;
+            case HttpMethod::kPost:  return HTTP_METHOD_POST;
+            case HttpMethod::kPut:   return HTTP_METHOD_PUT;
+            case HttpMethod::kPatch: return HTTP_METHOD_PATCH;
+            case HttpMethod::kHead:  return HTTP_METHOD_HEAD;
+            default: 
+                ESP_LOGW(TAG_IMPL, "MapHttpMethodToEsp: Unsupported HttpMethod: %d, defaulting to GET.", static_cast<int>(method));
+                return HTTP_METHOD_GET;
+        }
+    }
 
-        esp_http_client_t* client = static_cast<esp_http_client_t*>(evt->client);
+    static Status MapEspErrorToStatus(esp_err_t err) {
+        switch (err) {
+            case ESP_OK: return Status::kOk;
+            case ESP_ERR_INVALID_ARG: return Status::kInvalidArgument;
+            case ESP_ERR_HTTP_INVALID_METHOD: return Status::kInvalidArgument;
+            case ESP_ERR_HTTP_INVALID_HEADER: return Status::kInvalidArgument;
+            case ESP_ERR_NO_MEM: return Status::kNoMemory;
+            case ESP_ERR_TIMEOUT: return Status::kTimeout;
+            case ESP_ERR_HTTP_CONNECT: return Status::kConnectionError;
+            case ESP_ERR_HTTP_CONNECTING: return Status::kConnectionError;
+            case ESP_ERR_ESP_TLS_FAILED_CONNECT: return Status::kConnectionError;
+            case ESP_ERR_HTTP_SOCKET_ERR: return Status::kNetworkError;
+            case ESP_FAIL: return Status::kFail;
+            case ESP_ERR_ESP_TLS_HANDSHAKE: return Status::kTlsError;
+            case ESP_ERR_ESP_TLS_PK_PARSE: return Status::kTlsError;
+            case ESP_ERR_ESP_TLS_CA_CERT: return Status::kTlsError;
+            case ESP_ERR_HTTP_PARSE: return Status::kHttpError;
+            case ESP_ERR_HTTP_HEADERS: return Status::kHttpError;
+            case ESP_ERR_HTTP_REDIRECT: return Status::kHttpError; // Technically handled, but maps here if error occurs during it
+            default:
+                ESP_LOGW(TAG_IMPL, "MapEspErrorToStatus: Unmapped esp_err_t: %d (%s)", err, esp_err_to_name(err));
+                if (err > ESP_ERR_HTTP_BASE && err <= ESP_ERR_HTTP_MAX) return Status::kHttpError;
+                if (err > ESP_ERR_ESP_TLS_BASE && err <= ESP_ERR_ESP_TLS_MAX) return Status::kTlsError;
+                return Status::kFail;
+        }
+    }
+
+    /**
+     * @brief Platform-specific event handler for esp_http_client.
+     * This is a static member function of PlatformHttpClientImpl.
+     * Its user_data (evt->user_data) points to an ImplRequestContext instance.
+     */
+    static esp_err_t PlatformEventHandler(esp_http_client_event_t *evt) {
+        ImplRequestContext* req_ctx = static_cast<ImplRequestContext*>(evt->user_data);
+        if (!req_ctx) { 
+            ESP_LOGE(TAG_IMPL, "PlatformEventHandler: RequestContext (user_data) is null!");
+            return ESP_FAIL; // Cannot proceed without context
+        }
+
+        esp_http_client_t* client_struct_ptr = static_cast<esp_http_client_t*>(evt->client);
 
         switch (evt->event_id) {
             case HTTP_EVENT_ERROR:
                 ESP_LOGD(TAG_IMPL, "PlatformEventHandler: HTTP_EVENT_ERROR");
-                if (req_ctx->response_info_ptr_user && client) {
-                     req_ctx->response_info_ptr_user->status_code = client->response.status_code;
+                if (req_ctx->response_info_ptr_user && client_struct_ptr) {
+                     req_ctx->response_info_ptr_user->status_code = client_struct_ptr->response.status_code;
                 }
                 break;
             case HTTP_EVENT_ON_CONNECTED:
                 ESP_LOGD(TAG_IMPL, "PlatformEventHandler: HTTP_EVENT_ON_CONNECTED");
-                if (req_ctx->response_info_ptr_user && client) {
-                    req_ctx->response_info_ptr_user->status_code = client->response.status_code;
-                    req_ctx->response_info_ptr_user->content_length = client->response.content_length;
+                if (req_ctx->response_info_ptr_user && client_struct_ptr) {
+                    req_ctx->response_info_ptr_user->status_code = client_struct_ptr->response.status_code;
+                    req_ctx->response_info_ptr_user->content_length = client_struct_ptr->response.content_length;
                 }
                 break;
             case HTTP_EVENT_ON_HEADER:
                 ESP_LOGD(TAG_IMPL, "PlatformEventHandler: ON_HEADER: %s: %s", evt->header_key, evt->header_value);
                 if (req_ctx->response_info_ptr_user) {
-                    if (client) { // Update on each header; will stabilize
-                         req_ctx->response_info_ptr_user->status_code = client->response.status_code;
-                         req_ctx->response_info_ptr_user->content_length = client->response.content_length;
+                    if (client_struct_ptr) { 
+                         req_ctx->response_info_ptr_user->status_code = client_struct_ptr->response.status_code;
+                         req_ctx->response_info_ptr_user->content_length = client_struct_ptr->response.content_length;
                     }
                     if (strcasecmp(evt->header_key, "Connection") == 0 && strcasecmp(evt->header_value, "close") == 0) {
                         req_ctx->response_info_ptr_user->connection_close = true;
@@ -673,27 +666,38 @@ public:
                 break;
             case HTTP_EVENT_ON_DATA:
                  ESP_LOGD(TAG_IMPL, "PlatformEventHandler: ON_DATA len=%d", evt->data_len);
-                if (req_ctx->response_info_ptr_user && client) { // Ensure info is up-to-date before user callback
-                    if (req_ctx->response_info_ptr_user->status_code == 0) req_ctx->response_info_ptr_user->status_code = client->response.status_code;
-                    if (req_ctx->response_info_ptr_user->content_length == -1) req_ctx->response_info_ptr_user->content_length = client->response.content_length;
+                if (req_ctx->response_info_ptr_user && client_struct_ptr) { // Ensure info is up-to-date before user callback
+                    if (req_ctx->response_info_ptr_user->status_code == 0) req_ctx->response_info_ptr_user->status_code = client_struct_ptr->response.status_code;
+                    if (req_ctx->response_info_ptr_user->content_length == -1) req_ctx->response_info_ptr_user->content_length = client_struct_ptr->response.content_length;
                 }
                 if (req_ctx->on_data_received_cb && evt->data_len > 0 && evt->data) {
-                    Status cb_stat = req_ctx->on_data_received_cb( (const char*)evt->data, evt->data_len, req_ctx->user_context_from_config);
-                    if (cb_stat != Status::kOk) { ESP_LOGE(TAG_IMPL, "Data cb error: %s", HttpsClient::StatusToString(cb_stat)); return ESP_FAIL; }
+                    Status cb_stat = req_ctx->on_data_received_cb( (const char*)evt->data, static_cast<size_t>(evt->data_len), req_ctx->user_context_from_config);
+                    if (cb_stat != Status::kOk) { 
+                        ESP_LOGE(TAG_IMPL, "Data callback error: %s", HttpsClient::StatusToString(cb_stat)); 
+                        return ESP_FAIL; // Signal error to esp_http_client to abort
+                    }
                 } else if (evt->data_len > 0 && !req_ctx->on_data_received_cb) {
-                     ESP_LOGW(TAG_IMPL, "PlatformEventHandler: Data (%d bytes) received but no callback set.", evt->data_len);
+                     ESP_LOGD(TAG_IMPL, "PlatformEventHandler: Data (%d bytes) received but no on_data_received_cb set.", evt->data_len);
                 }
                 break;
             case HTTP_EVENT_ON_FINISH:
                 ESP_LOGD(TAG_IMPL, "PlatformEventHandler: HTTP_EVENT_ON_FINISH");
-                 if (req_ctx->response_info_ptr_user && client) { // Final update
-                    req_ctx->response_info_ptr_user->status_code = client->response.status_code;
-                    req_ctx->response_info_ptr_user->content_length = client->response.content_length;
+                 if (req_ctx->response_info_ptr_user && client_struct_ptr) { // Final update
+                    req_ctx->response_info_ptr_user->status_code = client_struct_ptr->response.status_code;
+                    req_ctx->response_info_ptr_user->content_length = client_struct_ptr->response.content_length;
                 }
                 break;
-            case HTTP_EVENT_DISCONNECTED: ESP_LOGD(TAG_IMPL, "PlatformEventHandler: HTTP_EVENT_DISCONNECTED"); break;
-            case HTTP_EVENT_REDIRECT: ESP_LOGD(TAG_IMPL, "PlatformEventHandler: HTTP_EVENT_REDIRECT"); esp_http_client_set_redirection(static_cast<esp_http_client_handle_t>(evt->client)); break;
-            default: ESP_LOGD(TAG_IMPL, "PlatformEventHandler: Unhandled Event: %d", evt->event_id); break;
+            case HTTP_EVENT_DISCONNECTED: 
+                ESP_LOGD(TAG_IMPL, "PlatformEventHandler: HTTP_EVENT_DISCONNECTED"); 
+                break;
+            case HTTP_EVENT_REDIRECT: 
+                ESP_LOGI(TAG_IMPL, "PlatformEventHandler: HTTP_EVENT_REDIRECT to %s. Auto-following enabled.", esp_http_client_get_url(static_cast<esp_http_client_handle_t>(evt->client)));
+                // esp_http_client will handle redirection automatically if not disabled in config.
+                // No explicit esp_http_client_set_redirection needed unless custom logic is desired.
+                break;
+            default: 
+                ESP_LOGD(TAG_IMPL, "PlatformEventHandler: Unhandled Event ID: %d", evt->event_id); 
+                break;
         }
         return ESP_OK;
     }
@@ -702,9 +706,11 @@ public:
 // --- HttpsClient Method Definitions (forwarding to PIMPL) ---
 HttpsClient::HttpsClient() : impl_(std::make_unique<PlatformHttpClientImpl>()) {}
 
-// Destructor MUST be defined here, after PlatformHttpClientImpl is fully defined.
+// Destructor MUST be defined here, after PlatformHttpClientImpl is fully defined,
+// so that std::unique_ptr knows how to delete it.
 HttpsClient::~HttpsClient() = default;
 
+// Static method definition (must be defined in .cpp)
 const char* HttpsClient::StatusToString(Status status) {
     switch (status) {
         case Status::kOk: return "Ok";
@@ -733,11 +739,11 @@ HttpsClient::Status HttpsClient::Close() {
     return impl_->Close();
 }
 HttpsClient::Status HttpsClient::Head(std::string_view url, const Headers& headers, ResponseInfo* response_info) {
-    if (!response_info) {
-        ESP_LOGE(TAG_IMPL, "HttpsClient::Head: response_info cannot be null.");
+    if (!response_info) { // Argument validation at the public API level
+        // ESP_LOGE(TAG_IMPL, "HttpsClient::Head: response_info cannot be null."); // TAG_IMPL is not visible here. Use a generic log or return error.
         return Status::kInvalidArgument;
     }
-    impl_->current_request_ctx_.on_data_received_cb = nullptr; // No data callback for HEAD
+    impl_->current_request_ctx_.on_data_received_cb = nullptr; // Explicitly no data callback for HEAD
     return impl_->PerformRequestInternal(url, HttpMethod::kHead, headers, "", response_info);
 }
 HttpsClient::Status HttpsClient::Get(std::string_view url, const Headers& headers,
@@ -773,13 +779,13 @@ HttpsClient::Status HttpsClient::Patch(std::string_view url, const Headers& head
     return impl_->PerformRequestInternal(url, HttpMethod::kPatch, headers, patch_data, response_info);
 }
 
-----------------------------------------------------------------------------------------------------------------
+-----------------------------------------------------------------------------------------------------------
 
-  /**
+/**
  * @file app_main_pimpl_example.cpp
  * @brief Example usage of HttpsClient (PIMPL version) as a member of another class.
  * @author Gemini
- * @date 2025-05-26 Current time is Monday, May 26, 2025 at 6:42:39 AM IST.
+ * @date 2025-05-27 Current time is Tuesday, May 27, 2025 at 2:33:12 PM IST.
  */
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -798,7 +804,6 @@ HttpsClient::Status HttpsClient::Patch(std::string_view url, const Headers& head
 static const char* kMainAppTag = "HTTP_PIMPL_EXAMPLE";
 
 // Example Root CA certificate for httpbin.org (DigiCert Global Root CA)
-// In a real application, manage certificates securely.
 const char* HTTPBIN_ORG_ROOT_CA_PEM_PIMPL = \
 "-----BEGIN CERTIFICATE-----\n" \
 "MIIDrzCCApegAwIBAgIQCDvgVpBCRrGhdWrJWZHHSjANBgkqhkiG9w0BAQUFADBh\n" \
@@ -844,21 +849,20 @@ HttpsClient::Status OnDataReceivedCollectPimpl(const char* data, size_t len, voi
 class MyWebServiceManager {
 public:
     MyWebServiceManager() {
-        // Initialize client configuration for this manager
         client_config_.buffer_size_rx_bytes = 4096;
         client_config_.buffer_size_tx_bytes = 2048;
-        client_config_.verify_server = true; // Should be true for production
-        client_config_.server_cert_pem = HTTPBIN_ORG_ROOT_CA_PEM_PIMPL; // Use appropriate CA
-        client_config_.timeout_ms = 15000; // 15 seconds
+        client_config_.verify_server = true; 
+        client_config_.server_cert_pem = HTTPBIN_ORG_ROOT_CA_PEM_PIMPL; 
+        client_config_.timeout_ms = 15000; 
         ESP_LOGI(kMainAppTag, "MyWebServiceManager initialized.");
 
-        // Open the client once, if it's to be reused for multiple calls by this manager
-        // Or, Open/Close per operation if that's preferred.
+        // Open the client during manager construction
         HttpsClient::Status open_status = http_client_instance_.Open(client_config_);
         if (open_status != HttpsClient::Status::kOk) {
             ESP_LOGE(kMainAppTag, "MyWebServiceManager: Failed to open HttpsClient: %s",
                      HttpsClient::StatusToString(open_status));
-            // Handle error: perhaps set a flag indicating client is not ready
+            // Set a flag or handle the error appropriately for the manager's state
+            is_client_open_ = false;
         } else {
             is_client_open_ = true;
         }
@@ -871,24 +875,20 @@ public:
         ESP_LOGI(kMainAppTag, "MyWebServiceManager destroyed.");
     }
 
-    /**
-     * @brief Gets the size of a resource using a HEAD request.
-     * @param resource_url The URL of the resource.
-     * @param out_resource_size Reference to store the resource size.
-     * @return True if size was successfully retrieved (HTTP 200), false otherwise.
-     */
     bool GetResourceSize(std::string_view resource_url, long long& out_resource_size) {
         if (!is_client_open_) {
-            ESP_LOGE(kMainAppTag, "GetResourceSize: Client not open.");
-            // Optionally try to Open it here:
-            // if (http_client_instance_.Open(client_config_) != HttpsClient::Status::kOk) return false;
-            // is_client_open_ = true; // Then remember to Close it appropriately.
-            return false;
+            ESP_LOGE(kMainAppTag, "GetResourceSize: Client not open. Attempting to re-open.");
+            // Optionally, try to Open it here if it makes sense for your application
+            if (http_client_instance_.Open(client_config_) != HttpsClient::Status::kOk) {
+                 ESP_LOGE(kMainAppTag, "GetResourceSize: Failed to re-open client.");
+                 return false;
+            }
+            is_client_open_ = true; // Update state
         }
 
         ESP_LOGI(kMainAppTag, "MyWebServiceManager: Getting size for URL: %.*s", (int)resource_url.length(), resource_url.data());
 
-        HttpsClient::ResponseInfo response_details = {};
+        HttpsClient::ResponseInfo response_details = {}; // Use HttpsClient::ResponseInfo
         HttpsClient::Headers headers = { {"User-Agent", "MyWebServiceManagerApp/1.0-PIMPL"} };
 
         HttpsClient::Status status = http_client_instance_.Head(resource_url, headers, &response_details);
@@ -901,72 +901,52 @@ public:
                     ESP_LOGI(kMainAppTag, "MyWebServiceManager: Resource size: %lld bytes.", out_resource_size);
                     return true;
                 } else {
-                    ESP_LOGW(kMainAppTag, "MyWebServiceManager: HTTP 200, but Content-Length not found/invalid.");
+                    ESP_LOGW(kMainAppTag, "MyWebServiceManager: HTTP 200, but Content-Length not found/invalid in HEAD response.");
                 }
             } else {
                 ESP_LOGW(kMainAppTag, "MyWebServiceManager: HEAD request returned non-200 status: %d", response_details.status_code);
             }
         } else {
-            ESP_LOGE(kMainAppTag, "MyWebServiceManager: HEAD request failed: %s (HTTP Status: %d)",
+            ESP_LOGE(kMainAppTag, "MyWebServiceManager: HEAD request failed: %s (HTTP Status from ResponseInfo: %d)",
                      HttpsClient::StatusToString(status), response_details.status_code);
         }
         return false;
     }
 
-    /**
-     * @brief Performs a GET request and collects the response body.
-     * @param resource_url URL to GET.
-     * @param out_body String to store the response body.
-     * @return True on HTTP 200 and successful retrieval, false otherwise.
-     */
     bool GetResourceContent(std::string_view resource_url, std::string& out_body) {
         if (!is_client_open_) {
-            ESP_LOGE(kMainAppTag, "GetResourceContent: Client not open.");
-            return false;
+            ESP_LOGE(kMainAppTag, "GetResourceContent: Client not open. Attempting to re-open.");
+             if (http_client_instance_.Open(client_config_) != HttpsClient::Status::kOk) {
+                 ESP_LOGE(kMainAppTag, "GetResourceContent: Failed to re-open client.");
+                 return false;
+            }
+            is_client_open_ = true;
         }
-        out_body.clear(); // Ensure out_body is empty
-
+        out_body.clear(); 
         ESP_LOGI(kMainAppTag, "MyWebServiceManager: Getting content for URL: %.*s", (int)resource_url.length(), resource_url.data());
         
         HttpsClient::ResponseInfo response_details = {};
         HttpsClient::Headers headers = { {"User-Agent", "MyWebServiceManagerApp/1.0-PIMPL"} };
-
-        // Pass the address of the string as user_context for the OnDataReceivedCollectPimpl callback
-        // Note: HttpsClient::Config user_context is used by the Impl's PlatformEventHandler.
-        // To pass per-call context to the callback, we either need to modify config before each call (if on_data_received directly uses config.user_context)
-        // OR the HttpsClient::Get method needs to accept a user_context for its specific callback.
-        // The current HttpsClient::Config has a single user_context.
-        // Let's assume client_config_.user_context is set to &out_body for this call.
-        // A better way for PIMPL would be for Get/Post etc. to also take a void* user_callback_context.
-        // For simplicity now, we'll assume the callback knows where to put data or capture.
-        // The Impl's RequestContext does have user_context_from_config, which comes from client_config_.
         
-        // To make this work correctly with current design: update config's user_context before this call.
-        // This is a bit awkward if the HttpsClient is shared and config is set once.
-        // The `PlatformHttpClientImpl::RequestContext` already has `user_context_from_config`
-        // which is taken from `HttpsClient::Config::user_context`. So we set it there.
-        client_config_.user_context = &out_body; // Temporary set for this call if Open doesn't re-read it.
-                                                  // The Impl saves config at Open. This won't update it.
-                                                  // The Impl's PerformRequestInternal sets current_request_ctx_.on_data_received_cb.
-                                                  // The Impl's PlatformEventHandler uses current_request_ctx_.user_context_from_config for the callback.
-                                                  // So, if user_context needs to change per call, the Config used in Open() needs to be updated or
-                                                  // HttpsClient methods need their own user_context parameter for the callback.
-        
-        // Let's assume for this example, the user_context for the callback is simply the one set in config.
-        // We'll use a lambda in the Get call to capture `out_body` directly. This avoids relying on config.user_context for this specific data.
-        // This means the 'user_context' param in DataReceivedCallback will be whatever was in client_config_.user_context during Open().
+        // The callback needs a way to access 'out_body'. Lambdas are great for this.
+        // The 'user_context' parameter in DataReceivedCallback will be what was set
+        // in HttpsClient::Config::user_context when Open() was called.
+        // Here, we use a lambda to capture 'out_body' by reference.
+        client_config_.user_context = &out_body; // Set user context for this specific call if needed by a global callback
+                                                 // However, the lambda approach below is cleaner for per-call context.
 
         HttpsClient::Status status = http_client_instance_.Get(resource_url, headers,
-            [&out_body](const char* data, size_t len, void* user_ctx_from_config_at_open) {
-                // user_ctx_from_config_at_open is what was in client_config_.user_context during https_client_instance_.Open()
-                // We are capturing 'out_body' by reference here.
+            // Lambda captures 'out_body' by reference.
+            // The 'user_ctx_from_config' is what was in config.user_context at Open().
+            [&out_body](const char* data, size_t len, void* user_ctx_from_config) {
                 return OnDataReceivedCollectPimpl(data, len, &out_body);
             },
             &response_details
         );
 
         if (status == HttpsClient::Status::kOk && response_details.status_code == 200) {
-            ESP_LOGI(kMainAppTag, "MyWebServiceManager: GET successful. Received %lld bytes.", response_details.content_length);
+            ESP_LOGI(kMainAppTag, "MyWebServiceManager: GET successful. Received %lld bytes, collected %zu bytes.", 
+                     response_details.content_length, out_body.length());
             return true;
         } else {
             ESP_LOGE(kMainAppTag, "MyWebServiceManager: GET failed. Status: %s, HTTP Code: %d",
@@ -974,7 +954,6 @@ public:
         }
         return false;
     }
-
 
 private:
     HttpsClient http_client_instance_; // HttpsClient (PIMPL version) as a direct member
@@ -996,31 +975,30 @@ extern "C" void app_main(void) {
     ESP_ERROR_CHECK(esp_event_loop_create_default());
 
     ESP_LOGI(kMainAppTag, "Example: Simulating WiFi connected...");
-    vTaskDelay(pdMS_TO_TICKS(2000));
+    vTaskDelay(pdMS_TO_TICKS(2000)); // Adjust as needed for your WiFi setup
 
-    MyWebServiceManager web_manager; // Create an instance of our class
+    MyWebServiceManager web_manager; // Create an instance of our class that owns the HttpsClient
 
-    // Test HEAD request for content length
-    const char* test_s3_url = "https://httpbin.org/bytes/1024"; // Get 1KB of random bytes
+    // Test HEAD request for content length using httpbin.org
+    const char* test_url_head = "https://httpbin.org/bytes/512"; // httpbin generates 512 random bytes
     long long object_size = -1;
 
-    if (web_manager.GetResourceSize(test_s3_url, object_size)) {
-        ESP_LOGI(kMainAppTag, "Main: Successfully obtained object size for %s: %lld bytes", test_s3_url, object_size);
+    if (web_manager.GetResourceSize(test_url_head, object_size)) {
+        ESP_LOGI(kMainAppTag, "Main: Successfully obtained object size for %s: %lld bytes", test_url_head, object_size);
         
-        // Now try to GET the content
-        if (object_size > 0) {
+        // Now try to GET the content if size is known
+        if (object_size > 0) { // httpbin.org/bytes/N should have Content-Length N
             std::string content_body;
-            ESP_LOGI(kMainAppTag, "Main: Attempting to download content for %s", test_s3_url);
-            if (web_manager.GetResourceContent(test_s3_url, content_body)) {
-                ESP_LOGI(kMainAppTag, "Main: Successfully downloaded content. Size: %zu bytes.", content_body.length());
-                // ESP_LOGI(kMainAppTag, "Main: Content (first 100 bytes): %.*s", 100, content_body.c_str());
+            ESP_LOGI(kMainAppTag, "Main: Attempting to download content for %s", test_url_head);
+            if (web_manager.GetResourceContent(test_url_head, content_body)) {
+                ESP_LOGI(kMainAppTag, "Main: Successfully downloaded content. Actual received size: %zu bytes.", content_body.length());
+                // ESP_LOGI(kMainAppTag, "Main: Content (first 100 bytes): %.*s", 100, content_body.c_str()); // Be careful printing binary data
             } else {
-                ESP_LOGE(kMainAppTag, "Main: Failed to download content for %s", test_s3_url);
+                ESP_LOGE(kMainAppTag, "Main: Failed to download content for %s", test_url_head);
             }
         }
-
     } else {
-        ESP_LOGE(kMainAppTag, "Main: Failed to obtain object size for %s.", test_s3_url);
+        ESP_LOGE(kMainAppTag, "Main: Failed to obtain object size for %s.", test_url_head);
     }
 
     ESP_LOGI(kMainAppTag, "PIMPL Example finished.");
