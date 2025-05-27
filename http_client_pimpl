@@ -262,7 +262,7 @@ private:
  * @brief Implements the HttpsClient class using the PIMPL idiom.
  * The HttpsClient::PlatformHttpClientImpl class encapsulates ESP-IDF specific details.
  * @author Gemini
- * @date 2025-05-27 Current time is Tuesday, May 27, 2025 at 2:51:00 PM IST.
+ * @date 2025-05-27 Current time is Tuesday, May 27, 2025 at 3:39:00 PM IST.
  */
 #include "https_client.h" // Public interface
 
@@ -276,7 +276,7 @@ private:
 #include "esp_log.h"
 #include "esp_err.h"
 
-#ifndef ESP32_PLATFORM // Guard for local builds/IDE
+#ifndef ESP32_PLATFORM
 #define ESP32_PLATFORM
 #endif
 
@@ -418,8 +418,8 @@ public:
         err_esp = esp_http_client_set_method(esp_client_handle_, MapHttpMethodToEsp(method_enum));
         if (err_esp != ESP_OK) { ESP_LOGE(TAG_IMPL, "PerformRequestInternal: set_method failed: %s", esp_err_to_name(err_esp)); return MapEspErrorToStatus(err_esp); }
 
-        std::array<char, HttpsClient::kMaxHeaderKeyLen> header_key_buffer; // Renamed
-        std::array<char, HttpsClient::kMaxHeaderValueLen> header_value_buffer; // Renamed
+        std::array<char, HttpsClient::kMaxHeaderKeyLen> header_key_buffer;
+        std::array<char, HttpsClient::kMaxHeaderValueLen> header_value_buffer;
         for (const auto& h : headers) {
             snprintf(header_key_buffer.data(), header_key_buffer.size(), "%.*s", (int)h.first.length(), h.first.data());
             snprintf(header_value_buffer.data(), header_value_buffer.size(), "%.*s", (int)h.second.length(), h.second.data());
@@ -433,16 +433,19 @@ public:
             err_esp = esp_http_client_set_post_field(esp_client_handle_, request_body.data(), request_body.length());
             if (err_esp != ESP_OK) { ESP_LOGE(TAG_IMPL, "PerformRequestInternal: set_post_field failed: %s", esp_err_to_name(err_esp)); return MapEspErrorToStatus(err_esp); }
             char* ct_val = nullptr;
+            // Check if Content-Type was already set by user, if not, set a default.
+            // esp_http_client_get_header returns a pointer to an internal buffer, DO NOT FREE IT.
             if (esp_http_client_get_header(esp_client_handle_, "Content-Type", &ct_val) != ESP_OK || ct_val == nullptr) {
-                ESP_LOGD(TAG_IMPL, "PerformRequestInternal: Auto-setting Content-Type to application/octet-stream.");
+                ESP_LOGD(TAG_IMPL, "PerformRequestInternal: Auto-setting Content-Type to application/octet-stream for non-empty body.");
                 esp_http_client_set_header(esp_client_handle_, "Content-Type", "application/octet-stream");
             }
-            if (ct_val) free(ct_val);
+            // No free(ct_val);
         } else if (method_enum == HttpMethod::kPost || method_enum == HttpMethod::kPut || method_enum == HttpMethod::kPatch) {
             char* cl_val = nullptr; char* te_val = nullptr;
+            // Check if Content-Length or Transfer-Encoding was already set by user.
             bool cl_present = (esp_http_client_get_header(esp_client_handle_, "Content-Length", &cl_val) == ESP_OK && cl_val != nullptr);
             bool te_present = (esp_http_client_get_header(esp_client_handle_, "Transfer-Encoding", &te_val) == ESP_OK && te_val != nullptr);
-            if (cl_val) free(cl_val); if (te_val) free(te_val);
+            // No free(cl_val) or free(te_val);
             if (!cl_present && !te_present) {
                 ESP_LOGD(TAG_IMPL, "PerformRequestInternal: Auto-setting Content-Length: 0 for empty body on method %d.", static_cast<int>(method_enum));
                 esp_http_client_set_header(esp_client_handle_, "Content-Length", "0");
@@ -455,7 +458,6 @@ public:
         if (response_info_user) {
             response_info_user->status_code = esp_http_client_get_status_code(esp_client_handle_);
             response_info_user->content_length = esp_http_client_get_content_length(esp_client_handle_);
-            // response_info_user->connection_close is set by PlatformEventHandler
         }
 
         if (status == Status::kOk && response_info_user) {
@@ -478,7 +480,6 @@ public:
         if (tx_buffer_size_ == 0) { ESP_LOGE(TAG_IMPL, "StreamUpload: TX buffer size is 0."); return Status::kNotInitialized; }
 
         current_request_ctx_.response_info_ptr_user = response_info_user;
-        // current_request_ctx_.on_data_received_cb is set by public PostStream/PutStream
 
         if (response_info_user) { *response_info_user = {}; }
 
@@ -491,8 +492,8 @@ public:
         esp_http_client_set_method(esp_client_handle_, MapHttpMethodToEsp(method_enum));
 
         bool cl_found = false;
-        std::array<char, HttpsClient::kMaxHeaderKeyLen> header_key_buffer; // Renamed
-        std::array<char, HttpsClient::kMaxHeaderValueLen> header_value_buffer; // Renamed
+        std::array<char, HttpsClient::kMaxHeaderKeyLen> header_key_buffer;
+        std::array<char, HttpsClient::kMaxHeaderValueLen> header_value_buffer;
         for(const auto& h : headers){
             snprintf(header_key_buffer.data(),header_key_buffer.size(),"%.*s",(int)h.first.length(),h.first.data());
             snprintf(header_value_buffer.data(),header_value_buffer.size(),"%.*s",(int)h.second.length(),h.second.data());
@@ -502,7 +503,13 @@ public:
             esp_http_client_set_header(esp_client_handle_,header_key_buffer.data(),header_value_buffer.data());
         }
         if(!cl_found) { ESP_LOGE(TAG_IMPL, "StreamUpload: Content-Length header missing."); return Status::kInvalidArgument; }
-        char* ct_val=nullptr; if(esp_http_client_get_header(esp_client_handle_,"Content-Type",&ct_val)!=ESP_OK||ct_val==nullptr){ ESP_LOGD(TAG_IMPL, "StreamUpload: Auto-setting Content-Type to application/octet-stream."); esp_http_client_set_header(esp_client_handle_,"Content-Type","application/octet-stream");} if(ct_val) free(ct_val);
+        char* ct_val=nullptr; 
+        // Pointer from esp_http_client_get_header is to internal buffer, do not free.
+        if(esp_http_client_get_header(esp_client_handle_,"Content-Type",&ct_val)!=ESP_OK||ct_val==nullptr){ 
+            ESP_LOGD(TAG_IMPL, "StreamUpload: Auto-setting Content-Type to application/octet-stream."); 
+            esp_http_client_set_header(esp_client_handle_,"Content-Type","application/octet-stream");
+        }
+        // No free(ct_val);
 
         err_esp = esp_http_client_open(esp_client_handle_, total_body_length);
         if (err_esp != ESP_OK) {
@@ -584,26 +591,26 @@ public:
         switch (err) {
             case ESP_OK: return Status::kOk;
             case ESP_ERR_INVALID_ARG: return Status::kInvalidArgument;
-            case ESP_ERR_HTTP_INVALID_METHOD: return Status::kInvalidArgument;
-            case ESP_ERR_HTTP_INVALID_HEADER: return Status::kInvalidArgument;
+            case ESP_ERR_HTTP_INVALID_METHOD: return Status::kInvalidArgument; 
+            case ESP_ERR_HTTP_INVALID_HEADER: return Status::kInvalidArgument; 
             case ESP_ERR_NO_MEM: return Status::kNoMemory;
             case ESP_ERR_TIMEOUT: return Status::kTimeout;
             case ESP_ERR_HTTP_CONNECT: return Status::kConnectionError;
-            case ESP_ERR_HTTP_CONNECTING: return Status::kConnectionError;
-            case ESP_ERR_ESP_TLS_FAILED_CONNECT: return Status::kConnectionError;
+            case ESP_ERR_HTTP_CONNECTING: return Status::kConnectionError; 
+            case ESP_ERR_ESP_TLS_FAILED_CONNECT: return Status::kConnectionError; 
             case ESP_ERR_HTTP_SOCKET_ERR: return Status::kNetworkError;
-            case ESP_FAIL: return Status::kFail;
+            case ESP_FAIL: return Status::kFail; 
             case ESP_ERR_ESP_TLS_HANDSHAKE: return Status::kTlsError;
-            case ESP_ERR_ESP_TLS_PK_PARSE: return Status::kTlsError;
-            case ESP_ERR_ESP_TLS_CA_CERT: return Status::kTlsError;
+            case ESP_ERR_ESP_TLS_PK_PARSE: return Status::kTlsError; 
+            case ESP_ERR_ESP_TLS_CA_CERT: return Status::kTlsError; 
             case ESP_ERR_HTTP_PARSE: return Status::kHttpError;
-            case ESP_ERR_HTTP_HEADERS: return Status::kHttpError;
-            case ESP_ERR_HTTP_REDIRECT: return Status::kHttpError;
+            case ESP_ERR_HTTP_HEADERS: return Status::kHttpError; 
+            case ESP_ERR_HTTP_REDIRECT: return Status::kHttpError; 
             default:
                 ESP_LOGW(TAG_IMPL, "MapEspErrorToStatus: Unmapped esp_err_t: %d (%s)", err, esp_err_to_name(err));
                 if (err > ESP_ERR_HTTP_BASE && err <= ESP_ERR_HTTP_MAX) return Status::kHttpError;
                 if (err > ESP_ERR_ESP_TLS_BASE && err <= ESP_ERR_ESP_TLS_MAX) return Status::kTlsError;
-                return Status::kFail;
+                return Status::kFail; 
         }
     }
 
@@ -614,32 +621,20 @@ public:
             return ESP_FAIL;
         }
 
-        // Note: Accessing evt->client internal struct fields directly (like client->response.status_code)
-        // is done here for early update of ResponseInfo. This relies on ESP-IDF internal struct layout.
-        // Official esp_http_client_get_status_code() / get_content_length() are for use after perform().
-        esp_http_client_t* client_struct = static_cast<esp_http_client_t*>(evt->client);
-
+        // The ResponseInfo (status_code, content_length) is primarily populated
+        // by PerformRequestInternal or PerformStreamUploadInternal after the main
+        // ESP-IDF API calls complete, using official getter functions.
+        // This event handler mainly focuses on data callbacks and connection status headers.
         switch (evt->event_id) {
             case HTTP_EVENT_ERROR:
                 ESP_LOGD(TAG_IMPL, "PlatformEventHandler: HTTP_EVENT_ERROR");
-                if (req_ctx->response_info_ptr_user && client_struct) {
-                     req_ctx->response_info_ptr_user->status_code = client_struct->response.status_code;
-                }
                 break;
-            case HTTP_EVENT_ON_CONNECTED: // Occurs after connection, headers are being/have been processed
+            case HTTP_EVENT_ON_CONNECTED:
                 ESP_LOGD(TAG_IMPL, "PlatformEventHandler: HTTP_EVENT_ON_CONNECTED");
-                if (req_ctx->response_info_ptr_user && client_struct) {
-                    req_ctx->response_info_ptr_user->status_code = client_struct->response.status_code;
-                    req_ctx->response_info_ptr_user->content_length = client_struct->response.content_length;
-                }
                 break;
             case HTTP_EVENT_ON_HEADER:
                 ESP_LOGD(TAG_IMPL, "PlatformEventHandler: ON_HEADER: %s: %s", evt->header_key, evt->header_value);
-                if (req_ctx->response_info_ptr_user) {
-                    if (client_struct) { 
-                         req_ctx->response_info_ptr_user->status_code = client_struct->response.status_code;
-                         req_ctx->response_info_ptr_user->content_length = client_struct->response.content_length;
-                    }
+                if (req_ctx->response_info_ptr_user) { 
                     if (strcasecmp(evt->header_key, "Connection") == 0 && strcasecmp(evt->header_value, "close") == 0) {
                         req_ctx->response_info_ptr_user->connection_close = true;
                     }
@@ -647,10 +642,6 @@ public:
                 break;
             case HTTP_EVENT_ON_DATA:
                  ESP_LOGD(TAG_IMPL, "PlatformEventHandler: ON_DATA len=%d", evt->data_len);
-                if (req_ctx->response_info_ptr_user && client_struct) { 
-                    if (req_ctx->response_info_ptr_user->status_code == 0) req_ctx->response_info_ptr_user->status_code = client_struct->response.status_code;
-                    if (req_ctx->response_info_ptr_user->content_length == -1) req_ctx->response_info_ptr_user->content_length = client_struct->response.content_length;
-                }
                 if (req_ctx->on_data_received_cb && evt->data_len > 0 && evt->data) {
                     Status cb_stat = req_ctx->on_data_received_cb( (const char*)evt->data, static_cast<size_t>(evt->data_len), req_ctx->user_context_from_config);
                     if (cb_stat != Status::kOk) { 
@@ -658,23 +649,18 @@ public:
                         return ESP_FAIL; 
                     }
                 } else if (evt->data_len > 0 && !req_ctx->on_data_received_cb) {
-                     ESP_LOGD(TAG_IMPL, "PlatformEventHandler: Data (%d bytes) received but no on_data_received_cb set (e.g. for HEAD).", evt->data_len);
+                     ESP_LOGD(TAG_IMPL, "PlatformEventHandler: Data (%d bytes) received but no on_data_received_cb set.", evt->data_len);
                 }
                 break;
             case HTTP_EVENT_ON_FINISH:
                 ESP_LOGD(TAG_IMPL, "PlatformEventHandler: HTTP_EVENT_ON_FINISH");
-                 if (req_ctx->response_info_ptr_user && client_struct) { 
-                    req_ctx->response_info_ptr_user->status_code = client_struct->response.status_code;
-                    req_ctx->response_info_ptr_user->content_length = client_struct->response.content_length;
-                }
                 break;
             case HTTP_EVENT_DISCONNECTED: 
                 ESP_LOGD(TAG_IMPL, "PlatformEventHandler: HTTP_EVENT_DISCONNECTED"); 
                 break;
             case HTTP_EVENT_REDIRECT: 
-                ESP_LOGI(TAG_IMPL, "PlatformEventHandler: HTTP_EVENT_REDIRECT to %s. Auto-following by default.", esp_http_client_get_url(static_cast<esp_http_client_handle_t>(evt->client)));
-                // esp_http_client will automatically follow redirects if not disabled in its configuration.
-                // No need to call esp_http_client_set_redirection() here unless you want to alter default behavior.
+                ESP_LOGI(TAG_IMPL, "PlatformEventHandler: HTTP_EVENT_REDIRECT. Auto-following enabled by default.");
+                // esp_http_client_set_redirection is not needed here as it's default behavior.
                 break;
             default: 
                 ESP_LOGD(TAG_IMPL, "PlatformEventHandler: Unhandled Event ID: %d", evt->event_id); 
@@ -718,8 +704,6 @@ HttpsClient::Status HttpsClient::Close() {
 }
 HttpsClient::Status HttpsClient::Head(std::string_view url, const Headers& headers, ResponseInfo* response_info) {
     if (!response_info) {
-        // Logging at the public API level could be done here if a global/static logger was available
-        // For now, just return the error status.
         return Status::kInvalidArgument;
     }
     impl_->current_request_ctx_.on_data_received_cb = nullptr; 
