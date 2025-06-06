@@ -1,0 +1,420 @@
+// operating_mode_controller.h
+#ifndef OPERATING_MODE_CONTROLLER_H
+#define OPERATING_MODE_CONTROLLER_H
+
+#include "platform_adapter.h"
+#include <string>
+#include <array>
+#include <optional>
+
+class ControlSystem; 
+
+/**
+ * @brief Manages the system's operating mode and makes ON/OFF decisions based on a
+ * priority-driven, data-driven event system.
+ *
+ * @details This class is a generic state machine engine. It determines the final
+ * output state by finding the single highest-priority active operation.
+ * The behavior of each operation (e.g., its expiry action) is defined in the
+ * `OperationEvent` sent to the controller, rather than being hardcoded.
+ * The `Run()` method should be called periodically to handle time-based logic.
+ */
+class OperatingModeController {
+ public:
+  /**
+   * @brief Defines system modes and operation types, ordered by effective priority.
+   * @details Higher integer value means higher priority for resolving conflicts
+   * between active operations.
+   */
+  enum class OperatingMode : int {
+    kNone       = 0,   ///< Default/uninitialized or for range boundaries
+    kIdle       = 1,   ///< System Idle (lowest priority mode)
+    kVacancy    = 2,   ///< Vacancy detection mode/event
+    kOccupancy  = 3,   ///< Occupancy detection mode/event
+    kSchedule   = 4,   ///< Schedule-based operation mode/event
+    kContinuous = 5,   ///< Continuous operation mode/event
+    kOverride   = 6,   ///< Override operation event (highest operational priority)
+    kError      = 7,   ///< System error state (special handling)
+    kNumOperatingModes ///< Sentinel for array sizing, must be last.
+  };
+
+  /** @brief Defines the explicit command type for an OperationEvent. */
+  enum class CommandType { kLoad, kRemove };
+  
+  /** @brief Structure for incoming operation events, now with an explicit command. */
+  struct OperationEvent {
+    CommandType command;           ///< The action to take: Load/update or Remove.
+    OperatingMode op_mode;         ///< The target operation type.
+    
+    // The fields below are only relevant for kLoad commands.
+    bool state = false;            ///< The desired state (e.g., true=ON).
+    uint32_t timeout_ms = 0;       ///< Duration in ms. A value of 0 means indefinite/persistent.
+    bool on_expiry_toggle = false; /// If true, the lamp state is toggled from its current state upon expiry.
+  };
+  
+  /** @brief Internal structure to hold details of an active timed operation. */
+  struct ActiveOperation {
+    bool state;                           
+    uint32_t received_timestamp_ticks;    
+    uint32_t timeout_ticks;               
+    bool on_expiry_toggle; // Copied from the event that created this operation.
+
+    /** @brief Checks if the timer for this operation has run out. */
+    bool IsTimerElapsed() const {
+      if (timeout_ticks == 0) return false; // A 0-tick operation is indefinite and never expires.
+      return (PlatformGetTicks() - received_timestamp_ticks) >= timeout_ticks;
+    }
+  };
+
+  OperatingModeController(ControlSystem& control_system);
+
+  bool SetSystemMode(OperatingMode new_system_mode);
+  OperatingMode GetSystemMode() const;
+  bool IsOverrideActive() const;
+  void OnOperationEvent(const OperationEvent& event);
+  /** @brief Main execution step, handles timeouts and applies control state. Call periodically. */
+  void Run();
+
+  static std::string ModeToString(OperatingMode mode);
+
+ private:
+  void ProcessLoadEvent(const OperationEvent& event);
+  void ProcessRemoveEvent(const OperationEvent& event);
+  void CheckOperationTimeouts();
+  void OnExitSystemMode(OperatingMode exiting_mode);
+  void OnEntrySystemMode(OperatingMode entering_mode);
+  void StartOverride(const OperationEvent& event);
+  void EndOverride();
+  void SetActiveOperation(const OperationEvent& event);
+  void ClearActiveOperation(OperatingMode op_mode_to_clear);
+  void ApplyControlState();
+
+  OperatingMode system_mode_;
+  bool override_active_;
+  OperatingMode post_override_target_mode_;
+  
+  std::array<std::optional<ActiveOperation>, static_cast<size_t>(OperatingMode::kNumOperatingModes)> active_operations_;
+
+  ControlSystem& control_system_;
+  bool first_apply_done_ = false;
+
+  OperatingMode current_min_acceptable_event_priority_;
+  OperatingMode current_max_acceptable_event_priority_;
+};
+
+#endif  // OPERATING_MODE_CONTROLLER_H
+
+--------------------------------------------------------------------------
+
+// operating_mode_controller.cpp
+#include "operating_mode_controller.h"
+#include "control_system.h"
+
+using OperatingMode = OperatingModeController::OperatingMode;
+using OperationEvent = OperatingModeController::OperationEvent;
+using ActiveOperation = OperatingModeController::ActiveOperation;
+using CommandType = OperatingModeController::CommandType;
+
+OperatingModeController::OperatingModeController(ControlSystem& control_system)
+    : system_mode_(OperatingMode::kIdle),
+      override_active_(false),
+      post_override_target_mode_(OperatingMode::kIdle),
+      control_system_(control_system),
+      first_apply_done_(false),
+      current_min_acceptable_event_priority_(OperatingMode::kNone),
+      current_max_acceptable_event_priority_(OperatingMode::kNone) {
+  LOG_PRINT(log_print::kInfo, "OperatingModeController Initialized.");
+  OnEntrySystemMode(system_mode_); 
+}
+
+bool OperatingModeController::SetSystemMode(OperatingMode new_system_mode) {
+  if (override_active_) {
+    LOG_PRINT(log_print::kInfo, "Override active. Saving new SystemMode %s to apply after override ends.",
+              ModeToString(new_system_mode).c_str());
+    post_override_target_mode_ = new_system_mode;
+    return true;
+  }
+  if (new_system_mode == system_mode_) return true;
+  LOG_PRINT(log_print::kInfo, "SystemMode: %s -> %s", ModeToString(system_mode_).c_str(), ModeToString(new_system_mode).c_str());
+  OnExitSystemMode(system_mode_);
+  system_mode_ = new_system_mode;
+  OnEntrySystemMode(new_system_mode);
+  return true;
+}
+
+OperatingMode OperatingModeController::GetSystemMode() const { return system_mode_; }
+bool OperatingModeController::IsOverrideActive() const { return override_active_; }
+
+void OperatingModeController::OnOperationEvent(const OperationEvent& event) {
+  switch (event.command) {
+    case CommandType::kLoad:
+      ProcessLoadEvent(event);
+      break;
+    case CommandType::kRemove:
+      ProcessRemoveEvent(event);
+      break;
+  }
+}
+
+void OperatingModeController::ProcessLoadEvent(const OperationEvent& event) {
+  LOG_PRINT(log_print::kDebug,"Load Event: OpMode=%s, State=%s, Timeout=%ums, ToggleOnExpiry=%s",
+            ModeToString(event.op_mode).c_str(), event.state ? "ON" : "OFF",
+            (unsigned int)event.timeout_ms, event.on_expiry_toggle ? "T" : "F");
+
+  if (event.op_mode == OperatingMode::kOverride) { StartOverride(event); return; }
+  if (override_active_) { LOG_PRINT(log_print::kDebug, "OVERRIDE active. Ignoring OpMode %s.", ModeToString(event.op_mode).c_str()); return; }
+  
+  bool accepted = false;
+  if (system_mode_ != OperatingMode::kIdle && system_mode_ != OperatingMode::kError) {
+    if (static_cast<int>(event.op_mode) >= static_cast<int>(current_min_acceptable_event_priority_) &&
+        static_cast<int>(event.op_mode) <= static_cast<int>(current_max_acceptable_event_priority_)) {
+      accepted = true;
+    }
+  }
+
+  if (accepted) {
+    LOG_PRINT(log_print::kInfo, "Event accepted: OpMode %s.", ModeToString(event.op_mode).c_str());
+    SetActiveOperation(event);
+  } else if (system_mode_ != OperatingMode::kIdle && system_mode_ != OperatingMode::kError) {
+    LOG_PRINT(log_print::kWarn, "Event rejected: OpMode %s for SystemMode %s.",
+              ModeToString(event.op_mode).c_str(), ModeToString(system_mode_).c_str());
+  }
+}
+
+void OperatingModeController::ProcessRemoveEvent(const OperationEvent& event) {
+  LOG_PRINT(log_print::kInfo, "Remove Event for OpMode %s.", ModeToString(event.op_mode).c_str());
+  if (event.op_mode == OperatingMode::kOverride) {
+    EndOverride();
+  } else {
+    ClearActiveOperation(event.op_mode);
+  }
+}
+
+void OperatingModeController::Run() {
+  CheckOperationTimeouts(); 
+  ApplyControlState();      
+}
+
+void OperatingModeController::CheckOperationTimeouts() {
+  bool an_override_op_expired = false;
+  for (size_t i = 0; i < active_operations_.size(); ++i) {
+    if (active_operations_[i].has_value() && active_operations_[i]->IsTimerElapsed()) {
+      OperatingMode current_op_mode = static_cast<OperatingMode>(i);
+      ActiveOperation expired_op = active_operations_[i].value();
+      
+      LOG_PRINT(log_print::kInfo, "Op timer ELAPSED: %s, OnExpiryToggle=%s.",
+                ModeToString(current_op_mode).c_str(), expired_op.on_expiry_toggle ? "TRUE" : "FALSE");
+      
+      active_operations_[i].reset(); 
+
+      if (expired_op.on_expiry_toggle) {
+        bool current_lamp_state = control_system_.GetLampState();
+        bool target_state = !current_lamp_state;
+        std::string reason = "Expiry toggle for " + ModeToString(current_op_mode);
+        control_system_.SetState(target_state, reason);
+        if (!first_apply_done_) first_apply_done_ = true; 
+        if (current_op_mode == OperatingMode::kOverride && override_active_) an_override_op_expired = true;
+      }
+    }
+  }
+  if (an_override_op_expired) EndOverride(); 
+}
+
+void OperatingModeController::OnExitSystemMode(OperatingMode exiting_mode) {
+  LOG_PRINT(log_print::kInfo, "Exiting SystemMode: %s. Clearing all active operations.", ModeToString(exiting_mode).c_str());
+  for (auto& op_slot : active_operations_) op_slot.reset();
+  current_min_acceptable_event_priority_ = OperatingMode::kNone;
+  current_max_acceptable_event_priority_ = OperatingMode::kNone;
+}
+
+void OperatingModeController::OnEntrySystemMode(OperatingMode entering_mode) {
+  LOG_PRINT(log_print::kInfo, "Entering SystemMode: %s.", ModeToString(entering_mode).c_str());
+  switch (entering_mode) {
+    case OperatingMode::kSchedule:
+      current_min_acceptable_event_priority_ = OperatingMode::kVacancy; 
+      current_max_acceptable_event_priority_ = OperatingMode::kSchedule;
+      break;
+    case OperatingMode::kOccupancy:
+      current_min_acceptable_event_priority_ = OperatingMode::kOccupancy;
+      current_max_acceptable_event_priority_ = OperatingMode::kOccupancy;
+      break;
+    case OperatingMode::kVacancy:
+      current_min_acceptable_event_priority_ = OperatingMode::kVacancy;
+      current_max_acceptable_event_priority_ = OperatingMode::kVacancy;
+      break;
+    default: 
+      current_min_acceptable_event_priority_ = OperatingMode::kNone;
+      current_max_acceptable_event_priority_ = OperatingMode::kNone;
+      break;
+  }
+  if (entering_mode == OperatingMode::kContinuous) {
+    LOG_PRINT(log_print::kInfo, "Continuous mode entered. Posting persistent ON event.");
+    // A timeout_ms of 0 means indefinite/persistent. on_expiry_toggle is irrelevant but set to false.
+    SetActiveOperation({CommandType::kLoad, OperatingMode::kContinuous, true, 0, false});
+  }
+}
+
+void OperatingModeController::StartOverride(const OperationEvent& event) {
+  if (!override_active_) {
+    LOG_PRINT(log_print::kInfo, "Starting OVERRIDE (Target State: %s).", event.state ? "ON" : "OFF");
+    post_override_target_mode_ = system_mode_;
+    override_active_ = true;
+    for (size_t i = 0; i < active_operations_.size(); ++i) {
+        if (static_cast<OperatingMode>(i) != OperatingMode::kOverride) active_operations_[i].reset();
+    }
+  } else {
+    LOG_PRINT(log_print::kInfo, "OVERRIDE already active. Refreshing (Target State: %s).", event.state ? "ON" : "OFF");
+  }
+  SetActiveOperation(event);
+}
+
+void OperatingModeController::EndOverride() {
+  if (override_active_) {
+    LOG_PRINT(log_print::kInfo, "Ending OVERRIDE. System will revert to target mode: %s.", ModeToString(post_override_target_mode_).c_str());
+    override_active_ = false;
+    // SetSystemMode will handle clearing operations and setting up the new mode's context.
+    // We call it here to perform a clean transition into the fallback mode.
+    SetSystemMode(post_override_target_mode_);
+  }
+}
+
+void OperatingModeController::SetActiveOperation(const OperationEvent& event) {
+  size_t index = static_cast<size_t>(event.op_mode);
+  if (index >= active_operations_.size()) { LOG_PRINT(log_print::kError, "SetActiveOp: Invalid index."); return; }
+  active_operations_[index] = ActiveOperation{
+      event.state, PlatformGetTicks(), PlatformMsToTicks(event.timeout_ms), event.on_expiry_toggle
+  };
+}
+
+void OperatingModeController::ClearActiveOperation(OperatingMode op_mode_to_clear) {
+    size_t index = static_cast<size_t>(op_mode_to_clear);
+    if (index >= active_operations_.size()) { return; }
+    if (op_mode_to_clear == OperatingMode::kOverride) { if (override_active_){ EndOverride(); } return; }
+    if (active_operations_[index].has_value()) {
+        active_operations_[index].reset();
+        LOG_PRINT(log_print::kInfo, "Cleared active op for OpMode %s.", ModeToString(op_mode_to_clear).c_str());
+    }
+}
+
+void OperatingModeController::ApplyControlState() {
+  bool new_control_state = false;
+  std::string reason = "Default OFF";
+
+  // Find the single highest-priority active operation
+  std::optional<ActiveOperation> highest_prio_op = std::nullopt;
+  OperatingMode highest_prio_op_mode = OperatingMode::kNone;
+
+  for (int i = static_cast<int>(OperatingMode::kNumOperatingModes) - 1; i > 0; --i) {
+      if (active_operations_[i].has_value()) {
+          highest_prio_op = active_operations_[i];
+          highest_prio_op_mode = static_cast<OperatingMode>(i);
+          break; 
+      }
+  }
+
+  // Determine state based ONLY on the single winning operation
+  if (highest_prio_op.has_value()) {
+      new_control_state = highest_prio_op->state;
+      reason = "Highest Prio Op: " + ModeToString(highest_prio_op_mode) +
+               (new_control_state ? " (ON)" : " (OFF)");
+  } else {
+    new_control_state = false;
+    reason = "No active operations";
+  }
+
+  if (new_control_state != control_system_.GetLampState() || !first_apply_done_) {
+    control_system_.SetState(new_control_state, reason);
+  } else {
+    LOG_PRINT(log_print::kDebug,
+              "ApplyState: Calculated state (%s) matches CS LampState. No change. Reason: %s",
+              new_control_state ? "ON" : "OFF", reason.c_str());
+  }
+  if (!first_apply_done_) first_apply_done_ = true;
+}
+
+std::string OperatingModeController::ModeToString(OperatingMode mode) {
+  switch (mode) {
+    case OperatingMode::kIdle: return "IDLE";
+    case OperatingMode::kContinuous: return "CONTINUOUS";
+    case OperatingMode::kOccupancy: return "OCCUPANCY";
+    case OperatingMode::kVacancy: return "VACANCY";
+    case OperatingMode::kSchedule: return "SCHEDULE";
+    case OperatingMode::kOverride: return "OVERRIDE_OpMode";
+    case OperatingMode::kError: return "ERROR";
+    case OperatingMode::kNone: return "NONE";
+    case OperatingMode::kNumOperatingModes: return "SENTINEL";
+    default: return "UNKNOWN(" + std::to_string(static_cast<int>(mode)) + ")";
+  }
+}
+
+--------------------------------------------------------------------------------------------
+
+// main.cpp
+#include "platform_adapter.h"
+#include "operating_mode_controller.h"
+#include "control_system.h"
+#include <thread>
+#include <chrono>
+
+void MockVTaskDelay(uint32_t ms) { std::this_thread::sleep_for(std::chrono::milliseconds(ms)); }
+
+// Alias for nested types for easier use in main
+using OperatingMode = OperatingModeController::OperatingMode;
+using OperationEvent = OperatingModeController::OperationEvent;
+using CommandType = OperatingModeController::CommandType;
+
+int main() {
+  LOG_PRINT(log_print::kInfo, "OperatingModeController Final (Command-Driven) Test Starting.");
+  ControlSystem my_control_system;
+  OperatingModeController my_controller(my_control_system);
+
+  LOG_PRINT(log_print::kInfo, "\n===== SCENARIO 1: Schedule expiry (toggles) =====");
+  my_controller.SetSystemMode(OperatingMode::kSchedule);
+  my_controller.Run(); // Apply initial state (OFF)
+  
+  LOG_PRINT(log_print::kInfo, "--- A) Setting Schedule ON (2s, toggles on expiry) ---");
+  my_controller.OnOperationEvent({CommandType::kLoad, OperatingMode::kSchedule, true, 2000, true});
+  my_controller.Run();
+  LOG_PRINT(log_print::kInfo, "Lamp state is %s", my_control_system.GetLampState() ? "ON":"OFF");
+
+  LOG_PRINT(log_print::kInfo, "--- B) Waiting for schedule to expire (2.5s) ---");
+  MockVTaskDelay(2500);
+  my_controller.Run();
+  LOG_PRINT(log_print::kInfo, "Lamp state after schedule expiry (should be toggled OFF): %s", my_control_system.GetLampState() ? "ON":"OFF");
+  
+  LOG_PRINT(log_print::kInfo, "\n===== SCENARIO 2: Override ON, set new mode, cancel override =====");
+  my_controller.SetSystemMode(OperatingMode::kContinuous);
+  my_controller.Run();
+  LOG_PRINT(log_print::kInfo, "In Continuous mode, lamp is %s", my_control_system.GetLampState() ? "ON":"OFF");
+
+  LOG_PRINT(log_print::kInfo, "--- A) Starting persistent OVERRIDE ON ---");
+  my_controller.OnOperationEvent({CommandType::kLoad, OperatingMode::kOverride, true, 0, true}); // timeout=0 means indefinite
+  my_controller.Run();
+  LOG_PRINT(log_print::kInfo, "During Override ON, lamp is %s", my_control_system.GetLampState() ? "ON":"OFF");
+
+  LOG_PRINT(log_print::kInfo, "--- B) Setting new mode to Occupancy while override is active ---");
+  my_controller.SetSystemMode(OperatingMode::kOccupancy); // This is saved as the new target
+  my_controller.Run(); // Does not change lamp state yet
+  LOG_PRINT(log_print::kInfo, "Lamp state is still %s", my_control_system.GetLampState() ? "ON":"OFF");
+
+  LOG_PRINT(log_print::kInfo, "--- C) Sending Occupancy event (will be ignored) ---");
+  my_controller.OnOperationEvent({CommandType::kLoad, OperatingMode::kOccupancy, true, 5000, false});
+  my_controller.Run();
+  LOG_PRINT(log_print::kInfo, "Lamp state is still %s", my_control_system.GetLampState() ? "ON":"OFF");
+
+  LOG_PRINT(log_print::kInfo, "--- D) Cancelling override with a kRemove command ---");
+  my_controller.OnOperationEvent({CommandType::kRemove, OperatingMode::kOverride});
+  my_controller.Run();
+  LOG_PRINT(log_print::kInfo, "After override ends, new system mode is '%s' and lamp is '%s'", 
+            OperatingModeController::ModeToString(my_controller.GetSystemMode()).c_str(), 
+            my_control_system.GetLampState() ? "ON" : "OFF");
+
+  LOG_PRINT(log_print::kInfo, "--- E) Sending an Occupancy event now ---");
+  my_controller.OnOperationEvent({CommandType::kLoad, OperatingMode::kOccupancy, true, 3000, false});
+  my_controller.Run();
+  LOG_PRINT(log_print::kInfo, "Lamp state is now %s", my_control_system.GetLampState() ? "ON":"OFF");
+
+  LOG_PRINT(log_print::kInfo, "PC Test Finished.");
+  return 0;
+}
+// Compile: g++ -std=c++17 -Wall main.cpp operating_mode_controller.cpp control_system.cpp -o mode_test
