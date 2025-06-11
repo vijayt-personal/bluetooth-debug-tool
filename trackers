@@ -1,0 +1,85 @@
+#ifndef LIB_CHANGE_TRACKERS_DIRTY_TRACKER_H_
+#define LIB_CHANGE_TRACKERS_DIRTY_TRACKER_H_
+
+namespace utils {
+namespace trackers {
+
+// A lightweight, memory-efficient tracker that uses a simple boolean flag
+// to mark if a value has changed since it was last marked clean.
+template <typename T>
+class DirtyTracker {
+ public:
+  // Constructor initializes the value and marks it as dirty by default.
+  DirtyTracker(const T& value = {}) : value_(value), is_dirty_(true) {}
+
+  // Returns a const reference to the value.
+  const T& Get() const { return value_; }
+
+  // Sets a new value. The tracker is marked as dirty ONLY if the new value
+  // is different from the current one.
+  void Set(const T& new_value) {
+    if (new_value != value_) {
+      value_ = new_value;
+      is_dirty_ = true;
+    }
+  }
+
+  // Checks if the value is dirty.
+  bool IsDirty() const { return is_dirty_; }
+
+  // Manually marks the value as clean (e.g., after saving or sending).
+  void MarkClean() { is_dirty_ = false; }
+
+ private:
+  T value_;
+  bool is_dirty_;
+};
+
+}  // namespace trackers
+}  // namespace utils
+
+#endif  // LIB_CHANGE_TRACKERS_DIRTY_TRACKER_H_
+
+----------------------------------------------------------------
+
+#ifndef LIB_CHANGE_TRACKERS_STATEFUL_TRACKER_H_
+#define LIB_CHANGE_TRACKERS_STATEFUL_TRACKER_H_
+
+namespace utils {
+namespace trackers {
+
+// Tracks both the 'current' (live) and 'cached' (last committed) state of a
+// value. This allows for robust change detection and provides access to both
+// the old and new values.
+template <typename T>
+class StatefulTracker {
+ public:
+  // Initializes both current and cached states to the same initial value.
+  StatefulTracker(const T& initial_value = {})
+      : current_value_(initial_value), cached_value_(initial_value) {}
+
+  // Sets or updates the live 'current' value.
+  void Set(const T& new_value) { current_value_ = new_value; }
+
+  // Returns the live 'current' value.
+  const T& GetCurrent() const { return current_value_; }
+
+  // Returns the 'cached' value from the last commit.
+  const T& GetCached() const { return cached_value_; }
+
+  // Checks if the live value has diverged from the cached baseline.
+  bool IsChanged() const { return current_value_ != cached_value_; }
+
+  // Commits the current value to the cached baseline, establishing a new
+  // clean state.
+  void Commit() { cached_value_ = current_value_; }
+
+ private:
+  T current_value_;
+  T cached_value_;
+};
+
+}  // namespace trackers
+}  // namespace utils
+
+#endif  // LIB_CHANGE_TRACKERS_STATEFUL_TRACKER_H_
