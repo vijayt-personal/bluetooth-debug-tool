@@ -11,7 +11,7 @@ This design implements a robust, packet-validated OTA (Over-The-Air) firmware up
 
 | Characteristic | UUID | Properties | Direction | Description |
 |---|---|---|---|---|
-| **Control Point** | `0xFFF1` | Write With Response | Central → Peripheral | Start, End, Abort, Info commands |
+| **Control Point** | `0xFFF1` | Write With Response | Central → Peripheral | Start, End, Abort commands |
 | **Data Transfer** | `0xFFF2` | Write Without Response | Central → Peripheral | Stream firmware chunks |
 | **Status / Progress** | `0xFFF3` | Notify | Peripheral → Central | ACKs and Responses |
 
@@ -75,14 +75,11 @@ message OtaAbort {
     string message = 2;
 }
 
-message OtaRequestInfo {}
-
 message OtaControl {
     oneof control_msg {
         OtaStart start_payload = 1;
         OtaEnd end_payload = 2;
         OtaAbort abort_payload = 3;
-        OtaRequestInfo request_info_payload = 4;
     }
 }
 
@@ -98,13 +95,6 @@ message OtaAck {
     string message = 2;
     uint32 received_seq = 3; // For DATA_ACK
 }
-
-message OtaInfoResponse {
-    string current_fw_version = 1;
-    string hw_version = 2;
-    uint32 product_id = 3;
-    uint32 supported_ota_scheme_version = 4;
-}
 ```
 
 ## Nanopb Implementation Note
@@ -119,8 +109,6 @@ ota.OtaStart.fw_version max_size:16
 ota.OtaStart.hw_version max_size:16
 ota.OtaEnd.image_hash max_size:32
 ota.OtaAbort.message max_size:32
-ota.OtaInfoResponse.current_fw_version max_size:16
-ota.OtaInfoResponse.hw_version max_size:16
 ota.OtaAck.message max_size:32
 ```
 
@@ -160,89 +148,73 @@ The fastest OTA method uses `Write Without Response` from the Central and `Notif
 
 ```mermaid
 stateDiagram-v2
-    direction LR
     [*] --> Idle
-
-    state Idle {
-        description: Waiting for OTA initiation.
-        Central_Writes_Control_Point_START_OTA --> Starting : OtaControl(start_payload)
-        Central_Writes_Control_Point_REQUEST_INFO --> Idle : OtaControl(request_info_payload) / Send OtaInfoResponse
-    }
-
-    state Starting {
-        description: Processing START command. Validating metadata.
-        --> Receiving : Valid_START / Send OtaAck(OK)
-        --> Aborted : Invalid_START (e.g., wrong product_id or unsupported scheme) / Send OtaAck(Error)
-    }
     
-    state Receiving {
-        description: Receiving firmware data chunks.
-        Central_Writes_Data_Transfer --> Receiving : OtaData(chunk) / Send OtaAck(OK)
-        Central_Writes_Control_Point_END_OTA --> Validating : OtaControl(end_payload) / Send OtaAck(OK)
-        Data_Error_Or_Timeout --> Aborted : e.g., CRC mismatch / Send OtaAck(Error)
-    }
+    Idle: Waiting for OTA initiation.
+    Starting: Processing START command. Validating metadata.
+    Receiving: Receiving firmware data chunks.
+    Validating: All data received. Validating full image integrity.
+    Committing: Writing firmware to flash and preparing for reboot.
+    Aborted: OTA process aborted due to error or explicit command.
+    Completed: OTA successful. Device reboots.
 
-    state Validating {
-        description: All data received. Validating full image integrity.
-        --> Committing : Validation_OK (e.g., SHA-256 hash matches) / Send OtaAck(OK)
-        --> Aborted : Validation_Failed / Send OtaAck(VALIDATION_FAILED)
-    }
+    Idle --> Starting : Central writes OtaControl(start_payload)
 
-    state Committing {
-        description: Writing firmware to flash and preparing for reboot.
-        --> Completed : Commit_OK
-        --> Aborted : Commit_Failed / Send OtaAck(COMMIT_FAILED)
-    }
+    Starting --> Receiving : Valid START / Send OtaAck(OK)
+    Starting --> Aborted : Invalid START (e.g., wrong product_id) / Send OtaAck(Error)
+    
+    Receiving --> Receiving : Central writes OtaData(chunk) / Send OtaAck(OK)
+    Receiving --> Validating : Central writes OtaControl(end_payload) / Send OtaAck(OK)
+    Receiving --> Aborted : Data Error or Timeout / Send OtaAck(Error)
 
-    state Aborted {
-        description: OTA process aborted due to error or explicit command.
-        --> Idle : Reset_OTA_State
-    }
+    Validating --> Committing : Validation OK (e.g., SHA-256 hash matches) / Send OtaAck(OK)
+    Validating --> Aborted : Validation Failed / Send OtaAck(VALIDATION_FAILED)
 
-    state Completed {
-        description: OTA successful. Device reboots.
-        --> [*] : Reboot_Device
-    }
+    Committing --> Completed : Commit OK
+    Committing --> Aborted : Commit Failed / Send OtaAck(COMMIT_FAILED)
+
+    Aborted --> Idle : Reset OTA State
+
+    Completed --> [*] : Reboot Device
 ```
 
-## OTA Message Sequence (Happy Path)
-
-### Phase 1: Capability Discovery
+## OTA Message Sequence (Happy Path and Error Handling)
 
 ```mermaid
 sequenceDiagram
     participant Central
     participant Peripheral
 
-    Note over Central, Peripheral: App connects to device.
-    Central->>Peripheral: Write Control Point: OtaControl(request_info_payload)
-    Peripheral-->>Central: Notify Status: OtaInfoResponse {current_fw_version, hw_version, product_id, supported_ota_scheme_version}
-    Note over Central: App now knows device capabilities and can choose a compatible firmware and OTA scheme.
-```
-
-### Phase 2: Firmware Transfer
-
-```mermaid
-sequenceDiagram
-    participant Central
-    participant Peripheral
-
-    Note over Central: Constructs OtaStart based on info from Phase 1.
-    Central->>Peripheral: OtaControl(start_payload {image_size, fw_version, ...})
-    Peripheral-->>Central: OtaAck(OK)
-
-    loop For each data chunk
-        Central->>Peripheral: OtaData(seq, chunk)
-        Peripheral-->>Central: OtaAck(OK, received_seq=seq)
-    end
+    note over Central, Peripheral: App connects to device and decides to start OTA.
+    Central->>Peripheral: OtaControl(start_payload)
     
-    Central->>Peripheral: OtaControl(end_payload {total_chunks, image_hash})
-    Peripheral-->>Central: OtaAck(OK)
-    Note over Peripheral: Validates full image using SHA-256 hash
+    alt Peripheral Accepts OTA Start
+        Peripheral-->>Central: OtaAck(OK)
+        
+        loop For each data chunk
+            Central->>Peripheral: OtaData(seq, chunk)
+            
+            alt Chunk transfer successful
+                Peripheral-->>Central: OtaAck(OK, received_seq=seq)
+            else Chunk transfer failed (e.g., CRC error)
+                Peripheral-->>Central: OtaAck(CRC_MISMATCH, received_seq=seq)
+                note over Central: Central retries sending the failed chunk.
+            end
+        end
+        
+        Central->>Peripheral: OtaControl(end_payload)
+        Peripheral-->>Central: OtaAck(OK)
+        
+        note over Peripheral: Validates full image using SHA-256 hash.
+    
+        alt Validation & Commit Successful
+            Peripheral-->>Central: OtaAck(OK, "Validation OK, Committing")
+            note over Peripheral: Commits firmware and prepares for reboot.
+        else Validation or Commit Failed
+            Peripheral-->>Central: OtaAck(VALIDATION_FAILED)
+        end
 
-    alt Validation & Commit Successful
-        Peripheral-->>Central: OtaAck(OK, message="Validation OK, Committing")
-        Note over Peripheral: Commits firmware and prepares for reboot.
-    else Validation or Commit Failed
-        Peripheral-->>Central: OtaAck(VALIDATION_FAILED)
+    else Peripheral Rejects OTA Start
+        Peripheral-->>Central: OtaAck(INCORRECT_PRODUCT or UNSUPPORTED_SCHEME)
+        note over Central: Aborts OTA or retries with a different scheme/firmware.
     end
