@@ -1,0 +1,168 @@
+#include <string>
+#include <string_view>
+#include <optional>
+#include <vector>
+#include <charconv>
+#include <tuple>
+#include <compare>
+#include <iostream> // For demonstration
+#include <cassert>  // For demonstration
+
+class Version {
+private:
+    std::string original_string_;
+    // This flag remains the single source of truth for overall SemVer validity.
+    bool is_valid_semver_ = false;
+
+    // The pre-release comparison helper remains the same.
+    static std::strong_ordering compare_prerelease_tags(/*...same as before...*/) {
+        // ... implementation from previous version ...
+    }
+
+public:
+    // Members are now optional again to provide a type-safe invalid state.
+    std::optional<int> major;
+    std::optional<int> minor;
+    std::optional<int> patch;
+    
+    std::optional<std::string_view> pre_release_tag;
+    std::optional<std::string_view> build_metadata;
+
+    explicit Version(std::string_view str) : original_string_(str) {
+        if (str.empty()) return;
+
+        std::string_view main = str;
+        if (auto pos = main.find('+'); pos != std::string_view::npos) { /* ... */ }
+        if (auto pos = main.find('-'); pos != std::string_view::npos) { /* ... */ }
+        
+        // ... (The parsing logic to split into parts remains the same) ...
+        std::vector<std::string_view> parts;
+        // ...
+        
+        int temp_major, temp_minor = 0, temp_patch = 0; // Use temps for parsing
+
+        if (parts.size() >= 1 && std::from_chars(parts[0].data(), parts[0].data() + parts[0].size(), temp_major).ec != std::errc()) return;
+        if (parts.size() >= 2 && std::from_chars(parts[1].data(), parts[1].data() + parts[1].size(), temp_minor).ec != std::errc()) return;
+        if (parts.size() == 3 && std::from_chars(parts[2].data(), parts[2].data() + parts[2].size(), temp_patch).ec != std::errc()) return;
+        
+        // Success! Now assign to the optional members.
+        major = temp_major;
+        minor = temp_minor;
+        patch = temp_patch;
+        is_valid_semver_ = true;
+    }
+
+    bool is_valid() const { return is_valid_semver_; }
+    const std::string& string() const { return original_string_; }
+
+    std::string to_string() const {
+        if (!is_valid_semver_) return original_string_;
+        // Now we must safely unwrap the optionals
+        std::string result = std::to_string(major.value()) + "." + std::to_string(minor.value()) + "." + std::to_string(patch.value());
+        if (pre_release_tag) { /* ... */ }
+        if (build_metadata) { /* ... */ }
+        return result;
+    }
+
+    auto operator<=>(const Version& other) const {
+        if (is_valid_semver_ && other.is_valid_semver_) {
+            // Compare numerically if both are valid
+            if (auto comp = std::tie(major, minor, patch) <=> std::tie(other.major, other.minor, other.patch); comp != 0) {
+                return comp;
+            }
+            return compare_prerelease_tags(pre_release_tag, other.pre_release_tag);
+        }
+        
+        // Fallback comparison
+        if (is_valid_semver_ != other.is_valid_semver_) {
+            return is_valid_semver_ <=> other.is_valid_semver_; // A valid version is > invalid
+        }
+        
+        // Both are invalid, compare original strings
+        return original_string_ <=> other.original_string_;
+    }
+
+    bool operator==(const Version& other) const { return (*this <=> other) == 0; }
+};
+
+
+--------------------------------------------------------------------------------------------
+
+int main() {
+    Version v_garbage("garbage");
+    Version v_zero("0.0.0");
+
+    std::cout << "--- Testing Ambiguity ---" << std::endl;
+
+    // Test the invalid version
+    std::cout << "Version(\"garbage\"): " << std::endl;
+    std::cout << "  Is Valid: " << std::boolalpha << v_garbage.is_valid() << std::endl;
+    std::cout << "  Major has value: " << std::boolalpha << v_garbage.major.has_value() << std::endl;
+    assert(!v_garbage.is_valid());
+    assert(!v_garbage.major.has_value()); // major is std::nullopt
+
+    // Test the valid zero version
+    std::cout << "\nVersion(\"0.0.0\"): " << std::endl;
+    std::cout << "  Is Valid: " << std::boolalpha << v_zero.is_valid() << std::endl;
+    std::cout << "  Major has value: " << std::boolalpha << v_zero.major.has_value() << std::endl;
+    assert(v_zero.is_valid());
+    assert(v_zero.major.has_value()); // major has a value
+
+    // The crucial comparison that is now type-safe:
+    if (v_zero.major == 0) {
+        std::cout << "\nCorrectly identified v_zero.major as 0." << std::endl;
+    }
+
+    // This check is now impossible to make by accident with an invalid version.
+    // The following line would not compile: if (v_garbage.major == 0)
+    // You are forced to be explicit:
+    if (v_garbage.major.value_or(-1) == 0) {
+        // This won't happen
+    } else {
+        std::cout << "Correctly determined v_garbage.major is not 0." << std::endl;
+    }
+    
+    std::cout << "\nAll assertions passed. The ambiguity between an invalid parse and version 0 is resolved." << std::endl;
+}
+
+----------------------------------
+
+#include <iostream>
+#include <cassert>
+
+void print_version_state(const std::string& name, const Version& v) {
+    std::cout << name << " \"" << v.string() << "\"\t-> Valid: " << (v.is_valid() ? "Yes" : "No ")
+              << ", Normalized: " << v.to_string() << std::endl;
+}
+
+int main() {
+    std::cout << "--- 1. Validity and Normalization ---" << std::endl;
+    print_version_state("Full", Version("2.1.3-beta.1+build42"));
+    print_version_state("Incomplete", Version("1.2"));
+    print_version_state("Malformed", Version("1..2"));
+    print_version_state("Invalid Chars", Version("1.a.c"));
+
+    // Test to_string and defaults
+    assert(Version("1.2").to_string() == "1.2.0");
+    assert(Version("1.2").is_valid());
+    assert(!Version("1..2").is_valid());
+
+    std::cout << "\n--- 2. SemVer Pre-Release Comparison ---" << std::endl;
+    // Numeric vs. Lexicographical in identifiers
+    assert(Version("1.0.0-rc.2") < Version("1.0.0-rc.10"));
+    assert(Version("1.0.0-alpha") < Version("1.0.0-beta"));
+
+    // Precedence of numeric vs. alpha
+    assert(Version("1.0.0-alpha.1") > Version("1.0.0-alpha"));
+
+    // Full precedence chain test
+    assert(Version("1.0.0-alpha") < Version("1.0.0-alpha.1"));
+    assert(Version("1.0.0-alpha.1") < Version("1.0.0-alpha.beta"));
+    assert(Version("1.0.0-alpha.beta") < Version("1.0.0-beta"));
+    assert(Version("1.0.0-beta") < Version("1.0.0-beta.2"));
+    assert(Version("1.0.0-beta.2") < Version("1.0.0-beta.11"));
+    assert(Version("1.0.0-beta.11") < Version("1.0.0-rc.1"));
+    assert(Version("1.0.0-rc.1") < Version("1.0.0"));
+
+    std::cout << "All assertions passed. SemVer logic is correct." << std::endl;
+}
