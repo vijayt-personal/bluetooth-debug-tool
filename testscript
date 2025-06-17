@@ -277,3 +277,57 @@ class OTAProtocol:
             return False
         finally:
             await self.ble.stop_notify(STATUS_PROGRESS_UUID)
+
+------------------------------------------
+
+# main.py
+import asyncio
+import json
+import os
+from ble_manager import BLEManager
+from ota_protocol import OTAProtocol
+
+def load_config(path="config.json"):
+    """Loads configuration from a JSON file."""
+    try:
+        with open(path, "r") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        print(f"Error: Configuration file not found at '{path}'")
+        return None
+
+def create_dummy_firmware(config):
+    """Creates a dummy firmware file if it doesn't exist."""
+    filepath = config.get("firmware_file")
+    if not os.path.exists(filepath):
+        print(f"Dummy firmware '{filepath}' not found, creating a new one (128KB)...")
+        with open(filepath, "wb") as f:
+            f.write(os.urandom(1024 * 128))
+        print("Dummy firmware created.")
+
+async def main():
+    """Main function to run the OTA update."""
+    config = load_config()
+    if not config:
+        return
+
+    # For simulation purposes, create a dummy binary if it's missing
+    create_dummy_firmware(config)
+
+    device_address = config.get("device_address")
+    if not device_address or device_address == "XX:XX:XX:XX:XX:XX":
+        print("Error: Please set a valid 'device_address' in config.json")
+        return
+
+    ble_manager = BLEManager(device_address)
+    try:
+        if await ble_manager.connect():
+            ota_handler = OTAProtocol(ble_manager, config)
+            await ota_handler.perform_ota()
+    except Exception as e:
+        print(f"A critical error occurred: {e}")
+    finally:
+        await ble_manager.disconnect()
+
+if __name__ == "__main__":
+    asyncio.run(main())
