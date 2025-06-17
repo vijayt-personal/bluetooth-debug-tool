@@ -1,0 +1,729 @@
+/**
+ * @file ble_peripheral.h
+ * @brief BLE Peripheral interface for handling BLE server, advertising, and
+ * modern BLE 5 features.
+ */
+#ifndef PLATFORM_BLE_PERIPHERAL_H_
+#define PLATFORM_BLE_PERIPHERAL_H_
+
+#include <cstddef>
+#include <cstdint>
+#include <functional>
+#include <map>
+#include <memory>
+#include <string>
+#include <tuple>
+#include <vector>
+
+namespace platform {
+namespace connectivity {
+
+/**
+ * @brief Manages BLE Peripheral (Server) functionality, including modern
+ * advertising and BLE 5.0 features.
+ *
+ * This class provides a high-level C++ interface to manage a BLE peripheral,
+ * hiding the underlying ESP-IDF NimBLE C API details using the PIMPL idiom.
+ */
+class BLEPeripheral {
+ public:
+  /** @brief BLE connection state. */
+  enum class BleState { kIdle, kAdvertising, kConnected, kDisconnected };
+
+  /** * @brief BLE characteristic property flags.
+   * These can be combined using the bitwise OR operator (e.g., CharProperty::kRead | CharProperty::kWrite).
+   */
+  enum class CharProperty {
+    kRead             = 0x02,
+    kWriteNoResponse  = 0x04,
+    kWrite            = 0x08,
+    kNotify           = 0x10,
+    kIndicate         = 0x20,
+  };
+
+  /** @brief Bitmask for selecting BLE 5.0 PHYs. */
+  enum PhyMask {
+    kPhy1m = (1 << 0),
+    kPhy2m = (1 << 1),
+    kPhyCoded = (1 << 2),
+  };
+
+  /** @brief User callback type for characteristic write events. */
+  using CharCallback = std::function<void(const void *data, size_t size)>;
+
+  BLEPeripheral();
+  ~BLEPeripheral();
+
+  // Disable copy and move operations for safety.
+  BLEPeripheral(const BLEPeripheral &) = delete;
+  BLEPeripheral &operator=(const BLEPeripheral &) = delete;
+  BLEPeripheral(BLEPeripheral &&) = delete;
+  BLEPeripheral &operator=(BLEPeripheral &&) = delete;
+
+  /**
+   * @brief Initializes the BLE stack and sets the device name.
+   *
+   * @note NVS flash must be initialized by the caller before this function is
+   * invoked. This is a prerequisite for the BLE stack to support bonding.
+   *
+   * @param device_name The name the device will advertise.
+   */
+  void Init(const std::string &device_name);
+
+  /**
+   * @brief Registers a BLE service with its characteristics.
+   * @param service_uuid The 128-bit UUID of the service as a string.
+   * @param characteristics A vector of tuples describing each characteristic.
+   * Each tuple contains: { UUID_string, Properties, Write_Callback }
+   */
+  void RegisterService(
+      const std::string &service_uuid,
+      const std::vector<
+          std::tuple<std::string, CharProperty, CharCallback>> &characteristics);
+
+  /**
+   * @brief Sets the value of a characteristic.
+   * @param char_uuid The UUID of the characteristic to update.
+   * @param value A pointer to the data buffer.
+   * @param size The size of the data buffer.
+   * @param notify If true, sends a GATT notification or indication to a subscribed client.
+   */
+  void SetCharacteristicValue(const std::string &char_uuid, const void *value,
+                              size_t size, bool notify = false);
+
+  /**
+   * @brief Sets custom "Service Data" for the advertising or scan response packet.
+   *
+   * @param service_uuid The 16- or 128-bit service UUID to associate data with.
+   * @param data The raw data to advertise.
+   */
+  void SetServiceData(const std::string &service_uuid,
+                      const std::vector<uint8_t> &data);
+  
+  /**
+   * @brief Sets Manufacturer Specific Data for the advertising packet.
+   *
+   * @param company_id The 16-bit Bluetooth SIG-assigned Company ID.
+   * @param data The proprietary data to advertise.
+   */
+  void SetManufacturerData(uint16_t company_id, const std::vector<uint8_t>& data);
+
+  /**
+   * @brief Sets the BLE Appearance value.
+   *
+   * @param appearance The 16-bit appearance value from BLE Assigned Numbers.
+   */
+  void SetAppearance(uint16_t appearance);
+
+  /**
+   * @brief Configures which of the registered service UUIDs should be advertised.
+   *
+   * By default, no service UUIDs are advertised to save space. This allows
+   * specifying which ones to include in the advertising or scan response packet.
+   *
+   * @param service_uuids A vector of service UUID strings to include.
+   */
+  void SetAdvertisedServiceUUIDs(const std::vector<std::string>& service_uuids);
+
+
+  /**
+   * @brief Rebuilds and applies any changes made to the advertising data.
+   *
+   * Call this after using SetManufacturerData, SetServiceData, etc., to make
+   * the changes take effect. If advertising is active, it will be seamlessly
+   * stopped and restarted with the new data.
+   */
+  void ApplyAdvertisingChanges();
+
+  /**
+   * @brief Starts legacy BLE advertising (pre-BLE 5.0).
+   *
+   * This will build and set a packet from the configured advertising fields.
+   *
+   * @param connectable If true, advertising is connectable.
+   * @param interval_ms The advertising interval in milliseconds.
+   */
+  void StartLegacyAdvertising(bool connectable = true,
+                              uint16_t interval_ms = 100);
+
+  /**
+   * @brief Starts BLE 5.0 Extended Advertising.
+   *
+   * This will build and set a packet from the configured advertising fields.
+   *
+   * @param connectable If true, advertising is connectable.
+   * @param scannable If true, a scan response can be requested.
+   * @param primary_phy The PHY to use for primary advertising channels.
+   * @param secondary_phy The PHY to use for the secondary/extended data packet.
+   * @param interval_ms The advertising interval in milliseconds.
+   */
+  void StartExtendedAdvertising(bool connectable = true, bool scannable = true,
+                                PhyMask primary_phy = kPhy1m,
+                                PhyMask secondary_phy = kPhy1m,
+                                uint16_t interval_ms = 100);
+
+  /**
+   * @brief Stops any active advertising.
+   */
+  void StopAdvertising();
+
+  /**
+   * @brief Sets the preferred PHYs for connections (a BLE 5.0 feature).
+   *
+   * @param tx_phys_mask A bitmask of preferred transmit PHYs.
+   * @param rx_phys_mask A bitmask of preferred receive PHYs.
+   */
+  void SetPreferredPhy(uint8_t tx_phys_mask, uint8_t rx_phys_mask);
+
+  /**
+   * @brief Disconnects from the currently connected client.
+   */
+  void Disconnect();
+
+  void SetConnectionCallback(std::function<void()> callback);
+  void SetDisconnectionCallback(std::function<void()> callback);
+  BleState GetState();
+
+ private:
+  class BlePeripheralImpl;
+  std::unique_ptr<BlePeripheralImpl> impl_;
+};
+
+}  // namespace connectivity
+}  // namespace platform
+
+#endif  // PLATFORM_BLE_PERIPHERAL_H_
+
+----------------------------
+
+/**
+ * @file ble_peripheral.cpp
+ * @brief Implements the BLE Peripheral interface using ESP-IDF NimBLE.
+ */
+
+#include "ble_peripheral.h"
+
+#include "esp_log.h"
+#include "host/ble_hs.h"
+#include "host/util/util.h"
+#include "nimble/nimble_port.h"
+#include "nimble/nimble_port_freertos.h"
+#include "services/gap/ble_svc_gap.h"
+#include "services/gatt/ble_svc_gatt.h"
+
+#include <algorithm>
+#include <vector>
+
+// Macro to check if Extended Advertising is enabled in sdkconfig
+#if SOC_BLE_5_SUPPORTED && CONFIG_BT_NIMBLE_EXT_ADV
+#define NIMBLE_EXT_ADV_SUPPORTED (1)
+#else
+#define NIMBLE_EXT_ADV_SUPPORTED (0)
+#endif
+
+namespace platform {
+namespace connectivity {
+
+static const char *TAG = "BLEPeripheral";
+
+// --- PIMPL Implementation Class Definition ---
+class BLEPeripheral::BlePeripheralImpl {
+ public:
+  BlePeripheralImpl();
+  ~BlePeripheralImpl();
+
+  // Public API implementation
+  void Init(const std::string &device_name);
+  void RegisterService(
+      const std::string &service_uuid,
+      const std::vector<
+          std::tuple<std::string, CharProperty, CharCallback>> &characteristics);
+  void SetCharacteristicValue(const std::string &char_uuid, const void *value,
+                                size_t size, bool notify);
+  void SetServiceData(const std::string &service_uuid, const std::vector<uint8_t> &data);
+  void SetManufacturerData(uint16_t company_id, const std::vector<uint8_t>& data);
+  void SetAppearance(uint16_t appearance);
+  void SetAdvertisedServiceUUIDs(const std::vector<std::string>& service_uuids);
+  void ApplyAdvertisingChanges();
+  void StartLegacyAdvertising(bool connectable, uint16_t interval_ms);
+  void StartExtendedAdvertising(bool connectable, bool scannable,
+                                PhyMask primary_phy, PhyMask secondary_phy,
+                                uint16_t interval_ms);
+  void StopAdvertising();
+  void SetPreferredPhy(uint8_t tx_phys_mask, uint8_t rx_phys_mask);
+  void Disconnect();
+
+  // Callbacks and State
+  BleState state_ = BleState::kIdle;
+  std::function<void()> on_connect_cb_;
+  std::function<void()> on_disconnect_cb_;
+  std::map<uint16_t, CharCallback> char_callbacks_;
+  uint16_t conn_handle_ = BLE_HS_CONN_HANDLE_NONE;
+
+ private:
+  // Static Event Handlers passed to NimBLE C API
+  static int GattSvrDispatch(struct ble_gatt_access_ctxt *ctxt, void *arg);
+  static int GapEventHandler(struct ble_gap_event *event, void *arg);
+  static void OnSync();
+
+  // Internal helpers
+  void BuildGattServices();
+  void BuildAdvertisingPayload(std::vector<uint8_t>& payload, bool is_scan_response);
+  void RestartAdvertising();
+
+  // Member Data
+  std::string device_name_;
+  uint8_t own_addr_type_ = 0;
+
+  // Advertising data components
+  uint16_t appearance_ = 0;
+  uint16_t manufacturer_company_id_ = 0;
+  std::vector<uint8_t> manufacturer_data_;
+  std::vector<ble_uuid_any_t> advertised_uuids_;
+  std::map<std::string, std::vector<uint8_t>> service_data_map_;
+
+  // Last advertising parameters for seamless restarts
+  struct AdvParams {
+      bool is_extended = false;
+      bool connectable = true;
+      bool scannable = true;
+      uint16_t interval_ms = 100;
+      PhyMask primary_phy = kPhy1m;
+      PhyMask secondary_phy = kPhy1m;
+  } last_adv_params_;
+
+  // Service and characteristic definitions
+  struct CharDef {
+    std::string uuid_str;
+    ble_uuid_any_t uuid;
+    CharProperty properties;
+    CharCallback callback;
+    uint16_t handle = 0;
+  };
+  struct ServiceDef {
+    std::string uuid_str;
+    ble_uuid_any_t uuid;
+    std::vector<CharDef> characteristics;
+  };
+  std::vector<ServiceDef> services_;
+
+#if NIMBLE_EXT_ADV_SUPPORTED
+  uint8_t ext_adv_handle_ = 0;
+#endif
+};
+
+// --- BlePeripheralImpl Method Implementations ---
+
+BLEPeripheral::BlePeripheralImpl::BlePeripheralImpl() = default;
+
+BLEPeripheral::BlePeripheralImpl::~BlePeripheralImpl() {
+  StopAdvertising();
+  if (nimble_port_get_status() == ESP_OK) {
+    nimble_port_deinit();
+  }
+}
+
+int BLEPeripheral::BlePeripheralImpl::GapEventHandler(struct ble_gap_event *event, void *arg) {
+    BlePeripheralImpl *self = static_cast<BlePeripheralImpl *>(arg);
+
+    switch (event->type) {
+    case BLE_GAP_EVENT_CONNECT:
+        ESP_LOGI(TAG, "Client connected; status=%d, handle=%d", event->connect.status, event->connect.conn_handle);
+        if (event->connect.status == 0) {
+            self->conn_handle_ = event->connect.conn_handle;
+            self->state_ = BleState::kConnected;
+            if (self->on_connect_cb_) self->on_connect_cb_();
+        } else {
+            self->RestartAdvertising();
+        }
+        break;
+
+    case BLE_GAP_EVENT_DISCONNECT:
+        ESP_LOGI(TAG, "Client disconnected; reason=0x%02x", event->disconnect.reason);
+        self->conn_handle_ = BLE_HS_CONN_HANDLE_NONE;
+        self->state_ = BleState::kDisconnected;
+        if (self->on_disconnect_cb_) self->on_disconnect_cb_();
+        self->RestartAdvertising();
+        break;
+
+    case BLE_GAP_EVENT_ADV_COMPLETE:
+        ESP_LOGI(TAG, "Advertising complete");
+        self->state_ = BleState::kIdle;
+        break;
+        
+    case BLE_GAP_EVENT_SUBSCRIBE:
+        ESP_LOGI(TAG, "Subscribe event; handle=%d, value=%d", event->subscribe.attr_handle, event->subscribe.cur_notify);
+        break;
+
+    case BLE_GAP_EVENT_PHY_UPDATE_COMPLETE:
+         ESP_LOGI(TAG, "PHY update complete; status=%d, tx_phy=%d, rx_phy=%d",
+               event->phy_update.status, event->phy_update.tx_phy, event->phy_update.rx_phy);
+        break;
+
+    default:
+        break;
+    }
+    return 0;
+}
+
+int BLEPeripheral::BlePeripheralImpl::GattSvrDispatch(struct ble_gatt_access_ctxt *ctxt, void *arg) {
+    BlePeripheralImpl *self = static_cast<BlePeripheralImpl *>(arg);
+    uint16_t attr_handle = ctxt->attr_handle;
+
+    switch (ctxt->op) {
+    case BLE_GATT_ACCESS_OP_WRITE_CHR:
+        ESP_LOGI(TAG, "Write request for handle %d", attr_handle);
+        if (self->char_callbacks_.count(attr_handle)) {
+            size_t len = OS_MBUF_PKTLEN(ctxt->om);
+            std::vector<uint8_t> data(len);
+            ble_hs_mbuf_to_flat(ctxt->om, data.data(), len, NULL);
+            self->char_callbacks_[attr_handle](data.data(), len);
+        }
+        return 0;
+    
+    // Read operations can be added here if characteristics are readable
+    case BLE_GATT_ACCESS_OP_READ_CHR:
+        ESP_LOGI(TAG, "Read request for handle %d", attr_handle);
+        // In a real app, you would look up the value for this handle and write it to ctxt->om
+        return BLE_ATT_ERR_READ_NOT_PERMITTED;
+
+    default:
+        return BLE_ATT_ERR_UNLIKELY;
+    }
+}
+
+void BLEPeripheral::BlePeripheralImpl::OnSync() {
+    ESP_LOGI(TAG, "BLE Host synced.");
+    int rc = ble_hs_util_ensure_addr(0);
+    assert(rc == 0);
+    rc = ble_hs_id_infer_auto(0, &ble_hs_our_addr_type);
+    assert(rc == 0);
+
+    // Services must be built *after* the host is synced.
+    // The `this` pointer is recovered via a static context since this callback has a C signature.
+    // This is a common pattern when interfacing C++ with C APIs.
+    // Assuming a singleton or a known static instance of BlePeripheralImpl.
+    // For a multi-instance scenario, a more complex handler registration would be needed.
+}
+
+
+void BLEPeripheral::BlePeripheralImpl::BuildGattServices() {
+    // This function will be called after services have been registered
+    std::vector<struct ble_gatt_svc_def> gatt_svcs;
+    std::vector<std::unique_ptr<struct ble_gatt_chr_def[]>> gatt_chrs_storage;
+
+    for (auto &service_def : services_) {
+        struct ble_gatt_svc_def svc_reg = {};
+        svc_reg.type = BLE_GATT_SVC_TYPE_PRIMARY;
+        svc_reg.uuid = &service_def.uuid.u;
+
+        auto gatt_chrs = std::make_unique<struct ble_gatt_chr_def[]>(service_def.characteristics.size() + 1);
+        int i = 0;
+        for (auto &char_def : service_def.characteristics) {
+            gatt_chrs[i].uuid = &char_def.uuid.u;
+            gatt_chrs[i].access_cb = GattSvrDispatch;
+            gatt_chrs[i].arg = this;
+            gatt_chrs[i].flags = static_cast<uint16_t>(char_def.properties);
+            gatt_chrs[i].val_handle = &char_def.handle;
+            i++;
+        }
+        gatt_chrs[i] = {}; // Null terminator
+
+        svc_reg.characteristics = gatt_chrs.get();
+        gatt_svcs.push_back(svc_reg);
+        gatt_chrs_storage.push_back(std::move(gatt_chrs));
+    }
+    gatt_svcs.push_back({}); // Null terminator for services array
+
+    if (ble_gatts_count_cfg(gatt_svcs.data()) != 0 || ble_gatts_add_svcs(gatt_svcs.data()) != 0) {
+        ESP_LOGE(TAG, "Failed to register GATT services");
+        return;
+    }
+
+    // After registration, map the assigned handles to callbacks for fast lookup
+    char_callbacks_.clear();
+    for (const auto &service_def : services_) {
+        for (const auto &char_def : service_def.characteristics) {
+            if (char_def.callback) {
+                char_callbacks_[char_def.handle] = char_def.callback;
+                ESP_LOGI(TAG, "Characteristic %s registered with handle %d", char_def.uuid_str.c_str(), char_def.handle);
+            }
+        }
+    }
+}
+
+void BLEPeripheral::BlePeripheralImpl::Init(const std::string &device_name) {
+    device_name_ = device_name;
+
+    nimble_port_init();
+
+    ble_hs_cfg.reset_cb = [](int r){ ESP_LOGW(TAG, "Host reset reason: %d", r); };
+    ble_hs_cfg.sync_cb = [this](){
+        ESP_LOGI(TAG, "BLE Host synced.");
+        int rc = ble_hs_util_ensure_addr(0);
+        assert(rc == 0);
+        rc = ble_hs_id_infer_auto(0, &this->own_addr_type_);
+        assert(rc == 0);
+        this->BuildGattServices();
+        ble_svc_gap_device_name_set(this->device_name_.c_str());
+    };
+    
+    ble_svc_gatt_init();
+    nimble_port_freertos_init(GapEventHandler, this);
+}
+
+void BLEPeripheral::BlePeripheralImpl::RegisterService(
+    const std::string &service_uuid_str,
+    const std::vector<std::tuple<std::string, CharProperty, CharCallback>> &characteristics) {
+    
+    ServiceDef new_service;
+    new_service.uuid_str = service_uuid_str;
+    if (ble_uuid_from_str(service_uuid_str.c_str(), &new_service.uuid.u128) != 0) {
+        ESP_LOGE(TAG, "Invalid service UUID: %s", service_uuid_str.c_st());
+        return;
+    }
+
+    for (const auto &char_tuple : characteristics) {
+        CharDef new_char;
+        new_char.uuid_str = std::get<0>(char_tuple);
+        if (ble_uuid_from_str(new_char.uuid_str.c_str(), &new_char.uuid.u128) != 0) {
+            ESP_LOGE(TAG, "Invalid characteristic UUID: %s", new_char.uuid_str.c_str());
+            continue;
+        }
+        new_char.properties = std::get<1>(char_tuple);
+        new_char.callback = std::get<2>(char_tuple);
+        new_service.characteristics.push_back(std::move(new_char));
+    }
+    services_.push_back(std::move(new_service));
+}
+
+void BLEPeripheral::BlePeripheralImpl::SetCharacteristicValue(const std::string &char_uuid_str, const void *value,
+                                                              size_t size, bool notify) {
+    uint16_t target_handle = 0;
+    for (const auto& service : services_) {
+        for (const auto& chr : service.characteristics) {
+            if (chr.uuid_str == char_uuid_str) {
+                target_handle = chr.handle;
+                break;
+            }
+        }
+        if (target_handle != 0) break;
+    }
+
+    if (target_handle == 0) {
+        ESP_LOGE(TAG, "Characteristic not found: %s", char_uuid_str.c_str());
+        return;
+    }
+
+    if (notify && state_ == BleState::kConnected) {
+        os_mbuf *om = ble_hs_mbuf_from_flat(value, size);
+        if (!om) {
+            ESP_LOGE(TAG, "Failed to create mbuf for notification");
+            return;
+        }
+        ble_gattc_notify_custom(conn_handle_, target_handle, om);
+    } else {
+        // This sets the local value in the GATT database
+        ble_gatts_chr_updated(target_handle);
+    }
+}
+
+void BLEPeripheral::BlePeripheralImpl::SetServiceData(const std::string &service_uuid, const std::vector<uint8_t> &data) {
+    service_data_map_[service_uuid] = data;
+}
+
+void BLEPeripheral::BlePeripheralImpl::SetManufacturerData(uint16_t company_id, const std::vector<uint8_t>& data) {
+    manufacturer_company_id_ = company_id;
+    manufacturer_data_ = data;
+}
+
+void BLEPeripheral::BlePeripheralImpl::SetAppearance(uint16_t appearance) {
+    appearance_ = appearance;
+}
+
+void BLEPeripheral::BlePeripheralImpl::SetAdvertisedServiceUUIDs(const std::vector<std::string>& service_uuids) {
+    advertised_uuids_.clear();
+    for(const auto& uuid_str : service_uuids) {
+        ble_uuid_any_t parsed_uuid;
+        if(ble_uuid_from_str(uuid_str.c_str(), &parsed_uuid.u128) == 0) {
+            advertised_uuids_.push_back(parsed_uuid);
+        } else {
+            ESP_LOGE(TAG, "Invalid UUID string for advertising: %s", uuid_str.c_str());
+        }
+    }
+}
+
+void BLEPeripheral::BlePeripheralImpl::BuildAdvertisingPayload(std::vector<uint8_t>& payload, bool is_scan_response) {
+    payload.clear();
+    ble_hs_adv_fields fields = {};
+
+    if (!is_scan_response) {
+        fields.flags = BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP;
+        
+        if (manufacturer_company_id_ != 0) {
+            fields.mfg_data = manufacturer_data_.data();
+            fields.mfg_data_len = manufacturer_data_.size();
+            // Company ID is set in ble_hs_cfg, not directly here. Or needs custom build.
+            // For now, let's build manually for full control
+        }
+
+        uint8_t flags_data[] = {0x02, 0x01, fields.flags};
+        payload.insert(payload.end(), flags_data, flags_data + sizeof(flags_data));
+        
+        if (manufacturer_company_id_ != 0 && !manufacturer_data_.empty()) {
+            payload.push_back(manufacturer_data_.size() + 3); // len+type+id
+            payload.push_back(BLE_HS_ADV_TYPE_MFG_DATA);
+            payload.push_back(manufacturer_company_id_ & 0xFF);
+            payload.push_back(manufacturer_company_id_ >> 8);
+            payload.insert(payload.end(), manufacturer_data_.begin(), manufacturer_data_.end());
+        }
+        
+    } else { // Scan Response
+        if (!device_name_.empty()) {
+            payload.push_back(device_name_.length() + 1);
+            payload.push_back(BLE_HS_ADV_TYPE_COMP_NAME);
+            payload.insert(payload.end(), device_name_.begin(), device_name_.end());
+        }
+    }
+}
+
+void BLEPeripheral::BlePeripheralImpl::ApplyAdvertisingChanges() {
+    bool was_advertising = (state_ == BleState::kAdvertising);
+    if (was_advertising) {
+        StopAdvertising();
+    }
+
+    std::vector<uint8_t> adv_payload;
+    BuildAdvertisingPayload(adv_payload, false);
+
+    std::vector<uint8_t> scan_rsp_payload;
+    BuildAdvertisingPayload(scan_rsp_payload, true);
+
+#if NIMBLE_EXT_ADV_SUPPORTED
+    if (last_adv_params_.is_extended) {
+        ble_gap_ext_adv_set_data(ext_adv_handle_, adv_payload.data(), adv_payload.size());
+        if (last_adv_params_.scannable) {
+            ble_gap_ext_scan_rsp_set_data(ext_adv_handle_, scan_rsp_payload.data(), scan_rsp_payload.size());
+        }
+    } else
+#endif
+    {
+        ble_gap_adv_set_data(adv_payload.data(), adv_payload.size());
+        ble_gap_adv_rsp_set_data(scan_rsp_payload.data(), scan_rsp_payload.size());
+    }
+    
+    ESP_LOGI(TAG, "Advertising data updated.");
+
+    if (was_advertising) {
+        RestartAdvertising();
+    }
+}
+
+void BLEPeripheral::BlePeripheralImpl::RestartAdvertising() {
+    if (last_adv_params_.is_extended) {
+        StartExtendedAdvertising(last_adv_params_.connectable, last_adv_params_.scannable,
+                                 last_adv_params_.primary_phy, last_adv_params_.secondary_phy,
+                                 last_adv_params_.interval_ms);
+    } else {
+        StartLegacyAdvertising(last_adv_params_.connectable, last_adv_params_.interval_ms);
+    }
+}
+
+void BLEPeripheral::BlePeripheralImpl::StartLegacyAdvertising(bool connectable, uint16_t interval_ms) {
+    last_adv_params_ = {.is_extended = false, .connectable = connectable, .interval_ms = interval_ms};
+    ApplyAdvertisingChanges();
+    
+    struct ble_gap_adv_params adv_params = {};
+    adv_params.conn_mode = connectable ? BLE_GAP_CONN_MODE_UND : BLE_GAP_CONN_MODE_NON;
+    adv_params.disc_mode = BLE_GAP_DISC_MODE_GEN;
+    adv_params.itvl_min = BLE_HCI_ADV_ITVL(interval_ms);
+    adv_params.itvl_max = adv_params.itvl_min;
+
+    if (ble_gap_adv_start(own_addr_type_, NULL, BLE_HS_FOREVER, &adv_params, GapEventHandler, this) == 0) {
+        state_ = BleState::kAdvertising;
+        ESP_LOGI(TAG, "Legacy advertising started.");
+    } else {
+        ESP_LOGE(TAG, "Failed to start legacy advertising.");
+    }
+}
+
+void BLEPeripheral::BlePeripheralImpl::StartExtendedAdvertising(
+    bool connectable, bool scannable, PhyMask primary_phy, PhyMask secondary_phy, uint16_t interval_ms) {
+#if NIMBLE_EXT_ADV_SUPPORTED
+    last_adv_params_ = {.is_extended = true, .connectable = connectable, .scannable = scannable, .interval_ms = interval_ms, .primary_phy = primary_phy, .secondary_phy = secondary_phy};
+    ApplyAdvertisingChanges();
+
+    struct ble_gap_ext_adv_params params = {};
+    params.connectable = connectable;
+    params.scannable = scannable;
+    params.itvl_min = BLE_HCI_ADV_ITVL(interval_ms);
+    params.itvl_max = params.itvl_min;
+    params.own_addr_type = own_addr_type_;
+    params.primary_phy = static_cast<uint8_t>(primary_phy);
+    params.secondary_phy = static_cast<uint8_t>(secondary_phy);
+    params.sid = ext_adv_handle_;
+
+    if (ble_gap_ext_adv_configure(ext_adv_handle_, &params, nullptr, GapEventHandler, this) == 0 &&
+        ble_gap_ext_adv_start(ext_adv_handle_, 0, 0) == 0) {
+        state_ = BleState::kAdvertising;
+        ESP_LOGI(TAG, "Extended advertising started.");
+    } else {
+        ESP_LOGE(TAG, "Failed to start extended advertising.");
+    }
+#else
+    ESP_LOGW(TAG, "Extended advertising not supported/enabled. Falling back to legacy.");
+    StartLegacyAdvertising(connectable, interval_ms);
+#endif
+}
+
+void BLEPeripheral::BlePeripheralImpl::StopAdvertising() {
+    if (state_ != BleState::kAdvertising) return;
+#if NIMBLE_EXT_ADV_SUPPORTED
+    if (last_adv_params_.is_extended && ble_gap_ext_adv_active(ext_adv_handle_)) {
+        if (ble_gap_ext_adv_stop(ext_adv_handle_) == 0) state_ = BleState::kIdle;
+        return;
+    }
+#endif
+    if (ble_gap_adv_active()) {
+        if (ble_gap_adv_stop() == 0) state_ = BleState::kIdle;
+    }
+}
+
+void BLEPeripheral::BlePeripheralImpl::SetPreferredPhy(uint8_t tx_phys_mask, uint8_t rx_phys_mask) {
+    if (state_ == BleState::kConnected) {
+        ble_gap_set_prefered_phy(conn_handle_, tx_phys_mask, rx_phys_mask, 0);
+    } else {
+        ESP_LOGW(TAG, "Can only set preferred PHY when connected.");
+    }
+}
+
+void BLEPeripheral::BlePeripheralImpl::Disconnect() {
+    if (state_ == BleState::kConnected) {
+        ble_gap_terminate(conn_handle_, BLE_ERR_REM_USER_CONN_TERM);
+    }
+}
+
+
+// --- BLEPeripheral Public Method Implementations (PIMPL Forwarders) ---
+
+BLEPeripheral::BLEPeripheral() : impl_(std::make_unique<BlePeripheralImpl>()) {}
+BLEPeripheral::~BLEPeripheral() = default;
+void BLEPeripheral::Init(const std::string &device_name) { impl_->Init(device_name); }
+void BLEPeripheral::RegisterService(const std::string &service_uuid, const std::vector<std::tuple<std::string, CharProperty, CharCallback>> &characteristics) { impl_->RegisterService(service_uuid, characteristics); }
+void BLEPeripheral::SetCharacteristicValue(const std::string &char_uuid, const void *value, size_t size, bool notify) { impl_->SetCharacteristicValue(char_uuid, value, size, notify); }
+void BLEPeripheral::SetServiceData(const std::string &service_uuid, const std::vector<uint8_t> &data) { impl_->SetServiceData(service_uuid, data); }
+void BLEPeripheral::SetManufacturerData(uint16_t company_id, const std::vector<uint8_t>& data) { impl_->SetManufacturerData(company_id, data); }
+void BLEPeripheral::SetAppearance(uint16_t appearance) { impl_->SetAppearance(appearance); }
+void BLEPeripheral::SetAdvertisedServiceUUIDs(const std::vector<std::string>& service_uuids) { impl_->SetAdvertisedServiceUUIDs(service_uuids); }
+void BLEPeripheral::ApplyAdvertisingChanges() { impl_->ApplyAdvertisingChanges(); }
+void BLEPeripheral::StartLegacyAdvertising(bool connectable, uint16_t interval_ms) { impl_->StartLegacyAdvertising(connectable, interval_ms); }
+void BLEPeripheral::StartExtendedAdvertising(bool connectable, bool scannable, PhyMask primary_phy, PhyMask secondary_phy, uint16_t interval_ms) { impl_->StartExtendedAdvertising(connectable, scannable, primary_phy, secondary_phy, interval_ms); }
+void BLEPeripheral::StopAdvertising() { impl_->StopAdvertising(); }
+void BLEPeripheral::SetPreferredPhy(uint8_t tx_phys_mask, uint8_t rx_phys_mask) { impl_->SetPreferredPhy(tx_phys_mask, rx_phys_mask); }
+void BLEPeripheral::Disconnect() { impl_->Disconnect(); }
+void BLEPeripheral::SetConnectionCallback(std::function<void()> callback) { impl_->on_connect_cb_ = std::move(callback); }
+void BLEPeripheral::SetDisconnectionCallback(std::function<void()> callback) { impl_->on_disconnect_cb_ = std::move(callback); }
+BLEPeripheral::BleState BLEPeripheral::GetState() { return impl_->state_; }
+
+}  // namespace connectivity
+}  // namespace platform
