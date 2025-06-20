@@ -1,13 +1,23 @@
-# BLE OTA Update Design (Simplified Transfer Focus)
+# BLE Device Update Service Protocol
 
 ## Overview
 
-This design implements a robust, packet-validated OTA (Over-The-Air) firmware update process over BLE. It assumes the underlying BLE link is secure and focuses on the protocol for reliably transferring the firmware image. The peripheral exposes a GATT service with three characteristics and communicates using a structured Protobuf format wrapped with framing.
+This document specifies the protocol for the **Device Update Service**, a robust, packet-validated service for performing Over-The-Air (OTA) firmware updates to an embedded device over BLE.
+
+While the peripheral device will implement a state machine to manage the update process (as shown in the diagrams below), this document's primary focus is on the **communication protocol** between the Central (e.g., a mobile app) and the Peripheral. It defines the BLE service structure, the packet framing, and the Protobuf messages used for the image transfer and update flow.
 
 * **Target Chip**: ESP32 (example)
 * **Update Type**: Full Application Firmware Update
 
 ## BLE GATT Structure
+
+This service consists of a single primary service with three characteristics.
+
+### Service UUID
+
+* **Device Update Service UUID**: `12345678-1234-5678-1234-56789ABCDEF0` (Example UUID - replace with your own 128-bit UUID)
+
+### Characteristics
 
 | Characteristic | UUID | Properties | Direction | Description |
 |---|---|---|---|---|
@@ -19,26 +29,35 @@ This design implements a robust, packet-validated OTA (Over-The-Air) firmware up
 
 Each message is framed for integrity, synchronization, and type identification before protobuf parsing.
 
-| Start Byte (1B) | Message Type (1B) | Length (4B) | Payload (Protobuf) | CRC32 (4B) | End Byte (1B) |
+| Start Byte (1B) | Message Type (1B) | Length (2B, LE) | Payload (Protobuf) | CRC32 (4B, LE) | End Byte (1B) |
 |---|---|---|---|---|---|
 | `0xAA` | *Type* | *Length* | *Payload* | *CRC* | `0xDD` |
 
 * **Start Byte (1B):** Constant `0xAA` for synchronization.
-* **Message Type (1B):** An enum defining the type of the protobuf payload (e.g., `0x01`=OtaControl, `0x02`=OtaData, `0x03`=OtaAck, `0x04`=OtaInfoResponse).
-* **Length (4B):** The length of the `Payload` field only. A 4-byte length is generous; 2 bytes may be sufficient depending on MTU.
-* **Payload (Variable):** The protobuf-encoded message.
-* **CRC32 (4B):** Computed on `Message Type` + `Length` + `Payload`.
+* **Message Type (1B):** The value from the `MessageType` enum, defined in the `.proto` file.
+* **Length (2B, LE):** The length of the `Payload` field only, in Little-Endian byte order. A 2-byte length is sufficient as the max payload per packet is less than 65,535 bytes.
+* **Payload (Variable):** The protobuf-encoded message corresponding to the `Message Type`.
+* **CRC32 (4B, LE):** Computed on `Message Type` + `Length` + `Payload`, in Little-Endian byte order.
 * **End Byte (1B):** Constant `0xDD` for frame validation.
-* **Total Frame Overhead:** 11 bytes.
+* **Total Frame Overhead:** 9 bytes.
 
 ## Protobuf Definition (nanopb Optimized)
 
-With the message type defined in the frame, the top-level `OtaMessage` wrapper is no longer needed. The individual messages are now the payloads. The package name `local_ota` clarifies that this specific protocol is for direct, local transfers.
+The `.proto` file now defines a `MessageType` enum to act as a single source of truth for the type identifier in the packet frame. This prevents synchronization issues between the client and peripheral.
 
 ```proto
 syntax = "proto3";
 
 package local_ota;
+
+// Defines the message type identifier used in the packet frame.
+enum MessageType {
+    MSG_TYPE_RESERVED = 0;
+    MSG_TYPE_OTA_CONTROL = 1;
+    MSG_TYPE_OTA_DATA = 2;
+    MSG_TYPE_OTA_ACK = 3;
+    MSG_TYPE_OTA_INFO_RESPONSE = 4;
+}
 
 enum OtaStatus {
     OK = 0;
@@ -77,6 +96,7 @@ message OtaAbort {
 
 message OtaRequestInfo {}
 
+// This message's type is identified by MSG_TYPE_OTA_CONTROL
 message OtaControl {
     oneof control_msg {
         OtaStart start_payload = 1;
@@ -87,18 +107,21 @@ message OtaControl {
 }
 
 // === Data Transfer Message (Central -> Peripheral) ===
+// This message's type is identified by MSG_TYPE_OTA_DATA
 message OtaData {
     uint32 chunk_num = 1;
     bytes chunk = 2;
 }
 
 // === Response Messages (Peripheral -> Central) ===
+// This message's type is identified by MSG_TYPE_OTA_ACK
 message OtaAck {
     OtaStatus status = 1;
     string message = 2;
     uint32 received_chunk_num = 3; // For DATA_ACK
 }
 
+// This message's type is identified by MSG_TYPE_OTA_INFO_RESPONSE
 message OtaInfoResponse {
     string current_fw_version = 1;
     string hw_version = 2;
@@ -107,13 +130,79 @@ message OtaInfoResponse {
 }
 ```
 
+## Protocol Message Details
+
+### Central → Peripheral Messages
+
+#### `OtaControl` containing `OtaRequestInfo`
+* **Frame Type:** `MSG_TYPE_OTA_CONTROL`
+* **Description:** Used by the Central to query the Peripheral's capabilities before starting an OTA. This is the first step in the process.
+* **Fields:** `request_info_payload` is an empty message; its presence indicates the command type.
+* **Example:** An app connects to the device and sends this command to determine the device's `product_id` and `supported_ota_scheme_version`.
+
+#### `OtaControl` containing `OtaStart`
+* **Frame Type:** `MSG_TYPE_OTA_CONTROL`
+* **Description:** Used by the Central to initiate the firmware update process after it has determined compatibility. It provides the essential metadata for the upcoming transfer.
+* **Fields:**
+  * `image_size`: The total size of the firmware image in bytes. The Peripheral uses this to reserve space and track progress.
+  * `fw_version`: The version string of the new firmware (e.g., "2.0.1"). Used by the Peripheral for anti-rollback checks.
+  * `hw_version`: The hardware version this firmware is compatible with.
+  * `product_id`: The product identifier this firmware is for.
+  * `ota_scheme_version`: The version of the OTA protocol the Central intends to use.
+  * `signature`: (For future use) A cryptographic signature of the firmware image.
+* **Example:** After getting a valid `OtaInfoResponse`, the app sends `OtaStart` with all the details of the firmware file it's about to send.
+
+#### `OtaData`
+* **Frame Type:** `MSG_TYPE_OTA_DATA`
+* **Description:** The workhorse message used to stream the firmware image, one chunk at a time.
+* **Fields:**
+  * `chunk_num`: The sequence number of the chunk, starting from 0. Essential for ordering and retries.
+  * `chunk`: The raw bytes of the firmware for this specific chunk.
+* **Example:** The Central sends a series of `OtaData` messages in a loop, incrementing `chunk_num` for each one.
+
+#### `OtaControl` containing `OtaEnd`
+* **Frame Type:** `MSG_TYPE_OTA_CONTROL`
+* **Description:** Sent by the Central after it has successfully transferred all data chunks. This signals the Peripheral to begin final validation.
+* **Fields:**
+  * `total_chunks`: The total number of `OtaData` chunks that were sent. The Peripheral can use this as a sanity check.
+  * `image_hash`: The SHA-256 hash of the complete firmware image. This is the primary mechanism for verifying the integrity of the entire transfer.
+* **Example:** After the last `OtaData` packet is acknowledged, the Central sends this message.
+
+#### `OtaControl` containing `OtaAbort`
+* **Frame Type:** `MSG_TYPE_OTA_CONTROL`
+* **Description:** Sent by the Central if it needs to cancel the OTA process at any time (e.g., user presses cancel, BLE connection is lost).
+* **Fields:** `reason_code` and `message` can provide context for the cancellation.
+* **Example:** The user taps the "Cancel" button in the mobile app.
+
+### Peripheral → Central Messages
+
+#### `OtaInfoResponse`
+* **Frame Type:** `MSG_TYPE_OTA_INFO_RESPONSE`
+* **Description:** The Peripheral's response to an `OtaRequestInfo` command. It provides the Central with all the necessary information to select a compatible firmware file.
+* **Fields:**
+  * `current_fw_version`: The version of the firmware currently running on the device.
+  * `hw_version`: The hardware version of the device.
+  * `product_id`: The product identifier of the device.
+  * `supported_ota_scheme_version`: The highest version of the OTA protocol the device supports.
+* **Example:** The device receives `OtaRequestInfo` and immediately replies with this message, detailing its identity.
+
+#### `OtaAck`
+* **Frame Type:** `MSG_TYPE_OTA_ACK`
+* **Description:** A general-purpose acknowledgement message used by the Peripheral to provide feedback to the Central. It's used to confirm control commands and data chunks.
+* **Fields:**
+  * `status`: An `OtaStatus` enum indicating success (`OK`) or a specific error.
+  * `message`: An optional string providing more human-readable context, especially for errors.
+  * `received_chunk_num`: Used specifically for acknowledging `OtaData` packets, echoing the `chunk_num` that was received. This helps the Central track which specific chunks were successful.
+* **Example 1 (Data ACK):** After receiving `OtaData` with `chunk_num = 10`, the Peripheral sends `OtaAck` with `received_chunk_num = 10` and `status = OK`.
+* **Example 2 (Control ACK):** After receiving `OtaEnd`, the Peripheral sends `OtaAck` with `status = OK` to confirm receipt before starting its validation process.
+
 ## Nanopb Implementation Note
 
 For a safe implementation with `nanopb`, it's highly recommended to specify a maximum size for all `bytes` and `string` fields. This generates static arrays instead of memory-managed callback fields.
 
 ```
 # local_ota.options
-local_ota.OtaData.chunk max_size:492
+local_ota.OtaData.chunk max_size:494
 local_ota.OtaStart.signature max_size:64
 local_ota.OtaStart.fw_version max_size:16
 local_ota.OtaStart.hw_version max_size:16
@@ -124,49 +213,33 @@ local_ota.OtaInfoResponse.hw_version max_size:16
 local_ota.OtaAck.message max_size:32
 ```
 
-## Protocol Extensibility for Cloud OTA
-
-This document defines a **local transport protocol** for transferring a firmware image over BLE. It does not define how the image is obtained by the Central (e.g., the mobile app). This modularity allows for different update sources:
-
-* **Local OTA:** The user downloads a `.bin` file to their phone and uses the app to push it to the device using this protocol.
-* **Cloud-based OTA:**
-    1.  The mobile app authenticates with a cloud service.
-    2.  It checks for new firmware updates for the connected device.
-    3.  If an update is available, the app downloads the firmware image from the cloud (e.g., via HTTPS from a storage bucket).
-    4.  Once the image is downloaded to the phone, the app then acts as a Central and uses this **exact same local BLE OTA protocol** to transfer the image from the phone to the device.
-
-This design cleanly separates the `Cloud -> Phone` transfer from the `Phone -> Device` transfer.
-
 ## BLE Performance: MTU, Block Size, and Throughput
 
 ### MTU and Data Length
-
 * **MTU (Maximum Transmission Unit):** The maximum size of an ATT packet, negotiated between the Central and Peripheral. The default is 23 bytes. Let's assume an MTU of **512 bytes** is successfully negotiated for maximum speed.
 * **ATT Overhead:** Each GATT operation (`Write Without Response` or `Notify`) uses 3 bytes for its own header (Opcode + Handle).
 * **Data Length:** The maximum amount of application data per BLE packet is `ATT_MTU - 3`. For an MTU of 512, this is **509 bytes**.
 * **Note on MTU Choice:** While a 512-byte MTU offers the best speed, it requires the peripheral (ESP32) to allocate larger memory buffers for the BLE stack. This is a critical trade-off to consider, as it reduces available RAM for other application tasks. An MTU of 247 is a common alternative that provides a good balance of speed and memory stability.
 
 ### Block Size (Chunk Size)
-
 The `Block Size` refers to the size of the `OtaData.chunk` field. It must be small enough to fit within a single BLE packet along with the protocol framing.
 
-* **Frame Overhead:** 11 bytes (as defined in Packet Framing).
+* **Frame Overhead:** 9 bytes (as defined in Packet Framing).
 * **Protobuf Overhead:** For `OtaData`, we have the `chunk_num` field (a `uint32` varint, ~1-5 bytes) plus field tags. Let's estimate **6 bytes**.
 * **Calculation:** `Max Data per Packet - Frame Overhead - Protobuf Overhead = Chunk Size`
-* **Example:** `509 bytes - 11 bytes - 6 bytes =` **492 bytes**. A `max_size` of **492 bytes** is a reasonable choice.
+* **Example:** `509 bytes - 9 bytes - 6 bytes =` **494 bytes**. A `max_size` of **494 bytes** is a reasonable choice.
 
 ### Throughput and Time Estimation
-
 The fastest OTA method uses `Write Without Response` from the Central and `Notify` from the Peripheral for ACKs.
 
 * **Connection Interval:** The time between connection events. A short interval (e.g., **7.5ms**) is needed for high speed.
 * **Packets per Interval:** Modern BLE stacks can often send multiple packets per connection interval. Let's assume an average of **4 packets per interval** is achievable.
 * **Packets per Second:** `(1000ms / 7.5ms) * 4 packets = ~533 packets/sec`
-* **Throughput (Theoretical):** `533 packets/sec * 492 bytes/chunk = ~262 KB/s`
-* **Real-World Throughput:** Due to RF interference, OS scheduling, and other overhead, a realistic throughput is often **50-70%** of the theoretical maximum. Let's assume **~150 KB/s**.
+* **Throughput (Theoretical):** `533 packets/sec * 494 bytes/chunk = ~263 KB/s`
+* **Real-World Throughput:** Due to RF interference, OS scheduling, and other overhead, a realistic throughput is often **50-70%** of the theoretical maximum. Let's assume **~155 KB/s**.
 * **Estimated Time for 6MB Image:**
   * `6 * 1024 * 1024 bytes = 6,291,456 bytes`
-  * `6,291,456 bytes / (150 * 1024 bytes/s) = ~41 seconds`
+  * `6,291,456 bytes / (155 * 1024 bytes/s) = ~40 seconds`
   * **Result:** A 6MB OTA update would take approximately **40-50 seconds** under ideal conditions with a large MTU.
 
 ## OTA State Machine (Peripheral)
@@ -189,8 +262,8 @@ stateDiagram-v2
     Starting --> Receiving : Valid START / Send OtaAck(OK)
     Starting --> Aborted : Invalid START (e.g., wrong product_id) / Send OtaAck(Error)
     
-    Receiving --> Receiving : Central writes OtaData(chunk) / Send OtaAck(OK)
-    Receiving --> Validating : Central writes OtaControl(end_payload) / Send OtaAck(OK)
+    Receiving --> Receiving : Central writes OtaData / Send OtaAck(OK)
+    Receiving --> Validating : Central writes OtaEnd / Send OtaAck(OK)
     Receiving --> Aborted : Data Error or Timeout / Send OtaAck(Error)
 
     Validating --> Committing : Validation OK (e.g., SHA-256 hash matches) / Send OtaAck(OK)
@@ -203,6 +276,15 @@ stateDiagram-v2
 
     Completed --> [*] : Reboot Device
 ```
+
+### State Machine Flow Description
+* **Idle:** The default state. The peripheral waits for a command. It can either handle an `OtaRequestInfo` by responding with its capabilities and returning to Idle, or it can handle an `OtaStart` command to begin the update process, moving to the `Starting` state.
+* **Starting:** The peripheral has received an `OtaStart` command. It validates the metadata within the command (e.g., is the `product_id` correct? Is the `ota_scheme_version` supported?). If the metadata is valid, it sends an `OtaAck(OK)` and moves to the `Receiving` state. If not, it sends an `OtaAck` with an appropriate error (e.g., `INCORRECT_PRODUCT`) and moves to the `Aborted` state.
+* **Receiving:** The main data transfer state. The peripheral receives `OtaData` packets, writes the chunk to its OTA partition, and sends an `OtaAck` for each chunk. It continues this loop until it receives an `OtaEnd` command, at which point it transitions to the `Validating` state.
+* **Validating:** The transfer is complete. The peripheral now performs a full integrity check on the downloaded image, for example by computing the SHA-256 hash of all received data and comparing it to the `image_hash` provided in the `OtaEnd` command. If the hashes match, it moves to `Committing`; otherwise, it moves to `Aborted`.
+* **Committing:** The firmware image is valid. The peripheral performs the final actions to make the new firmware active on the next boot (e.g., updating the bootloader partition table). If successful, it moves to `Completed`.
+* **Completed:** The OTA process is successful. The peripheral triggers a system reboot to load the new firmware. This is the final state.
+* **Aborted:** An unrecoverable error occurred, or the Central sent an `OtaAbort` command. The peripheral cleans up any temporary resources and returns to the `Idle` state.
 
 ## Unified OTA Message Sequence
 
@@ -252,3 +334,17 @@ sequenceDiagram
         Peripheral-->>Central: OtaAck(INCORRECT_PRODUCT or UNSUPPORTED_SCHEME)
         note over Central: Aborts OTA.
     end
+```
+
+## Protocol Extensibility for Cloud OTA
+
+This document defines a **local transport protocol** for transferring a firmware image over BLE. It does not define how the image is obtained by the Central (e.g., the mobile app). This modularity allows for different update sources:
+
+* **Local OTA:** The user downloads a `.bin` file to their phone and uses the app to push it to the device using this protocol.
+* **Cloud-based OTA:**
+    1. The mobile app authenticates with a cloud service.
+    2. It checks for new firmware updates for the connected device.
+    3. If an update is available, the app downloads the firmware image from the cloud (e.g., via HTTPS from a storage bucket).
+    4. Once the image is downloaded to the phone, the app then acts as a Central and uses this **exact same local BLE OTA protocol** to transfer the image from the phone to the device.
+
+This design cleanly separates the `Cloud -> Phone` transfer from the `Phone -> Device` transfer.
