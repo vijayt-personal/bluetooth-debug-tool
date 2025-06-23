@@ -1,0 +1,235 @@
+#ifndef COMMS_LOCAL_TRANSPORT_H_
+#define COMMS_LOCAL_TRANSPORT_H_
+
+#include "comms/packetizer.h"
+
+#include <chrono>
+#include <functional>
+#include <map>
+#include <utility>
+#include <vector>
+
+namespace comms {
+
+enum class Endpoint {
+  kCommand,
+  kTelemetry,
+};
+
+/**
+ * @brief Provides a generic, logical transport layer for the application.
+ *
+ * This class uses a compile-time policy to manage a transport session,
+ * validate packets, and dispatch payloads to registered endpoint handlers.
+ * It is responsible for the protocol framing and session, but not the
+ * message content itself.
+ *
+ * @tparam TransportPolicy A class that provides the physical transport mechanism.
+ */
+template <typename TransportPolicy>
+class LocalTransport {
+ public:
+  using EndpointHandler = std::function<void(const std::vector<uint8_t>& payload)>;
+
+  template <typename... Args>
+  explicit LocalTransport(std::chrono::seconds inactivity_timeout,
+                          Args&&... transport_args)
+      : inactivity_timeout_(inactivity_timeout),
+        transport_policy_(std::forward<Args>(transport_args)...) {}
+
+  ~LocalTransport() { Stop(); }
+
+  LocalTransport(const LocalTransport&) = delete;
+  LocalTransport& operator=(const LocalTransport&) = delete;
+
+  void RegisterEndpointHandler(Endpoint endpoint, EndpointHandler handler) {
+    endpoint_handlers_[endpoint] = std::move(handler);
+  }
+
+  /** @brief Performs one-time initialization of the transport hardware and services. */
+  bool Initialize() {
+    if (is_initialized_) return true;
+    is_initialized_ = transport_policy_.Initialize(this);
+    return is_initialized_;
+  }
+
+  /** @brief Opens the transport for connections (e.g., starts advertising). */
+  bool Start() {
+    if (!is_initialized_ || is_started_) return false;
+    if (transport_policy_.Open()) {
+      is_started_ = true;
+      ResetInactivityTimer();
+      return true;
+    }
+    return false;
+  }
+
+  /** @brief Closes the transport to connections (e.g., stops advertising). */
+  void Stop() {
+    if (is_started_) {
+      transport_policy_.Close();
+      is_started_ = false;
+    }
+  }
+
+  /** @brief Periodically called from the main loop to handle timeouts. */
+  void Process() {
+    if (!is_started_ || !transport_policy_.IsOpen()) return;
+    if (std::chrono::steady_clock::now() - last_activity_time_ >
+        inactivity_timeout_) {
+      transport_policy_.DisconnectPeer();
+    }
+  }
+
+  bool SendPayload(Endpoint endpoint, const std::vector<uint8_t>& payload) {
+    if (!is_started_) return false;
+    std::vector<uint8_t> framed_packet = packetizer_.Create(payload);
+    if (framed_packet.empty()) return false;
+    if (transport_policy_.Send(endpoint, framed_packet)) {
+      ResetInactivityTimer();
+      return true;
+    }
+    return false;
+  }
+
+  // --- Public Callback Methods (Called by the Transport Policy) ---
+  void OnConnected() { ResetInactivityTimer(); }
+  void OnDisconnected() { Stop(); }
+  void OnDataReceived(Endpoint endpoint, const std::vector<uint8_t>& raw_data) {
+    std::vector<uint8_t> payload = packetizer_.Validate(raw_data);
+    if (payload.empty()) return;
+    ResetInactivityTimer();
+    auto it = endpoint_handlers_.find(endpoint);
+    if (it != endpoint_handlers_.end() && it->second) {
+      it->second(payload);
+    }
+  }
+
+ private:
+  void ResetInactivityTimer() {
+    last_activity_time_ = std::chrono::steady_clock::now();
+  }
+
+  const std::chrono::seconds inactivity_timeout_;
+  std::chrono::steady_clock::time_point last_activity_time_{};
+  TransportPolicy transport_policy_;
+  Packetizer packetizer_;
+  bool is_initialized_ = false;
+  bool is_started_ = false;
+  std::map<Endpoint, EndpointHandler> endpoint_handlers_;
+};
+
+}  // namespace comms
+
+#endif  // COMMS_LOCAL_TRANSPORT_H_
+
+-----------------------------------------
+
+
+#ifndef TRANSPORT_BLE_TRANSPORT_POLICY_H_
+#define TRANSPORT_BLE_TRANSPORT_POLICY_H_
+
+#include "comms/local_transport.h"
+#include "lib/platform/ble_manager.h"
+
+#include <map>
+#include <string>
+#include <vector>
+
+namespace transport {
+
+namespace comms {
+template <typename TransportPolicy>
+class LocalTransport;
+}  // namespace comms
+
+/**
+ * @brief A transport policy for BLE, adapting LocalTransport to BLEManager.
+ */
+class BleTransportPolicy {
+ public:
+  using Host = comms::LocalTransport<BleTransportPolicy>;
+
+  BleTransportPolicy()
+      // Initialize the constant endpoint map once during construction.
+      : endpoint_map_{
+            {comms::Endpoint::kCommand, "YOUR-COMMAND-CHAR-UUID"},
+            {comms::Endpoint::kTelemetry, "YOUR-TELEMETRY-CHAR-UUID"},
+        } {}
+
+  BleTransportPolicy(const BleTransportPolicy&) = delete;
+  BleTransportPolicy& operator=(const BleTransportPolicy&) = delete;
+
+  /**
+   * @brief Performs one-time setup of BLE services and callbacks.
+   * @param host A pointer to the hosting LocalTransport instance.
+   * @return true on success.
+   */
+  bool Initialize(Host* host) {
+    host_ = host;
+
+    // Set up system-wide callbacks once.
+    platform::connectivity::BLEManager::SetConnectionCallback(
+        [this]() { if (host_) host_->OnConnected(); });
+    platform::connectivity::BLEManager::SetDisconnectionCallback(
+        [this]() { if (host_) host_->OnDisconnected(); });
+
+    // Build the characteristics vector from our constant map.
+    std::vector<platform::connectivity::BLEManager::CharacteristicData> chars;
+    for (const auto& [endpoint, uuid] : endpoint_map_) {
+      auto on_write_cb = [this, endpoint](const void* data, size_t size) {
+        if (host_) {
+          const auto* byte_data = static_cast<const uint8_t*>(data);
+          host_->OnDataReceived(endpoint, {byte_data, byte_data + size});
+        }
+      };
+      chars.push_back({uuid,
+                       platform::connectivity::BLEManager::CharProperty::WRITE |
+                           platform::connectivity::BLEManager::CharProperty::NOTIFY,
+                       on_write_cb});
+    }
+
+    // Initialize the BLE stack and register the services once.
+    platform::connectivity::BLEManager::Init("MyDevice");
+    platform::connectivity::BLEManager::RegisterService("YOUR-SERVICE-UUID",
+                                                        chars);
+    return true;
+  }
+
+  /** @brief A lightweight method to start BLE advertising. */
+  bool Open() {
+    platform::connectivity::BLEManager::StartAdvertising();
+    is_open_ = true;
+    return true;
+  }
+
+  /** @brief A lightweight method to stop BLE advertising. */
+  void Close() {
+    platform::connectivity::BLEManager::StopAdvertising();
+    is_open_ = false;
+  }
+
+  void DisconnectPeer() {
+    if (is_open_) platform::connectivity::BLEManager::Disconnect();
+  }
+
+  bool Send(comms::Endpoint endpoint, const std::vector<uint8_t>& data) {
+    if (!is_open_) return false;
+    auto it = endpoint_map_.find(endpoint);
+    if (it == endpoint_map_.end()) return false;
+    platform::connectivity::BLEManager::SetCharacteristicValue(
+        it->second, data.data(), data.size(), /*notify=*/true);
+    return true;
+  }
+
+  bool IsOpen() const { return is_open_; }
+
+ private:
+  Host* host_ = nullptr;
+  bool is_open_ = false;
+  const std::map<comms::Endpoint, std::string> endpoint_map_;
+};
+
+}  // namespace transport
+
+#endif  // TRANSPORT_BLE_TRANSPORT_POLICY_H_
