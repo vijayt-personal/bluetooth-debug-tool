@@ -1,0 +1,728 @@
+/**
+ * @file WiFiManager.cpp
+ * @brief Implementation of the WiFiManager class using the PIMPL idiom.
+ * All ESP-IDF specific code is contained within this file.
+ */
+
+#include "WiFiManager.h"
+
+// --- ESP-IDF Specific Headers ---
+#include "esp_wifi.h"
+#include "esp_event.h"
+#include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include <atomic>
+#include <cstring>
+
+// --- Logger Tag ---
+static const char* TAG = "WiFiManager";
+
+// --- PIMPL Implementation Struct ---
+struct WiFiManager::Impl {
+public:
+    /**
+     * @brief Constructor for the implementation.
+     */
+    Impl() 
+        : state_(WiFiState::kDeinitialized),
+          auto_reconnect_(false), // Default to false, enabled by Connect() or Reconnect()
+          reconnect_interval_ms_(kDefaultReconnectIntervalMs),
+          last_reconnect_attempt_(0),
+          scan_callback_(nullptr),
+          event_handler_instance_(nullptr)
+    {
+        // Initialize credentials to empty.
+        ssid_.fill(0);
+        password_.fill(0);
+    }
+
+    /**
+     * @brief Initializes the WiFi stack and event loop.
+     */
+    void Init() {
+        if (state_ != WiFiState::kDeinitialized) {
+            ESP_LOGW(TAG, "WiFi already initialized.");
+            return;
+        }
+        ESP_LOGI(TAG, "Initializing WiFi...");
+
+        ESP_ERROR_CHECK(esp_netif_init());
+        ESP_ERROR_CHECK(esp_event_loop_create_default());
+        esp_netif_create_default_wifi_sta();
+
+        wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+        ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+
+        // Register event handlers
+        ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT,
+                                                            ESP_EVENT_ANY_ID,
+                                                            &WiFiManager::Impl::EventHandler,
+                                                            this,
+                                                            &event_handler_instance_));
+        ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT,
+                                                            IP_EVENT_STA_GOT_IP,
+                                                            &WiFiManager::Impl::EventHandler,
+                                                            this,
+                                                            &event_handler_instance_));
+        
+        ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+        ESP_ERROR_CHECK(esp_wifi_start());
+
+        state_ = WiFiState::kDisconnected;
+        ESP_LOGI(TAG, "WiFi Initialized.");
+    }
+
+    /**
+     * @brief Deinitializes the WiFi stack.
+     */
+    void Deinit() {
+        if (state_ == WiFiState::kDeinitialized) {
+            ESP_LOGW(TAG, "WiFi already deinitialized.");
+            return;
+        }
+        ESP_LOGI(TAG, "Deinitializing WiFi...");
+
+        if (event_handler_instance_) {
+            esp_event_handler_instance_unregister(WIFI_EVENT, ESP_EVENT_ANY_ID, event_handler_instance_);
+            esp_event_handler_instance_unregister(IP_EVENT, IP_EVENT_STA_GOT_IP, event_handler_instance_);
+        }
+        
+        esp_wifi_stop();
+        esp_wifi_deinit();
+        esp_event_loop_delete_default();
+
+        state_ = WiFiState::kDeinitialized;
+        ESP_LOGI(TAG, "WiFi Deinitialized.");
+    }
+    
+    /**
+     * @brief Connects to the stored AP using a "scan-then-connect" approach for robust auth detection.
+     */
+    void Connect() {
+        if (state_ == WiFiState::kConnecting || state_ == WiFiState::kConnected) {
+            ESP_LOGW(TAG, "Already connecting or connected.");
+            return;
+        }
+
+        if (strlen(ssid_.data()) == 0) {
+            ESP_LOGE(TAG, "Cannot connect, SSID not set.");
+            return;
+        }
+        
+        // --- Smart Auth: Scan for the specific AP to find its security type ---
+        wifi_auth_mode_t authmode = WIFI_AUTH_OPEN;
+        bool found_ap = get_security_for_ssid(authmode);
+
+        if (!found_ap) {
+            ESP_LOGE(TAG, "Could not find SSID '%s' during pre-connect scan. Aborting connection.", ssid_.data());
+            return;
+        }
+
+        auto_reconnect_ = true; // Set user intent to be connected
+        state_ = WiFiState::kConnecting;
+        ESP_LOGI(TAG, "Connecting to SSID: '%s' (Auth mode: %d)", ssid_.data(), authmode);
+        
+        wifi_config_t wifi_config = {};
+        strncpy(reinterpret_cast<char*>(wifi_config.sta.ssid), ssid_.data(), sizeof(wifi_config.sta.ssid));
+        strncpy(reinterpret_cast<char*>(wifi_config.sta.password), password_.data(), sizeof(wifi_config.sta.password));
+        
+        wifi_config.sta.threshold.authmode = authmode;
+
+        // For WPA2/WPA3, enable Protected Management Frames (PMF)
+        if (authmode >= WIFI_AUTH_WPA2_PSK) {
+            wifi_config.sta.pmf_cfg.capable = true;
+            wifi_config.sta.pmf_cfg.required = false;
+        }
+
+        ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
+        esp_err_t err = esp_wifi_connect();
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "esp_wifi_connect failed: %s", esp_err_to_name(err));
+            state_ = WiFiState::kDisconnected;
+        }
+    }
+    
+    /**
+     * @brief Disconnects from the current AP.
+     */
+    void Disconnect() {
+        if (state_ != WiFiState::kConnected && state_ != WiFiState::kConnecting) {
+            ESP_LOGW(TAG, "Not connected or connecting.");
+            return;
+        }
+        auto_reconnect_ = false; // Set user intent to be disconnected
+        ESP_LOGI(TAG, "Disconnecting from WiFi.");
+        ESP_ERROR_CHECK(esp_wifi_disconnect());
+    }
+
+    /**
+     * @brief Manually triggers a reconnect, respecting the interval.
+     */
+    bool Reconnect() {
+        auto_reconnect_ = true; // Set user intent to be connected
+        ESP_LOGI(TAG, "Manual reconnect triggered.");
+        
+        if (strlen(ssid_.data()) == 0) {
+            ESP_LOGE(TAG, "Cannot reconnect, SSID not set.");
+            return false;
+        }
+
+        if (state_ == WiFiState::kConnecting || state_ == WiFiState::kConnected) {
+            ESP_LOGI(TAG, "Already connected or connecting. Will disconnect first to force reconnect.");
+            esp_wifi_disconnect(); // The disconnect event will handle the timed reconnect.
+            return true;
+        }
+        
+        // If disconnected, check the timer before attempting to connect.
+        int64_t now = esp_timer_get_time();
+        if (last_reconnect_attempt_ == 0 || (now - last_reconnect_attempt_) / 1000 > reconnect_interval_ms_) {
+            ESP_LOGI(TAG, "Attempting to reconnect now...");
+            Connect(); // Use the main Connect method which has the smart auth scan
+            last_reconnect_attempt_ = now;
+            return true;
+        } else {
+            ESP_LOGW(TAG, "Reconnect attempt skipped, interval not elapsed.");
+            return false;
+        }
+    }
+    
+    /**
+     * @brief Loads credentials into member variables.
+     */
+    void LoadCredentials(const char* ssid, const char* password) {
+        if (!ssid) return;
+        
+        strncpy(ssid_.data(), ssid, kMaxSSIDLength);
+        ssid_[kMaxSSIDLength - 1] = '\0';
+
+        if (password) {
+            strncpy(password_.data(), password, kMaxPasswordLength);
+            password_[kMaxPasswordLength - 1] = '\0';
+        } else {
+            password_.fill(0);
+        }
+
+        ESP_LOGI(TAG, "Credentials loaded for SSID: %s", ssid_.data());
+    }
+    
+    /**
+     * @brief Clears stored credentials.
+     */
+    void ClearCredentials() {
+        ssid_.fill(0);
+        password_.fill(0);
+        ESP_LOGI(TAG, "Credentials cleared.");
+    }
+    
+    /**
+     * @brief Starts a WiFi scan.
+     */
+    void StartScan(bool blocking) {
+        if (state_ == WiFiState::kScanning) {
+            ESP_LOGW(TAG, "Scan already in progress.");
+            return;
+        }
+        
+        state_ = WiFiState::kScanning;
+        scan_results_.clear();
+        
+        ESP_LOGI(TAG, "Starting WiFi scan...");
+        wifi_scan_config_t scan_config = {};
+        scan_config.show_hidden = true;
+        
+        esp_err_t err = esp_wifi_scan_start(&scan_config, blocking);
+        if (err != ESP_OK) {
+             ESP_LOGE(TAG, "Scan start failed: %s", esp_err_to_name(err));
+             // Revert state, checking if we were connected before
+             wifi_ap_record_t ap_info;
+             state_ = (esp_wifi_get_assoc_ap_record(&ap_info) == ESP_OK) ? WiFiState::kConnected : WiFiState::kDisconnected;
+        }
+        
+        if (blocking) {
+            ProcessScanDone();
+        }
+    }
+
+    /**
+     * @brief Stops an ongoing WiFi scan.
+     */
+    void StopScan() {
+        if (state_ != WiFiState::kScanning) {
+            ESP_LOGW(TAG, "No scan in progress to stop.");
+            return;
+        }
+        ESP_LOGI(TAG, "Stopping WiFi scan.");
+        esp_err_t err = esp_wifi_scan_stop();
+        // The SCAN_DONE event will fire, which will reset the state correctly.
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "Scan stop failed: %s", esp_err_to_name(err));
+        }
+    }
+
+
+private:
+    /**
+     * @brief Performs a targeted scan for the configured SSID to determine its security type.
+     * @param[out] authmode The detected authentication mode of the target AP.
+     * @return True if the AP was found, false otherwise.
+     */
+    bool get_security_for_ssid(wifi_auth_mode_t& authmode) {
+        ESP_LOGI(TAG, "Performing targeted scan for SSID: %s", ssid_.data());
+        wifi_scan_config_t scan_config = {};
+        scan_config.ssid = reinterpret_cast<uint8_t*>(ssid_.data());
+        scan_config.bssid = nullptr;
+        scan_config.channel = 0; // Scan all channels
+        scan_config.show_hidden = true;
+
+        esp_err_t err = esp_wifi_scan_start(&scan_config, true); // Blocking scan
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "Targeted scan failed: %s", esp_err_to_name(err));
+            return false;
+        }
+        
+        uint16_t ap_count = 0;
+        esp_wifi_scan_get_ap_num(&ap_count);
+        if (ap_count == 0) {
+            return false;
+        }
+        
+        // We only need one record
+        wifi_ap_record_t ap_record;
+        uint16_t max_records = 1;
+        ESP_ERROR_CHECK(esp_wifi_scan_get_ap_records(&max_records, &ap_record));
+        
+        authmode = ap_record.authmode;
+        return true;
+    }
+
+
+    /**
+     * @brief Processes scan results after a scan completes.
+     */
+    void ProcessScanDone() {
+        uint16_t ap_count = 0;
+        esp_wifi_scan_get_ap_num(&ap_count);
+
+        if (ap_count > 0) {
+            std::vector<wifi_ap_record_t> ap_records(ap_count);
+            ESP_ERROR_CHECK(esp_wifi_scan_get_ap_records(&ap_count, ap_records.data()));
+            
+            scan_results_.clear();
+            for (uint16_t i = 0; i < ap_count && i < kMaxAPList; ++i) {
+                APInfo ap_info;
+                strncpy(ap_info.ssid.data(), reinterpret_cast<const char*>(ap_records[i].ssid), kMaxSSIDLength);
+                ap_info.ssid[kMaxSSIDLength - 1] = '\0';
+                ap_info.rssi = ap_records[i].rssi;
+                ap_info.security = MapSecurityType(ap_records[i].authmode);
+                scan_results_.push_back(ap_info);
+            }
+            ESP_LOGI(TAG, "Scan done, %u APs found.", scan_results_.size());
+        } else {
+             ESP_LOGI(TAG, "Scan done, no APs found.");
+        }
+
+        // Revert state to what it was before scanning. Check if we are still associated.
+        wifi_ap_record_t ap_info_check;
+        state_ = (esp_wifi_get_assoc_ap_record(&ap_info_check) == ESP_OK) ? WiFiState::kConnected : WiFiState::kDisconnected;
+
+        if (scan_callback_) {
+            scan_callback_(scan_results_);
+        }
+    }
+
+    /**
+     * @brief Maps an ESP-IDF authentication mode to our SecurityType enum.
+     */
+    SecurityType MapSecurityType(wifi_auth_mode_t auth_mode) {
+        switch (auth_mode) {
+            case WIFI_AUTH_OPEN:            return SecurityType::kOpen;
+            case WIFI_AUTH_WEP:             return SecurityType::kWep;
+            case WIFI_AUTH_WPA_PSK:         return SecurityType::kWpa;
+            case WIFI_AUTH_WPA2_PSK:        return SecurityType::kWpa2;
+            case WIFI_AUTH_WPA_WPA2_PSK:    return SecurityType::kWpa2;
+            case WIFI_AUTH_WPA2_ENTERPRISE: return SecurityType::kWpa2Enterprise;
+            case WIFI_AUTH_WPA3_PSK:        return SecurityType::kWpa3;
+            case WIFI_AUTH_WPA2_WPA3_PSK:   return SecurityType::kWpa3;
+            default:                        return SecurityType::kUnknown;
+        }
+    }
+    
+    /**
+     * @brief Static event handler that forwards events to the instance's handler.
+     */
+    static void EventHandler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data) {
+        WiFiManager::Impl* self = static_cast<WiFiManager::Impl*>(arg);
+        self->InstanceEventHandler(event_base, event_id, event_data);
+    }
+    
+    /**
+     * @brief Instance-specific event handler logic.
+     */
+    void InstanceEventHandler(esp_event_base_t event_base, int32_t event_id, void* event_data) {
+        if (event_base == WIFI_EVENT) {
+            switch(event_id) {
+                case WIFI_EVENT_STA_START:
+                    ESP_LOGI(TAG, "WIFI_EVENT_STA_START: WiFi station started.");
+                    break;
+                case WIFI_EVENT_STA_CONNECTED:
+                    ESP_LOGI(TAG, "WIFI_EVENT_STA_CONNECTED: Connected to AP.");
+                    state_ = WiFiState::kConnected;
+                    // Reset the reconnect timer on a successful connection.
+                    last_reconnect_attempt_ = 0;
+                    break;
+                case WIFI_EVENT_STA_DISCONNECTED:
+                    ESP_LOGW(TAG, "WIFI_EVENT_STA_DISCONNECTED: Lost connection to AP.");
+                    state_ = WiFiState::kDisconnected;
+                    if (auto_reconnect_) {
+                        int64_t now = esp_timer_get_time();
+                        // The (last_reconnect_attempt_ == 0) check ensures the FIRST reconnect attempt after a
+                        // successful connection is IMMEDIATE. Subsequent attempts are delayed by the interval.
+                        if (last_reconnect_attempt_ == 0 || (now - last_reconnect_attempt_) / 1000 > reconnect_interval_ms_) {
+                             ESP_LOGI(TAG, "Auto-reconnect enabled. Attempting to reconnect...");
+                             esp_wifi_connect();
+                             last_reconnect_attempt_ = now;
+                        } else {
+                             ESP_LOGI(TAG, "Auto-reconnect: Waiting for interval before retrying.");
+                        }
+                    } else {
+                        ESP_LOGI(TAG, "Auto-reconnect disabled. Will not attempt to reconnect.");
+                    }
+                    break;
+                case WIFI_EVENT_SCAN_DONE:
+                    ESP_LOGI(TAG, "WIFI_EVENT_SCAN_DONE");
+                    ProcessScanDone();
+                    break;
+                default:
+                    break;
+            }
+        } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+            ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
+            ESP_LOGI(TAG, "Got IP address: " IPSTR, IP2STR(&event->ip_info.ip));
+        }
+    }
+
+// --- Member Variables ---
+public:
+    std::atomic<WiFiState> state_;
+    std::array<char, kMaxSSIDLength> ssid_;
+    std::array<char, kMaxPasswordLength> password_;
+    std::vector<APInfo> scan_results_;
+    std::atomic<bool> auto_reconnect_;
+    int reconnect_interval_ms_;
+    int64_t last_reconnect_attempt_;
+    ScanCallback scan_callback_;
+    esp_event_handler_instance_t event_handler_instance_;
+};
+
+
+// --- WiFiManager Public Methods (delegating to PIMPL) ---
+
+WiFiManager::WiFiManager() : pimpl_(std::make_unique<Impl>()) {}
+
+WiFiManager::~WiFiManager() = default;
+
+void WiFiManager::Init() {
+    pimpl_->Init();
+}
+
+void WiFiManager::Deinit() {
+    pimpl_->Deinit();
+}
+
+void WiFiManager::Connect() {
+    pimpl_->Connect();
+}
+
+void WiFiManager::Disconnect() {
+    pimpl_->Disconnect();
+}
+
+bool WiFiManager::Reconnect() {
+    return pimpl_->Reconnect();
+}
+
+void WiFiManager::SetReconnectInterval(int interval_ms) {
+    pimpl_->reconnect_interval_ms_ = interval_ms;
+}
+
+void WiFiManager::LoadCredentials(const char* ssid, const char* password) {
+    pimpl_->LoadCredentials(ssid, password);
+}
+
+void WiFiManager::ClearCredentials() {
+    pimpl_->ClearCredentials();
+}
+
+void WiFiManager::GetCredentials(std::array<char, kMaxSSIDLength>& ssid_out,
+                               std::array<char, kMaxPasswordLength>& password_out) const {
+    ssid_out = pimpl_->ssid_;
+    password_out = pimpl_->password_;
+}
+
+void WiFiManager::StartScan(bool blocking) {
+    pimpl_->StartScan(blocking);
+}
+
+void WiFiManager::StopScan() {
+    pimpl_->StopScan();
+}
+
+std::vector<WiFiManager::APInfo> WiFiManager::GetScanResults() {
+    return pimpl_->scan_results_;
+}
+
+void WiFiManager::SetScanCallback(ScanCallback callback) {
+    pimpl_->scan_callback_ = callback;
+}
+
+WiFiManager::WiFiState WiFiManager::GetWiFiState() const {
+    return pimpl_->state_.load();
+}
+-------------------------------------
+
+/**
+ * @file WiFiManager.h
+ * @brief WiFi Manager class for handling Wi-Fi connections, scanning, and credential management.
+ * This header is completely decoupled from ESP-IDF implementation details using the PIMPL idiom.
+ */
+
+#pragma once
+
+#include <array>
+#include <vector>
+#include <memory> // For std::unique_ptr
+
+/**
+ * @class WiFiManager
+ * @brief Manages Wi-Fi connectivity, scanning, and credential storage using the PIMPL idiom.
+ */
+class WiFiManager {
+public:
+    // --- Public Constants ---
+    static constexpr size_t kMaxSSIDLength = 32;     ///< Maximum SSID length.
+    static constexpr size_t kMaxPasswordLength = 64; ///< Maximum Wi-Fi password length.
+    static constexpr size_t kMaxAPList = 25;         ///< Maximum number of APs stored in scan results.
+    static constexpr int kDefaultReconnectIntervalMs = 10000; ///< Default reconnection interval in milliseconds.
+
+    // --- Public Enums and Typedefs ---
+
+    /**
+     * @enum SecurityType
+     * @brief Enumeration of Wi-Fi security types.
+     */
+    enum class SecurityType {
+        kOpen,
+        kWep,
+        kWpa,
+        kWpa2,
+        kWpa3,
+        kWpa2Enterprise,
+        kWpa3Enterprise,
+        kUnknown
+    };
+
+    /**
+     * @enum WiFiState
+     * @brief Enumeration of Wi-Fi connection states.
+     */
+    enum class WiFiState {
+        kDeinitialized,
+        kDisconnected,
+        kConnecting,
+        kConnected,
+        kScanning
+    };
+
+    /**
+     * @struct APInfo
+     * @brief Structure to store information about an access point.
+     */
+    struct APInfo {
+        std::array<char, kMaxSSIDLength> ssid{}; ///< SSID of the access point.
+        int rssi;                                ///< Signal strength (RSSI).
+        SecurityType security;                   ///< Security type.
+
+        /**
+         * @brief Equality operator to compare APInfo objects.
+         * @param other Another APInfo object.
+         * @return True if the SSIDs match, false otherwise.
+         */
+        bool operator==(const APInfo& other) const {
+            return ssid == other.ssid;
+        }
+    };
+
+    /** @brief Callback type for scan completion. */
+    using ScanCallback = void (*)(const std::vector<APInfo>&);
+
+
+    // --- Public Methods ---
+
+    /**
+     * @brief Constructor for WiFiManager.
+     */
+    WiFiManager();
+
+    /**
+     * @brief Destructor for WiFiManager.
+     */
+    ~WiFiManager();
+
+    // --- Deleted copy and move semantics to prevent accidental copying ---
+    WiFiManager(const WiFiManager&) = delete;
+    WiFiManager& operator=(const WiFiManager&) = delete;
+    WiFiManager(WiFiManager&&) = delete;
+    WiFiManager& operator=(WiFiManager&&) = delete;
+
+    /**
+     * @brief Initializes the Wi-Fi manager.
+     */
+    void Init();
+
+    /**
+     * @brief Deinitializes the Wi-Fi manager.
+     */
+    void Deinit();
+
+    /**
+     * @brief Connects to the configured Wi-Fi network.
+     * Enables the auto-reconnect feature internally.
+     */
+    void Connect();
+
+    /**
+     * @brief Disconnects from the current Wi-Fi network.
+     * Disables the auto-reconnect feature internally.
+     */
+    void Disconnect();
+
+    /**
+     * @brief Manually triggers a reconnection attempt, respecting the reconnect interval.
+     * Also enables the auto-reconnect feature for subsequent disconnects.
+     * @return True if a reconnect was initiated, false otherwise (e.g., if called too soon after a previous attempt).
+     */
+    bool Reconnect();
+
+    /**
+     * @brief Sets the interval between automatic reconnection attempts.
+     * @param interval_ms The time in milliseconds to wait before retrying.
+     */
+    void SetReconnectInterval(int interval_ms);
+
+    /**
+     * @brief Loads Wi-Fi credentials (SSID & password).
+     * @param ssid The Wi-Fi SSID.
+     * @param password The Wi-Fi password.
+     */
+    void LoadCredentials(const char* ssid, const char* password);
+
+    /**
+     * @brief Clears stored Wi-Fi credentials.
+     */
+    void ClearCredentials();
+
+    /**
+     * @brief Retrieves the currently stored Wi-Fi credentials.
+     * @param ssid_out Output parameter for SSID.
+     * @param password_out Output parameter for password.
+     */
+    void GetCredentials(std::array<char, kMaxSSIDLength>& ssid_out,
+                        std::array<char, kMaxPasswordLength>& password_out) const;
+
+    /**
+     * @brief Starts a Wi-Fi scan.
+     * @param blocking If true, waits for the scan to complete before returning.
+     */
+    void StartScan(bool blocking);
+
+    /**
+     * @brief Stops an ongoing Wi-Fi scan.
+     */
+    void StopScan();
+
+    /**
+     * @brief Gets the most recent scan results.
+     * @return A vector of APInfo structures containing scan results.
+     */
+    std::vector<APInfo> GetScanResults();
+
+    /**
+     * @brief Sets a callback function to be called when a scan completes.
+     * @param callback The callback function.
+     */
+    void SetScanCallback(ScanCallback callback);
+
+    /**
+     * @brief Gets the current Wi-Fi state.
+     * @return The current state of the Wi-Fi connection.
+     */
+    WiFiState GetWiFiState() const;
+
+private:
+    // Forward declaration of the implementation class (PIMPL).
+    struct Impl; 
+    
+    // The pointer to the implementation.
+    std::unique_ptr<Impl> pimpl_;
+};
+
+------------------------------------------
+
+name: Build [ESP-IDF:v5.4]
+
+run-name: |
+  Build #${{ github.run_number }} for device ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.target || 'esp32s3' }}
+
+
+on:
+  push:
+    branches:
+      - main
+
+  workflow_dispatch:
+    inputs:
+      target:
+        description: 'Chip target (e.g. esp32, esp32s3)'
+        required: true
+        default: 'esp32s3'
+        type: choice
+        options:
+          - esp32
+          - esp32s3
+
+      branch:
+        description: 'Branch to build'
+        required: true
+        default: 'main'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    container:
+      image: espressif/idf:v5.4
+      options: --user 0
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.branch || github.ref_name }}
+          submodules: recursive
+
+      - name: Build firmware for target ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.target || 'esp32s3' }}
+        run: |
+          . /opt/esp/idf/export.sh
+          idf.py set-target ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.target || 'esp32s3' }}
+          idf.py fullclean
+          idf.py build
+
+      - name: Upload firmware artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: device_${{ github.event_name == 'workflow_dispatch' && github.event.inputs.target || 'esp32s3' }}_build-${{ github.run_number }}
+          path: |
+            build/*.bin
+            build/*.elf
+            build/*.map
