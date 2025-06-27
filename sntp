@@ -1,0 +1,538 @@
+#ifndef TIME_UTIL_H_
+#define TIME_UTIL_H_
+
+#include <cstdint>
+#include <ctime>
+
+/**
+ * @class TimeUtil
+ * @brief A thread-safe utility class for time-related operations.
+ *
+ * Provides static methods to get the current time, retrieve individual
+ * time components, manage the system-wide timezone, and format time strings.
+ */
+class TimeUtil {
+public:
+    /** @brief Maximum supported length for timezone strings (including null terminator). */
+    static constexpr size_t kMaxTimeZoneLength = 64;
+
+    // --- Time Setting ---
+
+    /**
+     * @brief Manually sets the system time.
+     * @param epoch_seconds The number of seconds since the Unix epoch.
+     * @param microseconds The microseconds part of the timestamp (0-999999).
+     */
+    static void SetTime(time_t epoch_seconds, int microseconds = 0);
+
+    // --- Time Getting ---
+
+    /**
+     * @brief Gets the current time as milliseconds since the Unix epoch (UTC).
+     * @return Current time in milliseconds.
+     */
+    static uint64_t GetTimeMs();
+
+    /**
+     * @brief Gets the current time as a time_t object (seconds since epoch, UTC).
+     * @return Current time as time_t.
+     */
+    static time_t GetTimeT();
+
+    // --- Timezone Management ---
+
+    /**
+     * @brief Sets the system-wide timezone for this application.
+     * @param tz_string A POSIX TZ format string (e.g., "PST8PDT", "CET-1CEST").
+     * @return true if the timezone was set successfully, false on error.
+     */
+    static bool SetTimeZone(const char* tz_string);
+
+    /**
+     * @brief Gets the currently configured timezone string.
+     * @param buffer Pointer to a character buffer to receive the timezone string.
+     * @param buffer_size The size of the provided buffer.
+     * @return true if a timezone is set and was copied successfully, false otherwise.
+     */
+    static bool GetTimeZone(char* buffer, size_t buffer_size);
+
+    /**
+     * @brief Checks if a timezone has been configured.
+     * @return true if a timezone is set, false otherwise.
+     */
+    static bool IsTimeZoneSet();
+
+    // --- Formatted Time ---
+
+    /**
+     * @brief Gets a formatted time string (local time) into a provided buffer.
+     * This version is efficient, thread-safe, and avoids dynamic memory allocation.
+     * @param buffer Pointer to a character buffer for the output.
+     * @param buffer_size Size of the buffer.
+     * @param format A format string compatible with `strftime`. Defaults to ISO 8601 style.
+     * @return true if formatting was successful, false otherwise.
+     */
+    static bool GetFormattedTime(char* buffer, size_t buffer_size, const char* format = "%F %T"); // %F %T is YYYY-MM-DD HH:MM:SS
+
+    /**
+     * @brief Gets a formatted time string (local time) as a C-string pointer.
+     *
+     * WARNING: This function uses a thread-local static buffer. The returned
+     * pointer is valid only until the next call to this function *within the
+     * same thread*. Do not store the pointer for later use. Copy the contents
+     * if persistence is needed (e.g., `strncpy`).
+     *
+     * @param format A format string compatible with `strftime`. Defaults to ISO 8601 style.
+     * @return A pointer to a null-terminated string, or a pointer to an empty
+     * string on failure. The pointer is never null.
+     */
+    static const char* GetFormattedTimeCStr(const char* format = "%F %T");
+
+    // --- Individual Time Components (Local Time) ---
+
+    static uint8_t GetSecond();       // 0-59
+    static uint8_t GetMinute();       // 0-59
+    static uint8_t GetHour();         // 0-23
+    static uint8_t GetDayOfWeek();  // Sunday=0, Monday=1, ...
+    static uint8_t GetDayOfMonth(); // 1-31
+    static uint8_t GetMonth();        // January=1, February=2, ...
+    static uint16_t GetYear();        // e.g., 2023
+
+private:
+    /**
+     * @brief A helper to get the current local time info in a thread-safe way.
+     * @param tm_info Pointer to a `struct tm` to be filled.
+     * @return true on success, false on failure.
+     */
+    static bool GetLocalTimeInfo(struct tm* tm_info);
+
+    // Static members for managing timezone state safely across the application.
+    static std::mutex timezone_mutex_;
+    static char current_timezone_[kMaxTimeZoneLength];
+    static bool timezone_is_set_;
+};
+
+#endif // TIME_UTIL_H_
+----------------------------------
+
+#include "time_util.h"
+#include <sys/time.h>
+#include <mutex>
+#include "esp_log.h"
+
+// Define static members
+std::mutex TimeUtil::timezone_mutex_;
+char TimeUtil::current_timezone_[TimeUtil::kMaxTimeZoneLength] = {0};
+bool TimeUtil::timezone_is_set_ = false;
+
+static const char* kTag = "TimeUtil";
+
+void TimeUtil::SetTime(time_t epoch_seconds, int microseconds) {
+    struct timeval tv = {
+        .tv_sec = epoch_seconds,
+        .tv_usec = microseconds
+    };
+    settimeofday(&tv, nullptr);
+}
+
+uint64_t TimeUtil::GetTimeMs() {
+    struct timeval tv;
+    gettimeofday(&tv, nullptr);
+    return (static_cast<uint64_t>(tv.tv_sec) * 1000L) + (tv.tv_usec / 1000L);
+}
+
+time_t TimeUtil::GetTimeT() {
+    return time(nullptr);
+}
+
+bool TimeUtil::SetTimeZone(const char* tz_string) {
+    if (!tz_string || strlen(tz_string) == 0 || strlen(tz_string) >= kMaxTimeZoneLength) {
+        ESP_LOGE(kTag, "Invalid or too long timezone string.");
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(timezone_mutex_);
+    strncpy(current_timezone_, tz_string, kMaxTimeZoneLength);
+    current_timezone_[kMaxTimeZoneLength - 1] = '\0'; // Ensure null termination
+    setenv("TZ", current_timezone_, 1);
+    tzset();
+    timezone_is_set_ = true;
+    ESP_LOGI(kTag, "Timezone set to: %s", current_timezone_);
+    return true;
+}
+
+bool TimeUtil::GetTimeZone(char* buffer, size_t buffer_size) {
+    if (!buffer || buffer_size == 0) return false;
+    std::lock_guard<std::mutex> lock(timezone_mutex_);
+    if (!timezone_is_set_) {
+        buffer[0] = '\0';
+        return false;
+    }
+    if (buffer_size <= strlen(current_timezone_)) {
+        buffer[0] = '\0'; // Not enough space
+        return false;
+    }
+    strcpy(buffer, current_timezone_);
+    return true;
+}
+
+bool TimeUtil::IsTimeZoneSet() {
+    return timezone_is_set_;
+}
+
+bool TimeUtil::GetLocalTimeInfo(struct tm* tm_info) {
+    time_t now = time(nullptr);
+    // localtime_r is thread-safe, but we lock to protect access to our static timezone state
+    std::lock_guard<std::mutex> lock(timezone_mutex_);
+    return localtime_r(&now, tm_info) != nullptr;
+}
+
+bool TimeUtil::GetFormattedTime(char* buffer, size_t buffer_size, const char* format) {
+    if (!buffer || buffer_size == 0) {
+        return false;
+    }
+    struct tm timeinfo;
+    if (GetLocalTimeInfo(&timeinfo)) {
+        size_t written = strftime(buffer, buffer_size, format, &timeinfo);
+        return written > 0;
+    }
+    buffer[0] = '\0';
+    return false;
+}
+
+const char* TimeUtil::GetFormattedTimeCStr(const char* format) {
+    // Use a thread-local buffer to ensure thread safety and avoid heap allocation.
+    thread_local static char buffer[128];
+
+    if (GetFormattedTime(buffer, sizeof(buffer), format)) {
+        return buffer;
+    }
+
+    // On failure, return a pointer to a safe, empty string.
+    buffer[0] = '\0';
+    return buffer;
+}
+
+uint8_t TimeUtil::GetSecond() {
+    struct tm timeinfo;
+    return GetLocalTimeInfo(&timeinfo) ? timeinfo.tm_sec : 0;
+}
+
+uint8_t TimeUtil::GetMinute() {
+    struct tm timeinfo;
+    return GetLocalTimeInfo(&timeinfo) ? timeinfo.tm_min : 0;
+}
+
+uint8_t TimeUtil::GetHour() {
+    struct tm timeinfo;
+    return GetLocalTimeInfo(&timeinfo) ? timeinfo.tm_hour : 0;
+}
+
+uint8_t TimeUtil::GetDayOfWeek() {
+    struct tm timeinfo;
+    return GetLocalTimeInfo(&timeinfo) ? timeinfo.tm_wday : 0;
+}
+
+uint8_t TimeUtil::GetDayOfMonth() {
+    struct tm timeinfo;
+    return GetLocalTimeInfo(&timeinfo) ? timeinfo.tm_mday : 0;
+}
+
+uint8_t TimeUtil::GetMonth() {
+    struct tm timeinfo;
+    return GetLocalTimeInfo(&timeinfo) ? (timeinfo.tm_mon + 1) : 0;
+}
+
+uint16_t TimeUtil::GetYear() {
+    struct tm timeinfo;
+    return GetLocalTimeInfo(&timeinfo) ? (timeinfo.tm_year + 1900) : 0;
+}
+
+--------------------------------------
+
+#ifndef SNTP_CLIENT_H_
+#define SNTP_CLIENT_H_
+
+#include <cstdint>
+#include <memory>
+
+/**
+ * @class SntpClient
+ * @brief Client for synchronizing system time using the ESP-IDF SNTP service.
+ *
+ * Provides a C++ interface to configure, start, and stop the SNTP service.
+ * It uses the PIMPL idiom to hide ESP-IDF implementation details from the
+ * header, making it clean and dependency-free.
+ */
+class SntpClient {
+public:
+    SntpClient();
+    ~SntpClient();
+
+    // Disable copy and assignment semantics.
+    SntpClient(const SntpClient&) = delete;
+    SntpClient& operator=(const SntpClient&) = delete;
+
+    /**
+     * @brief Initializes the SNTP service. Must be called before starting.
+     * @return true on success, false on failure.
+     */
+    bool Initialize();
+
+    /**
+     * @brief Starts the SNTP service with the given configuration.
+     * @param sync_interval_ms Synchronization interval in milliseconds.
+     * @param num_servers The number of NTP servers provided in the array.
+     * @param server_names An array of NTP server hostnames. If null, uses default.
+     * @return true on success, false on failure.
+     */
+    bool Start(uint32_t sync_interval_ms = 3600 * 1000,
+               int num_servers = 0,
+               const char* server_names[] = nullptr);
+
+    /**
+     * @brief Stops the SNTP service.
+     */
+    void Stop();
+
+    /**
+     * @brief Checks if time has been successfully synchronized at least once.
+     * @return true if synchronized, false otherwise.
+     */
+    bool IsSynchronized() const;
+
+    /**
+     * @brief Checks if the SNTP service is currently running.
+     * @return true if running, false otherwise.
+     */
+    bool IsRunning() const;
+
+private:
+    class SntpClientImpl;
+    // Google C++ style prefers names with a trailing underscore for private members.
+    std::unique_ptr<SntpClientImpl> impl_;
+};
+
+#endif // SNTP_CLIENT_H_
+
+
+---------------------------------
+
+#include "sntp_client.h"
+
+#include <atomic>
+#include <cstring>
+#include "esp_sntp.h"
+#include "esp_log.h"
+
+// --- PIMPL Implementation ---
+class SntpClient::SntpClientImpl {
+public:
+    SntpClientImpl() = default;
+
+    void TimeSyncNotificationCallback(struct timeval *tv) {
+        ESP_LOGI(kTag, "Time successfully synchronized");
+        is_synchronized_ = true;
+    }
+
+    // A static wrapper to call the member function from the C-style callback.
+    static void SntpCallbackWrapper(struct timeval *tv) {
+        if (instance_) {
+            instance_->TimeSyncNotificationCallback(tv);
+        }
+    }
+
+    bool Initialize() {
+        if (is_initialized_) {
+            return true;
+        }
+        ESP_LOGI(kTag, "Initializing SNTP");
+        sntp_setoperatingmode(SNTP_OPMODE_POLL);
+        sntp_setservername(0, "pool.ntp.org"); // Default, can be overridden in Start()
+        sntp_set_time_sync_notification_cb(SntpCallbackWrapper);
+        instance_ = this; // Set static instance for the C callback to use.
+        is_initialized_ = true;
+        return true;
+    }
+
+    bool Start(uint32_t sync_interval_ms, int num_servers, const char* server_names[]) {
+        if (!is_initialized_) {
+            ESP_LOGE(kTag, "SNTP not initialized. Call Initialize() first.");
+            return false;
+        }
+        if (is_running_) {
+            return true;
+        }
+
+        if (num_servers > 0 && server_names != nullptr) {
+            for (int i = 0; i < num_servers; ++i) {
+                sntp_setservername(i, server_names[i]);
+            }
+        }
+
+        sntp_set_sync_interval(sync_interval_ms);
+        sntp_init();
+        is_running_ = true;
+        ESP_LOGI(kTag, "SNTP service started.");
+        return true;
+    }
+
+    void Stop() {
+        if (!is_running_) {
+            return;
+        }
+        sntp_stop();
+        is_running_ = false;
+        is_synchronized_ = false;
+        ESP_LOGI(kTag, "SNTP service stopped.");
+    }
+
+    // --- Member Variables ---
+    static constexpr const char* kTag = "SntpClient";
+
+    std::atomic<bool> is_initialized_{false};
+    std::atomic<bool> is_running_{false};
+    std::atomic<bool> is_synchronized_{false};
+
+    // Static pointer to the single instance for the C-style callback.
+    static SntpClientImpl* instance_;
+};
+
+// Define the static instance pointer.
+SntpClient::SntpClientImpl* SntpClient::SntpClientImpl::instance_ = nullptr;
+
+
+// --- SntpClient Public Methods (forwarding to PIMPL) ---
+
+SntpClient::SntpClient() : impl_(std::make_unique<SntpClientImpl>()) {}
+
+SntpClient::~SntpClient() {
+    impl_->Stop();
+}
+
+bool SntpClient::Initialize() {
+    return impl_->Initialize();
+}
+
+bool SntpClient::Start(uint32_t sync_interval_ms, int num_servers, const char* server_names[]) {
+    return impl_->Start(sync_interval_ms, num_servers, server_names);
+}
+
+void SntpClient::Stop() {
+    impl_->Stop();
+}
+
+bool SntpClient::IsSynchronized() const {
+    return impl_->is_synchronized_;
+}
+
+bool SntpClient::IsRunning() const {
+    return impl_->is_running_;
+}
+
+
+--------------------------------
+
+#include <stdio.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "esp_system.h"
+#include "esp_log.h"
+#include "nvs_flash.h"
+#include "esp_event.h"
+#include "esp_netif.h"
+
+// Your project's WiFi connection component would go here
+#include "your_wifi_component.h" // Placeholder
+
+// Include the created utility headers
+#include "sntp_client.h"
+#include "time_util.h"
+
+static const char* kTag = "MainApp";
+
+extern "C" void app_main(void)
+{
+    // --- 1. Standard ESP-IDF Initialization ---
+    // Initialize Non-Volatile Storage
+    esp_err_t ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+      ESP_ERROR_CHECK(nvs_flash_erase());
+      ret = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(ret);
+
+    // Initialize TCP/IP stack and default event loop
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+
+    // --- 2. Connect to WiFi ---
+    // This is a placeholder for your WiFi connection logic.
+    // SNTP client requires an active internet connection.
+    ESP_LOGI(kTag, "Connecting to WiFi...");
+    // your_wifi_connect_function(); // e.g., wifi_init_sta();
+
+
+    // --- 3. Initialize and Start SNTP Client ---
+    // Create an instance of the client
+    SntpClient sntp_client;
+
+    ESP_LOGI(kTag, "Initializing SNTP client...");
+    if (sntp_client.Initialize()) {
+        ESP_LOGI(kTag, "Starting SNTP service...");
+        // Start with default server (pool.ntp.org) and 1-hour sync interval
+        sntp_client.Start();
+    } else {
+        ESP_LOGE(kTag, "Failed to initialize SNTP client!");
+        // Handle error, perhaps restart
+    }
+
+    // --- 4. Wait for Time Synchronization ---
+    ESP_LOGI(kTag, "Waiting for time synchronization...");
+    while (!sntp_client.IsSynchronized()) {
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+    ESP_LOGI(kTag, "Time is synchronized!");
+
+    // --- 5. Use the TimeUtil Library ---
+    ESP_LOGI(kTag, "---------- TIME UTIL DEMO ----------");
+
+    // Print the initial synchronized time (will be UTC)
+    ESP_LOGI(kTag, "Initial UTC Time: %s", TimeUtil::GetFormattedTimeCStr());
+
+    // Set the timezone for Bengaluru, India (IST is UTC+5:30)
+    TimeUtil::SetTimeZone("IST-5:30");
+
+    // Main loop to demonstrate continuous time checking
+    while (true) {
+        // Get time as seconds since epoch
+        time_t epoch_time = TimeUtil::GetTimeT();
+        ESP_LOGI(kTag, "Current Epoch Time: %lld", (long long)epoch_time);
+
+        // Get formatted time string using the convenient C-string method
+        const char* formatted_time = TimeUtil::GetFormattedTimeCStr("%A, %B %d, %Y %I:%M:%S %p");
+        ESP_LOGI(kTag, "Local Time (IST): %s", formatted_time);
+
+        // Demonstrate the buffer-based method
+        char time_buffer[64];
+        if (TimeUtil::GetFormattedTime(time_buffer, sizeof(time_buffer))) {
+            ESP_LOGI(kTag, "Local Time (buffer): %s", time_buffer);
+        }
+
+        // Get and print individual components
+        ESP_LOGI(kTag, "Year: %d, Month: %d, Day: %d, Hour: %d, Min: %d, Sec: %d",
+            TimeUtil::GetYear(),
+            TimeUtil::GetMonth(),
+            TimeUtil::GetDayOfMonth(),
+            TimeUtil::GetHour(),
+            TimeUtil::GetMinute(),
+            TimeUtil::GetSecond()
+        );
+
+        ESP_LOGI(kTag, "--------------------------------------");
+        vTaskDelay(pdMS_TO_TICKS(10000)); // Print every 10 seconds
+    }
+}
+
+
+------------
+
