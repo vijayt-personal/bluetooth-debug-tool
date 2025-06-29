@@ -655,7 +655,6 @@ bool AwsIotMqttClient::UpdateJobStatus(const std::string& job_id, const std::str
 } // namespace AwsIot
 
 -------------------------
-
 #include "aws_iot_mqtt_client.h"
 
 // --- ESP-IDF Specific Headers ---
@@ -689,6 +688,9 @@ public:
     bool GetShadowTopic(const std::string& operation, char* buffer, size_t buffer_size);
     bool GetJobsTopic(const std::string& job_id, const std::string& operation, char* buffer, size_t buffer_size);
     
+    // --- FIX: Moved this method to public section ---
+    void RouteAwsCallback(const std::string& topic, std::string_view payload);
+    
     StatusCallback on_connected_cb_ = nullptr;
     StatusCallback on_disconnected_cb_ = nullptr;
     ShadowUpdateCallback shadow_update_cb_ = nullptr;
@@ -721,7 +723,6 @@ private:
     void OnData(esp_mqtt_event_handle_t event);
     void OnDisconnect();
     void ResubscribePending();
-    void RouteAwsCallback(const std::string& topic, std::string_view payload);
 };
 
 AwsIotMqttClientImpl::AwsIotMqttClientImpl() = default;
@@ -1060,4 +1061,5 @@ bool AwsIotMqttClient::UpdateJobStatus(const std::string& job_id, const std::str
 }
 
 } // namespace AwsIot
+
 
