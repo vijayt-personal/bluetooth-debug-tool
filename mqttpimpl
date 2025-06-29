@@ -1,0 +1,638 @@
+#ifndef AWS_IOT_MQTT_CLIENT_HPP_
+#define AWS_IOT_MQTT_CLIENT_HPP_
+
+#include <functional>
+#include <string>
+#include <string_view>
+#include <vector>
+#include <memory>
+#include <cstdint>
+
+// NO ESP-IDF specific headers or types here. This header is platform-agnostic.
+
+namespace AwsIot {
+
+// --- Constants ---
+constexpr size_t kMaxEndpointLen = 256;
+constexpr size_t kMaxClientIdLen = 128;
+constexpr size_t kMaxThingNameLen = 128;
+constexpr size_t kMaxTopicLen = 256;
+constexpr size_t kMaxPayloadLen = 4096;
+constexpr size_t kMaxSubs = 10;
+constexpr size_t kMaxCertLen = 2048; // Using a fixed size for certificate buffers
+
+// --- MQTT Protocol Version ---
+enum class MqttProtocolVersion {
+    V3_1_1,
+    V5
+};
+
+// --- MQTT v5 Specific Properties ---
+struct Mqtt5UserProperty {
+    std::string key;
+    std::string value;
+};
+
+// Forward declaration for the implementation class (PIMPL)
+class AwsIotMqttClientImpl;
+
+// --- Configuration ---
+struct MqttConfig {
+    // --- Connection Details (fixed-size buffers) ---
+    char        aws_endpoint[kMaxEndpointLen] = {0};
+    char        client_id[kMaxClientIdLen] = {0};
+    char        thing_name[kMaxThingNameLen] = {0};
+    uint16_t    port = 8883;
+
+    // --- Certificate Buffers (fixed-size, require manual copy) ---
+    char        root_ca_pem[kMaxCertLen] = {0};
+    char        device_cert_pem[kMaxCertLen] = {0};
+    char        private_key_pem[kMaxCertLen] = {0};
+
+    // MQTT protocol version
+    MqttProtocolVersion protocol_ver = MqttProtocolVersion::V3_1_1;
+
+    // MQTT RX/TX Buffers
+    int         rx_buffer_size = 4096;
+    int         tx_buffer_size = 4096;
+
+    // --- NEW: Reconnect Configuration ---
+    // Set to true to disable the MQTT client's built-in automatic reconnect.
+    // If disabled, the application is responsible for calling Connect() again
+    // after receiving the on_disconnected callback.
+    // Defaults to false (auto-reconnect enabled).
+    bool        disable_auto_reconnect = false;
+
+    // --- MQTT v5 Specific ---
+    // How long, in seconds, the broker should store the session after disconnect.
+    // A value of 0 means the session ends on disconnect.
+    // A value of 0xFFFFFFFF means the session never expires.
+    uint32_t    session_expiry_interval = 0; // Default to no persistence
+};
+
+// --- Callbacks ---
+using MqttMessageCallback = std::function<void(const std::string& topic, std::string_view payload)>;
+using StatusCallback = std::function<void()>;
+using JobNotificationCallback = std::function<void(const std::string& job_id, const std::string& status, const std::string& document)>;
+using ShadowUpdateCallback = std::function<void(const std::string& update_type, std::string_view payload)>;
+
+// --- Main Class ---
+class AwsIotMqttClient {
+public: // Public Interface
+    AwsIotMqttClient();
+    ~AwsIotMqttClient();
+
+    // Disable copy and move operations
+    AwsIotMqttClient(const AwsIotMqttClient&) = delete;
+    AwsIotMqttClient& operator=(const AwsIotMqttClient&) = delete;
+    AwsIotMqttClient(AwsIotMqttClient&&) = delete;
+    AwsIotMqttClient& operator=(AwsIotMqttClient&&) = delete;
+
+    // --- Core Functionality ---
+    bool Initialize(const MqttConfig& config);
+    bool Connect();
+    void Disconnect(uint32_t session_expiry_interval = 0); // MQTTv5 can override session expiry on disconnect
+    bool IsConnected() const;
+
+    // --- Publish/Subscribe ---
+    bool Publish(const std::string& topic, const std::string& payload, int qos = 0, bool retain = false);
+    bool Publish(const std::string& topic, std::string_view payload, int qos = 0, bool retain = false);
+    bool Publish(const std::string& topic, const uint8_t* payload, size_t len, int qos = 0, bool retain = false);
+
+    bool Subscribe(const std::string& topic_filter, int qos, MqttMessageCallback callback);
+    bool Unsubscribe(const std::string& topic_filter);
+
+    // --- AWS IoT Helpers ---
+    // Shadow
+    bool SubscribeToShadowUpdates(ShadowUpdateCallback callback);
+    bool SubscribeToShadowGetResponses(ShadowUpdateCallback callback);
+    bool UpdateShadow(const std::string& shadow_payload, int qos = 0);
+    bool UpdateShadow(std::string_view shadow_payload, int qos = 0);
+    bool GetShadow(const std::string& client_token = "");
+
+    // Jobs
+    bool SubscribeToJobs(JobNotificationCallback callback);
+    bool UpdateJobStatus(const std::string& job_id, const std::string& status, const std::string& status_details_json = "{}");
+    bool UpdateJobStatus(const std::string& job_id, const std::string& status, std::string_view status_details_json);
+
+    // --- Setters for Callbacks ---
+    void SetOnConnectedCallback(StatusCallback cb);
+    void SetOnDisconnectedCallback(StatusCallback cb);
+
+private:
+    // Pointer to the implementation (PIMPL)
+    std::unique_ptr<AwsIotMqttClientImpl> pimpl_;
+};
+
+} // namespace AwsIot
+
+#endif // AWS_IOT_MQTT_CLIENT_HPP_
+----------------------------------------
+
+#include "aws_iot_mqtt_client.h"
+
+// --- ESP-IDF Specific Headers ---
+#include "esp_log.h"
+#include "mqtt_client.h"
+#include <mutex>
+#include <atomic>
+#include <vector>
+#include <cstring>
+#include <algorithm>
+#include <inttypes.h> // For PRIu32 macro
+
+// --- PIMPL Implementation ---
+namespace AwsIot {
+
+static const char* TAG = "AwsIotMqttClient";
+
+// The implementation class holds all ESP-IDF specific details.
+class AwsIotMqttClientImpl {
+public:
+    // --- Constructor & Destructor ---
+    AwsIotMqttClientImpl();
+    ~AwsIotMqttClientImpl();
+
+    // --- Public Methods (called by the wrapper) ---
+    bool Initialize(const MqttConfig& config);
+    bool Connect();
+    void Disconnect(uint32_t session_expiry_interval);
+    bool IsConnected() const;
+    bool Publish(const std::string& topic, const uint8_t* payload, size_t len, int qos, bool retain);
+    bool Subscribe(const std::string& topic_filter, int qos, MqttMessageCallback callback);
+    bool Unsubscribe(const std::string& topic_filter);
+
+    // --- AWS Helpers ---
+    bool GetShadowTopic(const std::string& operation, char* buffer, size_t buffer_size);
+    bool GetJobsTopic(const std::string& job_id, const std::string& operation, char* buffer, size_t buffer_size);
+    
+    // --- Event Handler ---
+    void MqttEventHandler(esp_mqtt_event_handle_t event);
+
+    // --- Callbacks ---
+    StatusCallback on_connected_cb_ = nullptr;
+    StatusCallback on_disconnected_cb_ = nullptr;
+    
+    // --- Public Data for Wrapper Access ---
+    MqttConfig config_;
+
+private:
+    // --- Private Data Members ---
+    struct Subscription {
+        std::string topic;
+        int qos = 0;
+        MqttMessageCallback callback;
+    };
+
+    std::mutex              mutex_; // Protects subscriptions and other shared resources
+    esp_mqtt_client_handle_t client_handle_{nullptr};
+    std::atomic<bool>       connected_{false};
+    std::vector<Subscription> subscriptions_;
+    std::string             uri_; // To hold the constructed URI string
+    
+    // --- Private Methods ---
+    void CleanupMqttClient();
+    static void GlobalMqttEventHandler(void* handler_args, esp_event_base_t base, int32_t event_id, void* event_data);
+    void OnConnected();
+    void OnData(esp_mqtt_event_handle_t event);
+    void ResubscribePending();
+};
+
+
+// --- Implementation of AwsIotMqttClientImpl ---
+
+AwsIotMqttClientImpl::AwsIotMqttClientImpl() = default;
+
+AwsIotMqttClientImpl::~AwsIotMqttClientImpl() {
+    CleanupMqttClient();
+}
+
+void AwsIotMqttClientImpl::CleanupMqttClient() {
+    if (client_handle_) {
+        ESP_LOGI(TAG, "Destroying MQTT client.");
+        esp_mqtt_client_destroy(client_handle_);
+        client_handle_ = nullptr;
+        connected_ = false;
+    }
+}
+
+bool AwsIotMqttClientImpl::Initialize(const MqttConfig& config) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (client_handle_) {
+        ESP_LOGW(TAG, "Already initialized. Please Disconnect and re-initialize.");
+        return false;
+    }
+    
+    // --- FIX: Add validation for fixed-size char array config ---
+    if (config.aws_endpoint[0] == '\0' || config.client_id[0] == '\0' || 
+        config.root_ca_pem[0] == '\0' || config.device_cert_pem[0] == '\0' || config.private_key_pem[0] == '\0') {
+        ESP_LOGE(TAG, "Initialization failed: Endpoint, Client ID, or certificates are empty.");
+        return false;
+    }
+    config_ = config;
+
+    esp_mqtt_client_config_t mqtt_cfg = {};
+    
+    // --- FIX: Correctly construct the full URI ---
+    uri_ = "mqtts://" + std::string(config_.aws_endpoint) + ":" + std::to_string(config_.port);
+    mqtt_cfg.broker.address.uri = uri_.c_str();
+
+    // --- FIX: Use the fixed-size char arrays from config_ ---
+    mqtt_cfg.broker.verification.certificate = config_.root_ca_pem;
+    mqtt_cfg.credentials.authentication.certificate = config_.device_cert_pem;
+    mqtt_cfg.credentials.authentication.key = config_.private_key_pem;
+    mqtt_cfg.credentials.client_id = config_.client_id;
+
+    // Buffer sizes
+    mqtt_cfg.buffer.size = config_.rx_buffer_size;
+    mqtt_cfg.buffer.out_size = config_.tx_buffer_size;
+    
+    // Set auto-reconnect behavior based on user config
+    mqtt_cfg.network.disable_auto_reconnect = config_.disable_auto_reconnect;
+    if (config_.disable_auto_reconnect) {
+        ESP_LOGI(TAG, "Automatic reconnect is DISABLED by user configuration.");
+    } else {
+        ESP_LOGI(TAG, "Automatic reconnect is ENABLED (default).");
+    }
+
+    // Protocol Version
+    if (config_.protocol_ver == MqttProtocolVersion::V5) {
+        mqtt_cfg.session.protocol_ver = MQTT_PROTOCOL_V_5;
+        ESP_LOGI(TAG, "Using MQTT Protocol Version 5.");
+    } else {
+        mqtt_cfg.session.protocol_ver = MQTT_PROTOCOL_V_3_1_1;
+        ESP_LOGI(TAG, "Using MQTT Protocol Version 3.1.1.");
+    }
+
+    client_handle_ = esp_mqtt_client_init(&mqtt_cfg);
+    if (!client_handle_) {
+        ESP_LOGE(TAG, "Failed to initialize MQTT client.");
+        return false;
+    }
+
+    esp_mqtt_client_register_event(client_handle_, (esp_mqtt_event_id_t)ESP_EVENT_ANY_ID, GlobalMqttEventHandler, this);
+
+    // --- MQTTv5 Specific Connection Properties ---
+    if (config_.protocol_ver == MqttProtocolVersion::V5) {
+        esp_mqtt5_connection_property_config_t connect_property = {
+            .session_expiry_interval = config_.session_expiry_interval,
+            .maximum_packet_size = 0,
+            .receive_maximum = 10,
+            .topic_alias_maximum = 0,
+            .request_resp_info = false,
+            .request_problem_info = true,
+            .user_property = nullptr,
+            .will_delay_interval = 0,
+            .message_expiry_interval = 0,
+            .payload_format_indicator = false,
+            .content_type = nullptr,
+            .response_topic = nullptr,
+            .correlation_data = nullptr,
+            .correlation_data_len = 0,
+            .will_user_property = nullptr,
+        };
+        esp_mqtt5_client_set_connect_property(client_handle_, &connect_property);
+        ESP_LOGI(TAG, "MQTTv5 session expiry interval set to %" PRIu32 " seconds.", config.session_expiry_interval);
+    }
+    
+    return true;
+}
+
+bool AwsIotMqttClientImpl::Connect() {
+    if (!client_handle_) {
+        ESP_LOGE(TAG, "Client not initialized.");
+        return false;
+    }
+    ESP_LOGI(TAG, "Connecting to AWS IoT...");
+    esp_err_t err = esp_mqtt_client_start(client_handle_);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to start MQTT client, error: %s", esp_err_to_name(err));
+        return false;
+    }
+    return true;
+}
+
+void AwsIotMqttClientImpl::Disconnect(uint32_t session_expiry_interval) {
+    if (client_handle_ && IsConnected()) {
+         if (config_.protocol_ver == MqttProtocolVersion::V5) {
+            esp_mqtt5_disconnect_property_config_t disconnect_property = {
+                .session_expiry_interval = session_expiry_interval,
+                .disconnect_reason = 0,
+                .user_property = nullptr,
+            };
+            esp_mqtt5_client_set_disconnect_property(client_handle_, &disconnect_property);
+            ESP_LOGI(TAG, "MQTTv5 setting session expiry to %" PRIu32 " on disconnect.", session_expiry_interval);
+         }
+        ESP_LOGI(TAG, "Disconnecting from MQTT broker.");
+        esp_mqtt_client_disconnect(client_handle_);
+    }
+}
+
+bool AwsIotMqttClientImpl::IsConnected() const {
+    return connected_.load();
+}
+
+bool AwsIotMqttClientImpl::Publish(const std::string& topic, const uint8_t* payload, size_t len, int qos, bool retain) {
+    if (!IsConnected()) {
+        ESP_LOGW(TAG, "Not connected. Cannot publish.");
+        return false;
+    }
+    int msg_id = esp_mqtt_client_publish(client_handle_, topic.c_str(), (const char*)payload, len, qos, retain);
+    if (msg_id == -1) {
+        ESP_LOGE(TAG, "Failed to publish message to topic %s", topic.c_str());
+        return false;
+    }
+    ESP_LOGD(TAG, "Published to %s, msg_id=%d", topic.c_str(), msg_id);
+    return true;
+}
+
+bool AwsIotMqttClientImpl::Subscribe(const std::string& topic_filter, int qos, MqttMessageCallback callback) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    
+    auto it = std::find_if(subscriptions_.begin(), subscriptions_.end(),
+                           [&](const Subscription& s) { return s.topic == topic_filter; });
+
+    if (it != subscriptions_.end()) {
+        ESP_LOGW(TAG, "Topic %s already subscribed. Updating callback.", topic_filter.c_str());
+        it->callback = std::move(callback);
+        it->qos = qos;
+        return true;
+    }
+    
+    if (subscriptions_.size() >= kMaxSubs) {
+        ESP_LOGE(TAG, "Maximum number of subscriptions reached.");
+        return false;
+    }
+
+    if (IsConnected()) {
+        int msg_id = esp_mqtt_client_subscribe(client_handle_, topic_filter.c_str(), qos);
+        if (msg_id == -1) {
+            ESP_LOGE(TAG, "Failed to subscribe to topic %s", topic_filter.c_str());
+            return false;
+        }
+        ESP_LOGI(TAG, "Subscribed to %s, msg_id=%d", topic_filter.c_str(), msg_id);
+    } else {
+        ESP_LOGI(TAG, "Client not connected. Subscription to %s will be made upon connection.", topic_filter.c_str());
+    }
+
+    subscriptions_.push_back({topic_filter, qos, std::move(callback)});
+    return true;
+}
+
+bool AwsIotMqttClientImpl::Unsubscribe(const std::string& topic_filter) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    
+    auto it = std::find_if(subscriptions_.begin(), subscriptions_.end(),
+                           [&](const Subscription& s) { return s.topic == topic_filter; });
+
+    if (it == subscriptions_.end()) {
+        ESP_LOGW(TAG, "Topic %s not found in subscriptions.", topic_filter.c_str());
+        return false;
+    }
+
+    if (IsConnected()) {
+        int msg_id = esp_mqtt_client_unsubscribe(client_handle_, topic_filter.c_str());
+        if (msg_id == -1) {
+            ESP_LOGE(TAG, "Failed to unsubscribe from topic %s", topic_filter.c_str());
+            return false;
+        }
+        ESP_LOGI(TAG, "Unsubscribed from %s, msg_id=%d", topic_filter.c_str(), msg_id);
+    }
+    
+    subscriptions_.erase(it);
+    return true;
+}
+
+void AwsIotMqttClientImpl::OnConnected() {
+    connected_ = true;
+    ResubscribePending();
+    if (on_connected_cb_) {
+        on_connected_cb_();
+    }
+}
+
+void AwsIotMqttClientImpl::OnData(esp_mqtt_event_handle_t event) {
+    std::string topic(event->topic, event->topic_len);
+    std::string_view payload(event->data, event->data_len);
+
+    std::lock_guard<std::mutex> lock(mutex_);
+
+    // Generic topic match with wildcard support for '#'
+    for (const auto& sub : subscriptions_) {
+        bool match = false;
+        // Check for wildcard '#'
+        if (sub.topic.back() == '#') {
+            if (topic.rfind(sub.topic.substr(0, sub.topic.length() - 1), 0) == 0) {
+                match = true;
+            }
+        } 
+        // Check for exact match
+        else if (topic == sub.topic) {
+            match = true;
+        }
+
+        if (match && sub.callback) {
+            sub.callback(topic, payload);
+        }
+    }
+}
+
+void AwsIotMqttClientImpl::ResubscribePending() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!IsConnected()) return;
+
+    ESP_LOGI(TAG, "Resubscribing to %zu topics...", subscriptions_.size());
+    for (const auto& sub : subscriptions_) {
+        esp_mqtt_client_subscribe(client_handle_, sub.topic.c_str(), sub.qos);
+    }
+}
+
+void AwsIotMqttClientImpl::GlobalMqttEventHandler(void* handler_args, esp_event_base_t base, int32_t event_id, void* event_data) {
+    auto* client = static_cast<AwsIotMqttClientImpl*>(handler_args);
+    client->MqttEventHandler(static_cast<esp_mqtt_event_handle_t>(event_data));
+}
+
+void AwsIotMqttClientImpl::MqttEventHandler(esp_mqtt_event_handle_t event) {
+    switch (event->event_id) {
+        case MQTT_EVENT_CONNECTED:
+            ESP_LOGI(TAG, "MQTT_EVENT_CONNECTED");
+            OnConnected();
+            break;
+        case MQTT_EVENT_DISCONNECTED:
+            ESP_LOGW(TAG, "MQTT_EVENT_DISCONNECTED");
+            connected_ = false;
+            if (on_disconnected_cb_) {
+                on_disconnected_cb_();
+            }
+            break;
+        case MQTT_EVENT_SUBSCRIBED:
+            ESP_LOGI(TAG, "MQTT_EVENT_SUBSCRIBED, msg_id=%d", event->msg_id);
+            break;
+        case MQTT_EVENT_UNSUBSCRIBED:
+            ESP_LOGI(TAG, "MQTT_EVENT_UNSUBSCRIBED, msg_id=%d", event->msg_id);
+            break;
+        case MQTT_EVENT_PUBLISHED:
+            ESP_LOGD(TAG, "MQTT_EVENT_PUBLISHED, msg_id=%d", event->msg_id);
+            break;
+        case MQTT_EVENT_DATA:
+            ESP_LOGD(TAG, "MQTT_EVENT_DATA received");
+            ESP_LOGV(TAG, "TOPIC=%.*s", event->topic_len, event->topic);
+            ESP_LOGV(TAG, "DATA=%.*s", event->data_len, event->data);
+            OnData(event);
+            break;
+        case MQTT_EVENT_ERROR:
+            ESP_LOGE(TAG, "MQTT_EVENT_ERROR");
+            if (event->error_handle && event->error_handle->error_type == MQTT_ERROR_TYPE_TCP_TRANSPORT) {
+                 ESP_LOGE(TAG, "Last error from esp-tls: 0x%x", event->error_handle->esp_tls_last_esp_err);
+                 ESP_LOGE(TAG, "Last error from tls stack: 0x%x", event->error_handle->esp_tls_stack_err);
+            }
+            break;
+        default:
+            ESP_LOGI(TAG, "Other event id:%d", event->event_id);
+            break;
+    }
+}
+
+
+bool AwsIotMqttClientImpl::GetShadowTopic(const std::string& operation, char* buffer, size_t buffer_size) {
+    int len = snprintf(buffer, buffer_size, "$aws/things/%s/shadow/%s", config_.thing_name, operation.c_str());
+    return len > 0 && len < buffer_size;
+}
+
+bool AwsIotMqttClientImpl::GetJobsTopic(const std::string& job_id, const std::string& operation, char* buffer, size_t buffer_size) {
+    int len = snprintf(buffer, buffer_size, "$aws/things/%s/jobs/%s/%s", config_.thing_name, job_id.c_str(), operation.c_str());
+    return len > 0 && len < buffer_size;
+}
+
+
+// --- Implementation of AwsIotMqttClient (Public Wrapper) ---
+
+AwsIotMqttClient::AwsIotMqttClient() : pimpl_(std::make_unique<AwsIotMqttClientImpl>()) {}
+AwsIotMqttClient::~AwsIotMqttClient() = default;
+
+bool AwsIotMqttClient::Initialize(const MqttConfig& config) {
+    return pimpl_->Initialize(config);
+}
+
+bool AwsIotMqttClient::Connect() {
+    return pimpl_->Connect();
+}
+
+void AwsIotMqttClient::Disconnect(uint32_t session_expiry_interval) {
+    pimpl_->Disconnect(session_expiry_interval);
+}
+
+bool AwsIotMqttClient::IsConnected() const {
+    return pimpl_->IsConnected();
+}
+
+bool AwsIotMqttClient::Publish(const std::string& topic, const std::string& payload, int qos, bool retain) {
+    return pimpl_->Publish(topic, reinterpret_cast<const uint8_t*>(payload.c_str()), payload.length(), qos, retain);
+}
+
+bool AwsIotMqttClient::Publish(const std::string& topic, std::string_view payload, int qos, bool retain) {
+    return pimpl_->Publish(topic, reinterpret_cast<const uint8_t*>(payload.data()), payload.length(), qos, retain);
+}
+
+bool AwsIotMqttClient::Publish(const std::string& topic, const uint8_t* payload, size_t len, int qos, bool retain) {
+    return pimpl_->Publish(topic, payload, len, qos, retain);
+}
+
+bool AwsIotMqttClient::Subscribe(const std::string& topic_filter, int qos, MqttMessageCallback callback) {
+    return pimpl_->Subscribe(topic_filter, qos, std::move(callback));
+}
+
+bool AwsIotMqttClient::Unsubscribe(const std::string& topic_filter) {
+    return pimpl_->Unsubscribe(topic_filter);
+}
+
+void AwsIotMqttClient::SetOnConnectedCallback(StatusCallback cb) {
+    pimpl_->on_connected_cb_ = std::move(cb);
+}
+
+void AwsIotMqttClient::SetOnDisconnectedCallback(StatusCallback cb) {
+    pimpl_->on_disconnected_cb_ = std::move(cb);
+}
+
+
+// --- AWS IoT Helper Implementations ---
+
+bool AwsIotMqttClient::SubscribeToShadowUpdates(ShadowUpdateCallback callback) {
+    char topic[kMaxTopicLen];
+    pimpl_->GetShadowTopic("update/#", topic, sizeof(topic));
+    return Subscribe(std::string(topic), 1, [cb = std::move(callback)](const std::string& received_topic, std::string_view payload) {
+        std::string update_type;
+        if (received_topic.find("/accepted") != std::string::npos) update_type = "update/accepted";
+        else if (received_topic.find("/rejected") != std::string::npos) update_type = "update/rejected";
+        else if (received_topic.find("/delta") != std::string::npos) update_type = "update/delta";
+        
+        if (!update_type.empty() && cb) {
+            cb(update_type, payload);
+        }
+    });
+}
+
+bool AwsIotMqttClient::SubscribeToShadowGetResponses(ShadowUpdateCallback callback) {
+    char topic[kMaxTopicLen];
+    pimpl_->GetShadowTopic("get/#", topic, sizeof(topic));
+    return Subscribe(std::string(topic), 1, [cb = std::move(callback)](const std::string& received_topic, std::string_view payload) {
+        std::string update_type;
+        if (received_topic.find("/accepted") != std::string::npos) update_type = "get/accepted";
+        else if (received_topic.find("/rejected") != std::string::npos) update_type = "get/rejected";
+
+        if (!update_type.empty() && cb) {
+            cb(update_type, payload);
+        }
+    });
+}
+
+bool AwsIotMqttClient::UpdateShadow(const std::string& shadow_payload, int qos) {
+    return UpdateShadow(std::string_view(shadow_payload), qos);
+}
+
+bool AwsIotMqttClient::UpdateShadow(std::string_view shadow_payload, int qos) {
+    char topic_buffer[kMaxTopicLen];
+    if (!pimpl_->GetShadowTopic("update", topic_buffer, sizeof(topic_buffer))) {
+        return false;
+    }
+    return Publish(std::string(topic_buffer), shadow_payload, qos);
+}
+
+bool AwsIotMqttClient::GetShadow(const std::string& client_token) {
+    char topic_buffer[kMaxTopicLen];
+    if (!pimpl_->GetShadowTopic("get", topic_buffer, sizeof(topic_buffer))) {
+        return false;
+    }
+    return Publish(std::string(topic_buffer), std::string{}, 0);
+}
+
+bool AwsIotMqttClient::SubscribeToJobs(JobNotificationCallback callback) {
+     char topic[kMaxTopicLen];
+     snprintf(topic, sizeof(topic), "$aws/things/%s/jobs/notify-next", pimpl_->config_.thing_name);
+     
+     return Subscribe(std::string(topic), 1, [this, cb = std::move(callback)](const std::string& received_topic, std::string_view payload){
+        // A more robust implementation would parse the JSON payload to extract Job ID, status, etc.
+        std::string job_id = "example_job_id";
+        
+        // This logic is a placeholder. A proper JSON parser (like cJSON) would be needed here.
+        // For now, we'll just pass a default job ID and the full document.
+        if(cb) {
+            cb(job_id, "QUEUED", std::string(payload));
+        }
+     });
+}
+
+bool AwsIotMqttClient::UpdateJobStatus(const std::string& job_id, const std::string& status, const std::string& status_details_json) {
+    return UpdateJobStatus(job_id, status, std::string_view(status_details_json));
+}
+
+bool AwsIotMqttClient::UpdateJobStatus(const std::string& job_id, const std::string& status, std::string_view status_details_json) {
+    char topic_buffer[kMaxTopicLen];
+    if (!pimpl_->GetJobsTopic(job_id, "update", topic_buffer, sizeof(topic_buffer))) {
+        return false;
+    }
+    std::string payload = "{\"status\":\"" + status + "\", \"statusDetails\": " + std::string(status_details_json) + "}";
+    return Publish(std::string(topic_buffer), payload, 1);
+}
+
+} // namespace AwsIot
