@@ -1,0 +1,588 @@
+#ifndef COMMANDS_HPP_
+#define COMMANDS_HPP_
+
+#include <variant>
+#include <string>
+
+namespace visium {
+
+// A strongly-typed enum for all possible commands.
+enum class CommandType {
+    SetPower,
+    SetIntensity,
+    SetConfig, // A command that takes a complex payload
+    Unknown
+};
+
+// A variant to hold the different types of data for our commands.
+// It can hold simple types and std::string for complex, serialized data.
+using CommandValue = std::variant<bool, int, std::string>;
+
+// The final Command struct that the policy creates and the application consumes.
+struct Command {
+    CommandType type;
+    CommandValue value;
+};
+
+} // namespace visium
+
+#endif // COMMANDS_HPP_
+
+------------------
+
+#ifndef CLOUD_COMMUNICATOR_HPP_
+#define CLOUD_COMMUNICATOR_HPP_
+
+#include "commands.hpp"
+#include <atomic>
+#include <cstdint>
+#include <functional>
+#include <memory>
+#include <string>
+
+// --- Assumed Project Includes ---
+#include "log_print.h"
+#include "system_uptime.h"
+
+namespace visium {
+
+template <typename CloudPolicy>
+class CloudCommunicator {
+public:
+    // The callback now passes a single, type-safe Command object.
+    using ControlCommandCallback = std::function<bool(const Command& command)>;
+    using ConnectionStatusCallback = std::function<void(bool connected)>;
+
+    struct Config {
+        uint32_t initial_backoff_ms = 1000;
+        uint32_t max_backoff_ms     = 60000;
+        uint32_t connect_timeout_ms = 30000;
+    };
+
+    CloudCommunicator(CloudPolicy&& policy, const Config& comm_config, const typename CloudPolicy::Config& policy_config)
+        : policy_(std::move(policy)),
+          config_(comm_config),
+          current_state_(State::UNINITIALIZED) {
+        policy_.Initialize(
+            policy_config,
+            [this]() { this->OnPolicyConnected(); },
+            [this]() { this->OnPolicyDisconnected(); },
+            [this](const Command& cmd) { return this->OnPolicyCommandReceived(cmd); });
+    }
+
+    ~CloudCommunicator() {
+        if (IsConnected()) {
+            Disconnect();
+        }
+    }
+
+    CloudCommunicator(const CloudCommunicator&) = delete;
+    CloudCommunicator& operator=(const CloudCommunicator&) = delete;
+    CloudCommunicator(CloudCommunicator&&) = delete;
+    CloudCommunicator& operator=(CloudCommunicator&&) = delete;
+
+    void Start() {
+        LOG_PRINT(log_print::kINFO, "CloudCommunicator started. State: DISCONNECTED.");
+        current_state_.store(State::DISCONNECTED);
+    }
+
+    void Connect() {
+        LOG_PRINT(log_print::kINFO, "Manual connect requested, resetting backoff timer.");
+        State current = current_state_.load();
+        if (current == State::UNINITIALIZED) {
+            LOG_PRINT(log_print::kERROR, "Cannot connect: Must call Start() first.");
+            return;
+        }
+
+        if (current == State::DISCONNECTED || current == State::WAITING_TO_RETRY) {
+            reconnect_attempts_ = 0;
+            current_backoff_delay_ms_ = config_.initial_backoff_ms;
+            last_disconnect_time_ms_ = 0;
+            AttemptReconnect();
+        }
+    }
+
+    void Disconnect() {
+        LOG_PRINT(log_print::kINFO, "Application requested disconnect.");
+        State previous_state = current_state_.exchange(State::DISCONNECTED);
+        if (previous_state == State::CONNECTED || previous_state == State::CONNECTING) {
+            policy_.Disconnect();
+        }
+        reconnect_attempts_ = 0;
+        current_backoff_delay_ms_ = config_.initial_backoff_ms;
+    }
+
+    bool IsConnected() const {
+        return current_state_.load(std::memory_order_relaxed) == State::CONNECTED;
+    }
+
+    void Process() {
+        policy_.Yield();
+
+        const State state = current_state_.load();
+        switch (state) {
+            case State::DISCONNECTED:
+                AttemptReconnect();
+                break;
+            case State::WAITING_TO_RETRY:
+                if (system_uptime::ExceedsMs(last_disconnect_time_ms_, current_backoff_delay_ms_)) {
+                    AttemptReconnect();
+                }
+                break;
+            case State::CONNECTING:
+                if (system_uptime::ExceedsMs(connect_start_time_ms_, config_.connect_timeout_ms)) {
+                    LOG_PRINT(log_print::kERROR, "Connection attempt timed out after %u ms.", config_.connect_timeout_ms);
+                    policy_.Disconnect();
+                    HandleDisconnectInternal();
+                }
+                break;
+            case State::CONNECTED:
+                policy_.Process();
+                break;
+            case State::UNINITIALIZED:
+            default:
+                break;
+        }
+    }
+
+    bool SendData(const std::string& topic, const std::string& payload, int qos = 0) {
+        if (!IsConnected()) {
+            LOG_PRINT(log_print::kWARN, "Cannot send data to topic '%s', not connected.", topic.c_str());
+            return false;
+        }
+        return policy_.Publish(topic, payload, qos);
+    }
+
+    bool ReportState(const std::string& state_payload, int qos = 1) {
+        if (!IsConnected()) {
+            LOG_PRINT(log_print::kWARN, "Cannot report state, not connected.");
+            return false;
+        }
+        return policy_.ReportState(state_payload, qos);
+    }
+
+    void SetConnectionStatusCallback(ConnectionStatusCallback cb) { connection_status_callback_ = std::move(cb); }
+    void SetControlCommandCallback(ControlCommandCallback cb) { control_command_callback_ = std::move(cb); }
+
+private:
+    enum class State { UNINITIALIZED, DISCONNECTED, CONNECTING, CONNECTED, WAITING_TO_RETRY };
+
+    void AttemptReconnect() {
+        State expected = State::DISCONNECTED;
+        if (!current_state_.compare_exchange_strong(expected, State::CONNECTING)) {
+            expected = State::WAITING_TO_RETRY;
+            if (!current_state_.compare_exchange_strong(expected, State::CONNECTING)) {
+                return;
+            }
+        }
+        LOG_PRINT(log_print::kINFO, "Attempting connection (Attempt #%d)...", reconnect_attempts_ + 1);
+        connect_start_time_ms_ = system_uptime::GetMs();
+        reconnect_attempts_++;
+        if (!policy_.Connect()) {
+            LOG_PRINT(log_print::kWARN, "Policy refused connection attempt immediately.");
+            HandleDisconnectInternal();
+        }
+    }
+
+    void HandleDisconnectInternal() {
+        State previous_state = current_state_.load();
+        if (previous_state != State::CONNECTED && previous_state != State::CONNECTING) {
+            return;
+        }
+        current_state_.store(State::WAITING_TO_RETRY);
+        last_disconnect_time_ms_ = system_uptime::GetMs();
+        if (previous_state == State::CONNECTED) {
+            uint64_t next_delay = static_cast<uint64_t>(current_backoff_delay_ms_) * 2;
+            current_backoff_delay_ms_ = std::min(static_cast<uint32_t>(next_delay), config_.max_backoff_ms);
+        } else {
+             current_backoff_delay_ms_ = config_.initial_backoff_ms;
+        }
+        LOG_PRINT(log_print::kINFO, "Entered WAITING_TO_RETRY state. Next attempt in %u ms.", current_backoff_delay_ms_);
+        if (previous_state == State::CONNECTED && connection_status_callback_) {
+            connection_status_callback_(false);
+        }
+    }
+
+    void OnPolicyConnected() {
+        LOG_PRINT(log_print::kINFO, "Policy reported connection success!");
+        current_state_.store(State::CONNECTED);
+        reconnect_attempts_ = 0;
+        current_backoff_delay_ms_ = config_.initial_backoff_ms;
+        if (connection_status_callback_) {
+            connection_status_callback_(true);
+        }
+    }
+
+    void OnPolicyDisconnected() {
+        LOG_PRINT(log_print::kWARN, "Policy reported disconnection.");
+        HandleDisconnectInternal();
+    }
+
+    bool OnPolicyCommandReceived(const Command& command) {
+        if (control_command_callback_) {
+            return control_command_callback_(command);
+        }
+        LOG_PRINT(log_print::kWARN, "Received command but no callback is registered.");
+        return false;
+    }
+
+    CloudPolicy&             policy_;
+    Config                   config_;
+    std::atomic<State>       current_state_;
+    int                      reconnect_attempts_ = 0;
+    uint32_t                 current_backoff_delay_ms_ = 1000;
+    uint64_t                 last_disconnect_time_ms_ = 0;
+    uint64_t                 connect_start_time_ms_ = 0;
+    ConnectionStatusCallback connection_status_callback_{nullptr};
+    ControlCommandCallback   control_command_callback_{nullptr};
+};
+
+} // namespace visium
+#endif // CLOUD_COMMUNICATOR_HPP_
+
+-------------------
+
+#ifndef AWS_IOT_POLICY_HPP_
+#define AWS_IOT_POLICY_HPP_
+
+#include "commands.hpp"
+#include <string>
+#include <functional>
+#include <memory>
+#include <cstdint>
+
+namespace AwsIot { class AwsIotMqttClient; }
+namespace rapidjson { class Value; }
+
+namespace visium {
+
+class AwsIotPolicy {
+public:
+    struct Config {
+        std::string aws_endpoint;
+        std::string client_id;
+        std::string thing_name;
+        uint16_t    port = 8883;
+        std::string root_ca_pem;
+        std::string device_cert_pem;
+        std::string private_key_pem;
+        uint32_t get_shadow_retry_base_ms = 5000;
+        uint32_t max_get_shadow_retry_ms  = 30000;
+        uint16_t max_get_shadow_attempts  = 10;
+    };
+
+    using ConnectionCallback = std::function<void()>;
+    using CommandCallback = std::function<bool(const Command& command)>;
+
+    AwsIotPolicy();
+    ~AwsIotPolicy();
+
+    void Initialize(const Config& config, ConnectionCallback on_conn, ConnectionCallback on_disconn, CommandCallback on_cmd);
+    bool Connect();
+    void Disconnect();
+    void Yield();
+    void Process();
+    bool Publish(const std::string& topic, const std::string& payload, int qos);
+    bool ReportState(const std::string& state_payload, int qos = 1);
+
+private:
+    void OnMqttConnected();
+    void OnMqttDisconnected();
+    void HandleShadowCallback(const std::string& update_type, std::string_view payload);
+    void ProcessShadowDelta(const rapidjson::Value& delta_state);
+    void PollShadow();
+
+    std::unique_ptr<AwsIot::AwsIotMqttClient> client_;
+    Config config_;
+    ConnectionCallback on_connected_{nullptr};
+    ConnectionCallback on_disconnected_{nullptr};
+    CommandCallback on_command_{nullptr};
+    bool initial_shadow_received_ = false;
+    uint16_t get_shadow_attempts_ = 0;
+    uint64_t last_get_shadow_attempt_ms_ = 0;
+    uint32_t current_get_shadow_backoff_ms_ = 5000;
+    uint32_t last_processed_shadow_version_ = 0;
+};
+
+} // namespace visium
+
+#endif // AWS_IOT_POLICY_HPP_
+
+------------------------------
+
+#include "aws_iot_policy.hpp"
+#include <cstring>
+#include "aws_iot_mqtt_client.hpp"
+#include "rapidjson/document.h"
+#include "rapidjson/stringbuffer.h"
+#include "rapidjson/writer.h"
+#include "log_print.h"
+#include "system_uptime.h"
+
+namespace visium {
+
+AwsIotPolicy::AwsIotPolicy() = default;
+AwsIotPolicy::~AwsIotPolicy() = default;
+
+void AwsIotPolicy::Initialize(const Config& config, ConnectionCallback on_conn, ConnectionCallback on_disconn, CommandCallback on_cmd) {
+    config_ = config;
+    on_connected_ = std::move(on_conn);
+    on_disconnected_ = std::move(on_disconn);
+    on_command_ = std::move(on_cmd);
+
+    AwsIot::MqttConfig client_config;
+    strncpy(client_config.aws_endpoint, config_.aws_endpoint.c_str(), AwsIot::kMaxEndpointLen - 1);
+    strncpy(client_config.client_id, config_.client_id.c_str(), AwsIot::kMaxClientIdLen - 1);
+    strncpy(client_config.thing_name, config_.thing_name.c_str(), AwsIot::kMaxThingNameLen - 1);
+    client_config.port = config_.port;
+    strncpy(client_config.root_ca_pem, config_.root_ca_pem.c_str(), AwsIot::kMaxCertLen - 1);
+    strncpy(client_config.device_cert_pem, config_.device_cert_pem.c_str(), AwsIot::kMaxCertLen - 1);
+    strncpy(client_config.private_key_pem, config_.private_key_pem.c_str(), AwsIot::kMaxCertLen - 1);
+
+    client_ = std::make_unique<AwsIot::AwsIotMqttClient>();
+    if (!client_->Initialize(client_config)) {
+         LOG_PRINT(log_print::kERROR, "Failed to initialize underlying AwsIotMqttClient.");
+         return;
+    }
+    client_->SetOnConnectedCallback([this]() { this->OnMqttConnected(); });
+    client_->SetOnDisconnectedCallback([this]() { this->OnMqttDisconnected(); });
+}
+
+bool AwsIotPolicy::Connect() { return client_ ? client_->Connect() : false; }
+void AwsIotPolicy::Disconnect() { if (client_) client_->Disconnect(); }
+void AwsIotPolicy::Yield() {}
+void AwsIotPolicy::Process() { if (client_ && client_->IsConnected()) PollShadow(); }
+
+bool AwsIotPolicy::Publish(const std::string& topic, const std::string& payload, int qos) {
+    if (!client_ || !client_->IsConnected()) return false;
+    return client_->Publish(topic, payload, qos);
+}
+
+bool AwsIotPolicy::ReportState(const std::string& state_payload, int qos) {
+    if (!client_ || !client_->IsConnected()) return false;
+    std::string shadow_payload = "{\"state\":{\"reported\":" + state_payload + "}}";
+    return client_->UpdateShadow(shadow_payload, qos);
+}
+
+void AwsIotPolicy::OnMqttConnected() {
+    LOG_PRINT(log_print::kINFO, "MQTT Connected. Subscribing to shadow topics for thing: %s", config_.thing_name.c_str());
+    auto shadow_handler = [this](const std::string& type, std::string_view payload) { this->HandleShadowCallback(type, payload); };
+    if (client_->SubscribeToShadowUpdates(shadow_handler) && client_->SubscribeToShadowGetResponses(shadow_handler)) {
+        LOG_PRINT(log_print::kINFO, "Shadow subscriptions successful.");
+        initial_shadow_received_ = false;
+        get_shadow_attempts_ = 0;
+        current_get_shadow_backoff_ms_ = config_.get_shadow_retry_base_ms;
+        last_processed_shadow_version_ = 0;
+        if (on_connected_) on_connected_();
+    } else {
+        LOG_PRINT(log_print::kERROR, "Failed to subscribe to shadow topics! Disconnecting.");
+        client_->Disconnect();
+    }
+}
+
+void AwsIotPolicy::OnMqttDisconnected() { if (on_disconnected_) on_disconnected_(); }
+
+void AwsIotPolicy::HandleShadowCallback(const std::string& update_type, std::string_view payload) {
+    LOG_PRINT(log_print::kDEBUG1, "Shadow Callback: Type='%s', Size=%zu", update_type.c_str(), payload.length());
+    if (payload.empty()) return;
+    std::string mutable_payload(payload);
+    rapidjson::Document doc;
+    doc.ParseInsitu(&mutable_payload[0]);
+    if (doc.HasParseError()) {
+        LOG_PRINT(log_print::kERROR, "Shadow JSON parse error.");
+        return;
+    }
+
+    uint32_t incoming_version = 0;
+    if (doc.HasMember("version") && doc["version"].IsUint()) {
+        incoming_version = doc["version"].GetUint();
+    }
+    if (incoming_version > 0 && incoming_version <= last_processed_shadow_version_) {
+        LOG_PRINT(log_print::kINFO, "Ignoring stale shadow update (version %u <= last processed %u).", incoming_version, last_processed_shadow_version_);
+        return;
+    }
+
+    if (update_type == "delta") {
+        if (doc.HasMember("state") && doc["state"].IsObject()) {
+            last_processed_shadow_version_ = incoming_version;
+            ProcessShadowDelta(doc["state"]);
+        }
+    } else if (update_type == "accepted") {
+        initial_shadow_received_ = true;
+        last_processed_shadow_version_ = incoming_version;
+        if (doc.HasMember("state") && doc["state"].IsObject() && doc["state"].HasMember("delta") && doc["state"]["delta"].IsObject()) {
+            ProcessShadowDelta(doc["state"]["delta"]);
+        }
+    } else if (update_type == "rejected") {
+        int error_code = 0;
+        if (doc.HasMember("code") && doc["code"].IsInt()) error_code = doc["code"].GetInt();
+        if (error_code == 404) {
+            LOG_PRINT(log_print::kINFO, "No existing shadow found (404 Not Found). This is normal for a new device.");
+            initial_shadow_received_ = true;
+        } else {
+            LOG_PRINT(log_print::kERROR, "Shadow operation rejected. Code: %d, Payload: %s", error_code, std::string(payload).c_str());
+        }
+    }
+}
+
+void AwsIotPolicy::ProcessShadowDelta(const rapidjson::Value& delta_state) {
+    if (!delta_state.IsObject() || !on_command_) return;
+    LOG_PRINT(log_print::kINFO, "Processing and translating shadow delta commands...");
+    rapidjson::Document report(rapidjson::kObjectType);
+    auto& allocator = report.GetAllocator();
+    bool command_actioned = false;
+
+    for (auto itr = delta_state.MemberBegin(); itr != delta_state.MemberEnd(); ++itr) {
+        const std::string key = itr->name.GetString();
+        const rapidjson::Value& raw_value = itr->value;
+        Command command{CommandType::Unknown};
+
+        if (key == "power" && raw_value.IsString()) {
+            command.type = CommandType::SetPower;
+            command.value = (strcmp(raw_value.GetString(), "ON") == 0);
+        } else if (key == "intensity" && raw_value.IsInt()) {
+            command.type = CommandType::SetIntensity;
+            command.value = raw_value.GetInt();
+        } else if (key == "config" && raw_value.IsObject()) {
+            command.type = CommandType::SetConfig;
+            rapidjson::StringBuffer buffer;
+            rapidjson::Writer<rapidjson::StringBuffer> writer(buffer);
+            raw_value.Accept(writer);
+            command.value = std::string(buffer.GetString());
+        }
+
+        if (command.type != CommandType::Unknown) {
+            if (on_command_(command)) {
+                command_actioned = true;
+                report.AddMember(rapidjson::Value(key, allocator).Move(), rapidjson::Value(raw_value, allocator).Move(), allocator);
+            }
+        } else {
+            LOG_PRINT(log_print::kWARN, "Unrecognized or malformed command key in delta: '%s'", key.c_str());
+        }
+    }
+
+    if (command_actioned) {
+        rapidjson::StringBuffer buffer;
+        rapidjson::Writer<rapidjson::StringBuffer> writer(buffer);
+        report.Accept(writer);
+        ReportState(buffer.GetString());
+    }
+}
+
+void AwsIotPolicy::PollShadow() {
+    if (initial_shadow_received_) return;
+    if (system_uptime::ExceedsMs(last_get_shadow_attempt_ms_, current_get_shadow_backoff_ms_)) {
+        if (get_shadow_attempts_ >= config_.max_get_shadow_attempts) {
+            LOG_PRINT(log_print::kERROR, "Max GetShadow attempts reached without a response. Giving up.");
+            initial_shadow_received_ = true;
+            return;
+        }
+        if (client_->GetShadow()) {
+            LOG_PRINT(log_print::kINFO, "Requesting initial shadow (Attempt #%u)...", get_shadow_attempts_ + 1);
+            last_get_shadow_attempt_ms_ = system_uptime::GetMs();
+            get_shadow_attempts_++;
+            current_get_shadow_backoff_ms_ = std::min(current_get_shadow_backoff_ms_ + config_.get_shadow_retry_base_ms, config_.max_get_shadow_retry_ms);
+        }
+    }
+}
+
+} // namespace visium
+
+----------
+#include "cloud_communicator.hpp"
+#include "aws_iot_policy.hpp"
+#include <iostream>
+#include <chrono>
+
+// --- Placeholder Dependencies for a complete, runnable example ---
+// Replace these with your actual platform implementations.
+namespace log_print {
+    enum LogLevel { kINFO, kWARN, kERROR, kDEBUG1 };
+    void LOG_PRINT(LogLevel level, const char* format, ...) {
+        va_list args;
+        va_start(args, format);
+        vprintf(format, args);
+        printf("\n");
+        va_end(args);
+    }
+}
+namespace system_uptime {
+    uint64_t GetMs() {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+    }
+    bool ExceedsMs(uint64_t start_time, uint32_t delay_ms) {
+        return (GetMs() - start_time) > delay_ms;
+    }
+}
+// You would also need a stub for AwsIotMqttClient's implementation
+// or link against the real library for this to compile fully.
+// --------------------------------------------------------------------
+
+// Application's handler function for type-safe commands.
+bool handle_device_command(const visium::Command& command) {
+    switch (command.type) {
+        case visium::CommandType::SetPower: {
+            bool power_state = std::get<bool>(command.value);
+            LOG_PRINT(log_print::kINFO, "Device Logic: Setting power to %s.", power_state ? "ON" : "OFF");
+            return true;
+        }
+        case visium::CommandType::SetIntensity: {
+            int intensity = std::get<int>(command.value);
+            LOG_PRINT(log_print::kINFO, "Device Logic: Setting intensity to %d.", intensity);
+            return true;
+        }
+        case visium::CommandType::SetConfig: {
+            const std::string& config_payload = std::get<std::string>(command.value);
+            LOG_PRINT(log_print::kINFO, "Device Logic: Applying new config: %s", config_payload.c_str());
+            return true;
+        }
+        default:
+            LOG_PRINT(log_print::kWARN, "Received unhandled command type.");
+            return false;
+    }
+}
+
+int main() {
+    // 1. Configure the Policy
+    visium::AwsIotPolicy::Config policy_config;
+    policy_config.aws_endpoint = "your-endpoint.iot.region.amazonaws.com"; // <-- IMPORTANT: Set your endpoint
+    policy_config.thing_name = "MyThing";
+    policy_config.client_id = "MyThing";
+    // In a real app, load these from files or secure storage
+    policy_config.root_ca_pem = "-----BEGIN CERTIFICATE-----\n...\n-----END CERTIFICATE-----\n";
+    policy_config.device_cert_pem = "-----BEGIN CERTIFICATE-----\n...\n-----END CERTIFICATE-----\n";
+    policy_config.private_key_pem = "-----BEGIN RSA PRIVATE KEY-----\n...\n-----END RSA PRIVATE KEY-----\n";
+
+    // 2. Configure the Communicator
+    visium::CloudCommunicator<visium::AwsIotPolicy>::Config comm_config;
+
+    // 3. Create the communicator and policy instances
+    visium::CloudCommunicator<visium::AwsIotPolicy> cloud_comm(
+        visium::AwsIotPolicy(), // Create and move the policy
+        comm_config,
+        policy_config
+    );
+
+    // 4. Set the application's callbacks
+    cloud_comm.SetConnectionStatusCallback([](bool connected){
+        LOG_PRINT(log_print::kINFO, "Connection Status Changed: %s", connected ? "CONNECTED" : "DISCONNECTED");
+    });
+    cloud_comm.SetControlCommandCallback(handle_device_command);
+
+    // 5. Start the communicator's state machine
+    cloud_comm.Start();
+
+    // 6. Main application loop
+    LOG_PRINT(log_print::kINFO, "Starting main application loop...");
+    while (true) {
+        cloud_comm.Process();
+        // Your other application logic would go here.
+        // For this example, we'll just add a small delay.
+        // std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+
+    return 0;
+}
+
+              
