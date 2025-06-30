@@ -1,0 +1,1023 @@
+// Copyright [2025] [Your Name or Company]
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#ifndef APP_UPDATER_H
+#define APP_UPDATER_H
+
+#include <cstdint>
+#include <functional>
+#include <map>
+#include <memory>
+#include <string>
+#include <cstdio> // For snprintf in StatusToString
+
+namespace platform {
+
+/**
+ * @class AppUpdater
+ * @brief Public interface for a platform-agnostic Application Updater.
+ *
+ * This class uses the PIMPL idiom to provide a stable, clean interface,
+ * completely hiding the underlying platform-specific implementation details.
+ * It is designed to be instantiated directly, e.g., `platform::AppUpdater my_updater;`.
+ */
+class AppUpdater {
+public:
+  // --- Public Nested Types for a Clean, Scoped API ---
+
+  /** @enum Status
+   * @brief Defines the possible status codes for update operations.
+   */
+  enum class Status {
+    kSuccess,                   ///< The operation completed successfully.
+    kErrorAlreadyInProgress,    ///< An update is already in progress.
+    kErrorNotIdle,              ///< An operation was attempted when the updater was not idle.
+    kErrorInvalidState,         ///< An operation was attempted in an invalid state.
+    kErrorMetadataInvalid,      ///< The provided firmware metadata is invalid or mismatched (e.g., chip ID).
+    kErrorPartitionNotFound,    ///< A suitable OTA partition could not be found.
+    kErrorOtaBeginFailed,       ///< The platform's underlying 'begin' operation failed.
+    kErrorWriteFailed,          ///< Writing a firmware chunk to flash failed.
+    kErrorImageSizeMismatch,    ///< The total bytes written does not match the expected size (if size was known).
+    kErrorOtaEndFailed,         ///< The platform's 'end' operation failed (e.g., image validation, chip compatibility).
+    kErrorSetBootPartitionFailed, ///< Failed to set the new partition as the next boot target.
+    kErrorRebootFailed,         ///< The command to reboot the device failed.
+    kErrorInvalidArgument,      ///< An invalid argument was provided to a method.
+    kErrorCancelled,            ///< The operation was cancelled by the user or Reset().
+    kErrorTimeout,              ///< The session timed out due to inactivity.
+    kErrorVersionIdentical,     ///< New version is identical to the current version, and same-version flashing is disallowed.
+    kErrorGeneric,              ///< A generic, unspecified error occurred.
+  };
+
+  /** @struct Metadata
+   * @brief Describes the firmware image being updated.
+   * `image_size` can be 0 if the total size is unknown at the start of the update.
+   * `target_platform_identifier` is an OPTIONAL hint for an early compatibility check
+   * in Begin(). A mandatory, more robust chip check against the image header
+   * occurs during the first Write() call, and a final one during End().
+   */
+  struct Metadata {
+    size_t image_size = 0;                      ///< Total size of the firmware image in bytes. 0 for unknown.
+    std::string version_string;                 ///< Version of the new firmware (e.g., "1.2.3").
+    std::string target_platform_identifier;     ///< Optional: Expected platform (e.g., "ESP32S3") for an early check.
+    std::map<std::string, std::string> custom_fields; ///< For application-specific metadata.
+  };
+
+  /** @struct BeginConfig
+   * @brief Configuration options for beginning an update session.
+   */
+  struct BeginConfig {
+    uint32_t inactivity_timeout_ms = 60000; ///< Timeout in ms. 0 to disable. Default 60 seconds.
+    bool allow_same_version = false;        ///< If false, Begin() will fail if new version matches current.
+  };
+
+  /** @enum State
+   * @brief Represents the internal operational state of the updater.
+   */
+  enum class State {
+    kIdle,          ///< Not performing an update. Ready to begin.
+    kPreparing,     ///< Initializing partitions and resources.
+    kReceivingData, ///< Actively writing firmware data.
+    kFinalizing,    ///< Finalizing the write and validating the image.
+    kReadyToApply,  ///< The new firmware is valid and ready to be booted.
+    kApplying,      ///< Setting the boot partition and preparing to reboot.
+    kError          ///< An error occurred. Call Reset() to return to idle.
+  };
+
+  /** @struct PartitionInfo
+   * @brief Provides details about a flash memory partition.
+   */
+  struct PartitionInfo {
+    std::string label;       ///< The label or name of the partition.
+    uint32_t type_id = 0;    ///< Platform-specific type identifier.
+    uint32_t subtype_id = 0; ///< Platform-specific subtype identifier.
+    size_t address = 0;      ///< Starting address of the partition.
+    size_t size = 0;         ///< Size of the partition in bytes.
+    bool is_encrypted = false;///< True if the partition is encrypted.
+    bool is_valid = false;   ///< True if this struct contains valid data.
+  };
+
+  /**
+   * @brief Converts a Status enum to a human-readable string.
+   * @param status The status code to convert.
+   * @return A constant string representation of the status.
+   */
+  static const char* StatusToString(Status status);
+
+  /**
+   * @brief Constructs an AppUpdater instance, ready in an idle state.
+   */
+  AppUpdater();
+
+  /**
+   * @brief Destructor. Ensures safe cleanup of the implementation.
+   * Its definition is in the .cpp file, which is required for the PIMPL idiom.
+   */
+  ~AppUpdater();
+
+  // --- Move Semantics (defined in .cpp to support PIMPL) ---
+  AppUpdater(AppUpdater&&) noexcept;
+  AppUpdater& operator=(AppUpdater&&) noexcept;
+
+  // --- Copying is disabled to prevent slicing and ownership issues ---
+  AppUpdater(const AppUpdater&) = delete;
+  AppUpdater& operator=(const AppUpdater&) = delete;
+
+  /**
+   * @brief Registers a custom callback function to be executed on reset.
+   * This is useful for application-level cleanup (e.g., closing sockets,
+   * updating UI state) when an update is reset, cancelled, or aborted due to error/timeout.
+   * @param hook The function to call. Pass an empty function or `nullptr` to clear the hook.
+   */
+  void SetResetHook(std::function<void()> hook);
+
+  /**
+   * @brief Begins an update session with custom configuration.
+   * @param metadata The metadata for the incoming firmware.
+   * @param config Configuration options for the update session (timeout, version check).
+   * @return Status code indicating success or failure.
+   */
+  Status Begin(const Metadata& metadata, const BeginConfig& config);
+
+  /**
+   * @brief Begins an update session with default configuration.
+   * @param metadata The metadata for the incoming firmware.
+   * @return Status code indicating success or failure.
+   */
+  Status Begin(const Metadata& metadata);
+
+  /**
+   * @brief Writes a chunk of firmware data.
+   * Resets the inactivity timer on each successful call.
+   * Performs a chip compatibility check against the image header on the first write.
+   * @param data Pointer to the data buffer.
+   * @param size The size of the data buffer in bytes.
+   * @return Status code indicating success or failure.
+   */
+  Status Write(const uint8_t* data, size_t size);
+
+  /**
+   * @brief Finalizes the update process after all data has been written.
+   * This typically involves the platform verifying the image signature and integrity.
+   * @return Status code indicating success or failure.
+   */
+  Status End();
+
+  /**
+   * @brief Applies the update by setting the boot partition and rebooting.
+   * @param pre_restart_hook An optional function for last-minute cleanup
+   * before the device reboots.
+   * @return This function should not return on success, as the device will reboot.
+   * A returned status indicates a failure to apply the update.
+   */
+  Status Apply(std::function<void()> pre_restart_hook = nullptr);
+
+  /**
+   * @brief Explicitly aborts any ongoing operation and resets the updater to the idle state.
+   * Executes the registered reset hook after internal cleanup.
+   */
+  void Reset();
+
+  /** @return The current operational state of the updater. */
+  State GetState() const;
+
+  /** @return A string describing the last error that occurred. */
+  std::string GetLastError() const;
+
+  /** @return The total number of bytes successfully written in the current session. */
+  size_t GetBytesWritten() const;
+
+  /** @return A structure with details about the currently running partition. */
+  PartitionInfo GetRunningPartitionInfo() const;
+
+  /** @return A structure with details about the partition that will boot next. */
+  PartitionInfo GetNextBootPartitionInfo() const;
+
+  /**
+   * @brief Marks the currently running application as valid, cancelling any pending OTA rollback.
+   *
+   * This function should be called by the **newly booted application** after it has performed
+   * its own health checks and determined it is running correctly.
+   *
+   * @return Status::kSuccess if the operation was successful or no action was needed.
+   * Returns an error status if a problem occurred while trying to mark the app as valid.
+   */
+  static Status MarkBootSuccessful();
+
+private:
+  // Forward-declare the private implementation class.
+  class PlatformUpdater;
+
+  // The pointer to implementation.
+  std::unique_ptr<PlatformUpdater> impl_;
+};
+
+} // namespace platform
+
+#endif // APP_UPDATER_H
+
+--------------------
+
+// Copyright [2025] [Your Name or Company]
+// (Apache License header as before)
+
+#include "app_updater.h"
+
+// --- Platform-Specific Includes (Completely hidden from clients) ---
+#include <algorithm>
+#include <cstring>
+#include "esp_app_format.h"
+#include "esp_chip_info.h"
+#include "esp_log.h"
+#include "esp_ota_ops.h"
+#include "esp_partition.h"
+#include "esp_system.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+
+// OTA_SIZE_UNKNOWN is used by esp_ota_begin when image size is not known.
+#ifndef OTA_SIZE_UNKNOWN
+#define OTA_SIZE_UNKNOWN 0xFFFFFFFF
+#endif
+
+namespace platform {
+
+// --- Anonymous namespace for helpers local to this implementation file ---
+namespace {
+
+const char* kImplTag = "PlatformUpdater"; // Tag for ESP_LOG in the PIMPL class
+
+// Helper to convert ESP chip model to string
+std::string ChipModelToString(esp_chip_model_t model) {
+  switch (model) {
+    case CHIP_ESP32: return "ESP32";
+    case CHIP_ESP32S2: return "ESP32S2";
+    case CHIP_ESP32S3: return "ESP32S3";
+    case CHIP_ESP32C3: return "ESP32C3";
+    case CHIP_ESP32H2: return "ESP32H2";
+    case CHIP_ESP32C2: return "ESP32C2";
+    case CHIP_ESP32C6: return "ESP32C6";
+    // Add other chips as needed
+    default:
+      char unknown_chip_buf[30];
+      snprintf(unknown_chip_buf, sizeof(unknown_chip_buf), "UNKNOWN_CHIP_ID(%d)", static_cast<int>(model));
+      return std::string(unknown_chip_buf);
+  }
+}
+
+// Helper to convert esp_partition_t to the public PartitionInfo struct
+AppUpdater::PartitionInfo ToPartitionInfo(const esp_partition_t* esp_part) {
+    AppUpdater::PartitionInfo info;
+    if (esp_part) {
+        if(esp_part->label[0] != '\0') {
+            info.label.assign(esp_part->label);
+        }
+        info.type_id = esp_part->type;
+        info.subtype_id = esp_part->subtype;
+        info.address = esp_part->address;
+        info.size = esp_part->size;
+        info.is_encrypted = esp_part->encrypted;
+        info.is_valid = true;
+    } else {
+        info.is_valid = false;
+    }
+    return info;
+}
+
+} // anonymous namespace
+
+
+/**
+ * @class AppUpdater::PlatformUpdater
+ * @brief The private implementation class for the AppUpdater.
+ */
+class AppUpdater::PlatformUpdater {
+public:
+  PlatformUpdater() { ResetInternalState(); }
+  ~PlatformUpdater() {
+    if (ota_handle_ != 0) {
+      ESP_LOGW(kImplTag, "Destructor: Aborting active OTA handle %p.", (void*)ota_handle_);
+      esp_ota_abort(ota_handle_);
+    }
+  }
+
+  void SetResetHook(std::function<void()> hook) { user_reset_hook_ = hook; }
+  AppUpdater::Status Begin(const AppUpdater::Metadata& metadata, const AppUpdater::BeginConfig& config);
+  AppUpdater::Status Write(const uint8_t* data, size_t size);
+  AppUpdater::Status End();
+  AppUpdater::Status Apply(std::function<void()> pre_restart_hook);
+  void Reset();
+
+  AppUpdater::State GetState() const { return current_state_; }
+  std::string GetLastError() const { return last_error_message_; }
+  size_t GetBytesWritten() const { return bytes_written_; }
+  AppUpdater::PartitionInfo GetRunningPartitionInfo() const;
+  AppUpdater::PartitionInfo GetNextBootPartitionInfo() const;
+
+private:
+  void SetState(AppUpdater::State new_state);
+  void SetErrorAndAbort(const std::string& error_message, AppUpdater::Status status_code, esp_err_t esp_idf_err = ESP_OK);
+  void ResetInternalState();
+  bool CheckInactivityTimeout();
+
+  // Platform-specific state
+  esp_ota_handle_t ota_handle_ = 0;
+  const esp_partition_t* update_partition_ = nullptr;
+
+  // Generic operational state
+  AppUpdater::State current_state_ = AppUpdater::State::kIdle;
+  std::string last_error_message_;
+  size_t bytes_written_ = 0;
+  size_t total_image_size_ = 0;
+
+  // Timeout state
+  uint32_t inactivity_timeout_ms_ = 0;
+  uint64_t last_activity_timestamp_ms_ = 0;
+
+  // User callback
+  std::function<void()> user_reset_hook_;
+
+  // Chip check flag
+  bool chip_check_performed_on_write_ = false;
+};
+
+// --- Implementation of PlatformUpdater methods ---
+
+void AppUpdater::PlatformUpdater::ResetInternalState() {
+    update_partition_ = nullptr;
+    current_state_ = AppUpdater::State::kIdle;
+    last_error_message_.clear();
+    bytes_written_ = 0;
+    total_image_size_ = 0;
+    inactivity_timeout_ms_ = 0;
+    last_activity_timestamp_ms_ = 0;
+    chip_check_performed_on_write_ = false;
+}
+
+void AppUpdater::PlatformUpdater::SetState(AppUpdater::State new_state) {
+    ESP_LOGD(kImplTag, "State transition from %d to %d", static_cast<int>(current_state_), static_cast<int>(new_state));
+    current_state_ = new_state;
+}
+
+void AppUpdater::PlatformUpdater::SetErrorAndAbort(const std::string& msg, AppUpdater::Status status_code, esp_err_t err) {
+    last_error_message_ = msg;
+    if (err != ESP_OK) {
+        last_error_message_ += " (Platform Error: " + std::string(esp_err_to_name(err)) + ")";
+    }
+    ESP_LOGE(kImplTag, "Error set: %s", last_error_message_.c_str());
+
+    if (ota_handle_ != 0) {
+        ESP_LOGW(kImplTag, "Aborting active OTA handle %p due to error.", (void*)ota_handle_);
+        esp_ota_abort(ota_handle_);
+        ota_handle_ = 0;
+    }
+    SetState(AppUpdater::State::kError);
+}
+
+bool AppUpdater::PlatformUpdater::CheckInactivityTimeout() {
+    if (inactivity_timeout_ms_ == 0) return true;
+    if (current_state_ != AppUpdater::State::kReceivingData) return true;
+
+    uint64_t now_ms = pdTICKS_TO_MS(xTaskGetTickCount());
+    if ((now_ms - last_activity_timestamp_ms_) > inactivity_timeout_ms_) {
+        SetErrorAndAbort("OTA session timed out due to inactivity.", AppUpdater::Status::kErrorTimeout);
+        if (user_reset_hook_) {
+            ESP_LOGI(kImplTag, "Executing user-provided reset hook due to timeout.");
+            user_reset_hook_();
+        }
+        return false;
+    }
+    return true;
+}
+
+AppUpdater::Status AppUpdater::PlatformUpdater::Begin(const AppUpdater::Metadata& metadata, const AppUpdater::BeginConfig& config) {
+    if (current_state_ != AppUpdater::State::kIdle) {
+      SetErrorAndAbort("Begin: Updater is not idle.", AppUpdater::Status::kErrorNotIdle);
+      return AppUpdater::Status::kErrorNotIdle;
+    }
+    ResetInternalState();
+
+    SetState(AppUpdater::State::kPreparing);
+    // *** FIX: Changed format specifier from %u to %lu for uint32_t to prevent warnings/errors. ***
+    ESP_LOGI(kImplTag, "Begin OTA. Same version: %s. Timeout: %lu ms. Optional target platform: '%s'",
+             config.allow_same_version ? "Allowed" : "Disallowed",
+             config.inactivity_timeout_ms,
+             metadata.target_platform_identifier.c_str());
+
+    inactivity_timeout_ms_ = config.inactivity_timeout_ms;
+    if (inactivity_timeout_ms_ > 0) {
+        last_activity_timestamp_ms_ = pdTICKS_TO_MS(xTaskGetTickCount());
+    }
+
+    if (!config.allow_same_version) {
+        const esp_app_desc_t* running_app_info = esp_app_get_description();
+        if (running_app_info && !metadata.version_string.empty() &&
+            metadata.version_string == running_app_info->version) {
+            SetErrorAndAbort("New version is the same as the currently running version.", AppUpdater::Status::kErrorVersionIdentical);
+            return AppUpdater::Status::kErrorVersionIdentical;
+        }
+    }
+
+    if (!metadata.target_platform_identifier.empty()) {
+        esp_chip_info_t current_chip_info;
+        esp_chip_info(&current_chip_info);
+        std::string current_chip_str = ChipModelToString(current_chip_info.model);
+        if (metadata.target_platform_identifier != current_chip_str) {
+            char err_msg[200];
+            snprintf(err_msg, sizeof(err_msg),
+                     "Metadata target platform ('%s') does not match current chip ('%s').",
+                     metadata.target_platform_identifier.c_str(), current_chip_str.c_str());
+            SetErrorAndAbort(err_msg, AppUpdater::Status::kErrorMetadataInvalid);
+            return AppUpdater::Status::kErrorMetadataInvalid;
+        }
+        ESP_LOGI(kImplTag, "Optional metadata platform check passed for '%s'.", current_chip_str.c_str());
+    } else {
+        ESP_LOGI(kImplTag, "No target_platform_identifier in metadata; chip compatibility will be checked on first Write().");
+    }
+
+    update_partition_ = esp_ota_get_next_update_partition(nullptr);
+    if (update_partition_ == nullptr) {
+        SetErrorAndAbort("No valid OTA update partition found.", AppUpdater::Status::kErrorPartitionNotFound);
+        return AppUpdater::Status::kErrorPartitionNotFound;
+    }
+    ESP_LOGI(kImplTag, "Using OTA partition: %s", update_partition_->label);
+
+    total_image_size_ = (metadata.image_size == 0) ? OTA_SIZE_UNKNOWN : metadata.image_size;
+    ESP_LOGI(kImplTag, "Attempting to begin OTA with image size: 0x%zx (OTA_SIZE_UNKNOWN if 0xFFFFFFFF)", total_image_size_);
+
+    esp_err_t err = esp_ota_begin(update_partition_, total_image_size_, &ota_handle_);
+    if (err != ESP_OK) {
+        SetErrorAndAbort("esp_ota_begin failed.", AppUpdater::Status::kErrorOtaBeginFailed, err);
+        ota_handle_ = 0;
+        update_partition_ = nullptr;
+        return AppUpdater::Status::kErrorOtaBeginFailed;
+    }
+    ESP_LOGI(kImplTag, "esp_ota_begin succeeded. OTA Handle: %p", (void*)ota_handle_);
+    SetState(AppUpdater::State::kReceivingData);
+    return AppUpdater::Status::kSuccess;
+}
+
+AppUpdater::Status AppUpdater::PlatformUpdater::Write(const uint8_t* data, size_t size) {
+    if (current_state_ != AppUpdater::State::kReceivingData) {
+        ESP_LOGE(kImplTag, "Write called in invalid state: %d", static_cast<int>(current_state_));
+        return AppUpdater::Status::kErrorInvalidState;
+    }
+    if (!CheckInactivityTimeout()) {
+        return AppUpdater::Status::kErrorTimeout;
+    }
+    if (data == nullptr && size > 0) {
+        SetErrorAndAbort("Write called with null data pointer but non-zero size.", AppUpdater::Status::kErrorInvalidArgument);
+        return AppUpdater::Status::kErrorInvalidArgument;
+    }
+    if (size == 0) {
+        return AppUpdater::Status::kSuccess;
+    }
+    if (ota_handle_ == 0) {
+        SetErrorAndAbort("Write called but OTA handle is invalid.", AppUpdater::Status::kErrorInvalidState);
+        return AppUpdater::Status::kErrorInvalidState;
+    }
+
+    // *** FIX: Corrected chip compatibility check to use esp_image_header_t. ***
+    if (!chip_check_performed_on_write_) {
+        ESP_LOGI(kImplTag, "Performing internal chip compatibility check on first write chunk (size: %zu).", size);
+
+        if (bytes_written_ == 0 && size >= sizeof(esp_image_header_t)) {
+            const esp_image_header_t* image_header = reinterpret_cast<const esp_image_header_t*>(data);
+
+            esp_chip_info_t current_chip_info;
+            esp_chip_info(&current_chip_info);
+
+            ESP_LOGD(kImplTag, "Current chip model ID: %d (%s). Image header chip_id: %d.",
+                     current_chip_info.model, ChipModelToString(current_chip_info.model).c_str(), image_header->chip_id);
+
+            if (image_header->chip_id != current_chip_info.model) {
+                char err_msg[200];
+                snprintf(err_msg, sizeof(err_msg),
+                         "Chip ID mismatch! Current: %s (ID %d), Image for: Chip ID %d.",
+                         ChipModelToString(current_chip_info.model).c_str(), current_chip_info.model, image_header->chip_id);
+                SetErrorAndAbort(err_msg, AppUpdater::Status::kErrorMetadataInvalid);
+                return AppUpdater::Status::kErrorMetadataInvalid;
+            }
+            ESP_LOGI(kImplTag, "Internal chip compatibility check passed.");
+
+            // Also check app description magic word if the first chunk is large enough
+            size_t app_desc_offset = sizeof(esp_image_header_t) + sizeof(esp_image_segment_header_t);
+            if (size >= app_desc_offset + sizeof(esp_app_desc_t)) {
+                const esp_app_desc_t* image_app_desc = reinterpret_cast<const esp_app_desc_t*>(data + app_desc_offset);
+                 if (image_app_desc->magic_word != ESP_APP_DESC_MAGIC_WORD) {
+                    SetErrorAndAbort("New firmware image has invalid app description magic word.", AppUpdater::Status::kErrorMetadataInvalid);
+                    return AppUpdater::Status::kErrorMetadataInvalid;
+                }
+            }
+
+        } else if (bytes_written_ == 0) {
+            ESP_LOGW(kImplTag, "First data chunk too small (%zu bytes) for immediate chip check. Relying on esp_ota_end().", size);
+        }
+        chip_check_performed_on_write_ = true;
+    }
+
+    esp_err_t err = esp_ota_write(ota_handle_, data, size);
+    if (err != ESP_OK) {
+        SetErrorAndAbort("esp_ota_write failed.", AppUpdater::Status::kErrorWriteFailed, err);
+        return AppUpdater::Status::kErrorWriteFailed;
+    }
+    bytes_written_ += size;
+    if (inactivity_timeout_ms_ > 0) {
+        last_activity_timestamp_ms_ = pdTICKS_TO_MS(xTaskGetTickCount());
+    }
+    return AppUpdater::Status::kSuccess;
+}
+
+AppUpdater::Status AppUpdater::PlatformUpdater::End() {
+    if (current_state_ != AppUpdater::State::kReceivingData) {
+        ESP_LOGE(kImplTag, "End called in invalid state: %d", static_cast<int>(current_state_));
+        return AppUpdater::Status::kErrorInvalidState;
+    }
+    if (!CheckInactivityTimeout()) {
+        return AppUpdater::Status::kErrorTimeout;
+    }
+    
+    SetState(AppUpdater::State::kFinalizing);
+    ESP_LOGI(kImplTag, "Finalizing update. Bytes written: %zu. Expected size: 0x%zx", bytes_written_, total_image_size_);
+
+    if (total_image_size_ != OTA_SIZE_UNKNOWN && bytes_written_ != total_image_size_) {
+        char err_msg[150];
+        snprintf(err_msg, sizeof(err_msg), "Image size mismatch. Expected 0x%zx, got %zu.", total_image_size_, bytes_written_);
+        SetErrorAndAbort(err_msg, AppUpdater::Status::kErrorImageSizeMismatch);
+        return AppUpdater::Status::kErrorImageSizeMismatch;
+    }
+    if (ota_handle_ == 0) {
+        SetErrorAndAbort("End called but OTA handle is invalid.", AppUpdater::Status::kErrorInvalidState);
+        return AppUpdater::Status::kErrorInvalidState;
+    }
+
+    esp_err_t err = esp_ota_end(ota_handle_);
+    esp_ota_handle_t temp_handle = ota_handle_;
+    ota_handle_ = 0; // Handle is now invalid.
+
+    if (err != ESP_OK) {
+        SetErrorAndAbort("esp_ota_end failed. Image may be invalid or for a different chip.", AppUpdater::Status::kErrorOtaEndFailed, err);
+        return AppUpdater::Status::kErrorOtaEndFailed;
+    }
+    ESP_LOGI(kImplTag, "esp_ota_end succeeded for handle %p. Platform-level validation passed.", (void*)temp_handle);
+    SetState(AppUpdater::State::kReadyToApply);
+    return AppUpdater::Status::kSuccess;
+}
+
+AppUpdater::Status AppUpdater::PlatformUpdater::Apply(std::function<void()> pre_restart_hook) {
+    if (current_state_ != AppUpdater::State::kReadyToApply) {
+        ESP_LOGE(kImplTag, "Apply called in invalid state: %d", static_cast<int>(current_state_));
+        return AppUpdater::Status::kErrorInvalidState;
+    }
+    if (update_partition_ == nullptr) {
+        SetErrorAndAbort("Apply called but no valid update partition is set.", AppUpdater::Status::kErrorInvalidState);
+        return AppUpdater::Status::kErrorInvalidState;
+    }
+
+    SetState(AppUpdater::State::kApplying);
+    ESP_LOGI(kImplTag, "Applying update to partition: %s", update_partition_->label);
+
+    esp_err_t err = esp_ota_set_boot_partition(update_partition_);
+    if (err != ESP_OK) {
+        SetErrorAndAbort("esp_ota_set_boot_partition failed.", AppUpdater::Status::kErrorSetBootPartitionFailed, err);
+        return AppUpdater::Status::kErrorSetBootPartitionFailed;
+    }
+    ESP_LOGI(kImplTag, "Boot partition set successfully.");
+
+    if (pre_restart_hook) {
+        ESP_LOGI(kImplTag, "Executing pre-restart hook...");
+        pre_restart_hook();
+        ESP_LOGI(kImplTag, "Pre-restart hook finished.");
+    }
+
+    ESP_LOGI(kImplTag, "Rebooting device now...");
+    esp_restart();
+
+    // Should not be reached
+    SetErrorAndAbort("esp_restart was called but device did not reboot.", AppUpdater::Status::kErrorRebootFailed);
+    return AppUpdater::Status::kErrorRebootFailed;
+}
+
+void AppUpdater::PlatformUpdater::Reset() {
+    ESP_LOGW(kImplTag, "PlatformUpdater::Reset called. Current state: %d", static_cast<int>(current_state_));
+    if (ota_handle_ != 0) {
+        ESP_LOGI(kImplTag, "Aborting active OTA handle %p during reset.", (void*)ota_handle_);
+        esp_ota_abort(ota_handle_);
+        ota_handle_ = 0;
+    }
+    ResetInternalState();
+
+    if (user_reset_hook_) {
+        ESP_LOGI(kImplTag, "Executing user-provided reset hook.");
+        user_reset_hook_();
+    }
+}
+
+AppUpdater::PartitionInfo AppUpdater::PlatformUpdater::GetRunningPartitionInfo() const {
+    return ToPartitionInfo(esp_ota_get_running_partition());
+}
+
+AppUpdater::PartitionInfo AppUpdater::PlatformUpdater::GetNextBootPartitionInfo() const {
+    return ToPartitionInfo(esp_ota_get_boot_partition());
+}
+
+// --- Public AppUpdater methods forwarding to the implementation ---
+
+AppUpdater::AppUpdater() : impl_(std::make_unique<PlatformUpdater>()) {}
+AppUpdater::~AppUpdater() = default;
+AppUpdater::AppUpdater(AppUpdater&&) noexcept = default;
+AppUpdater& AppUpdater::operator=(AppUpdater&&) noexcept = default;
+
+// --- Static Method Definition ---
+const char* AppUpdater::StatusToString(AppUpdater::Status status) {
+  static char unknown_buf[40];
+  switch (status) {
+    case AppUpdater::Status::kSuccess: return "SUCCESS";
+    case AppUpdater::Status::kErrorAlreadyInProgress: return "ERROR_ALREADY_IN_PROGRESS";
+    case AppUpdater::Status::kErrorNotIdle: return "ERROR_NOT_IDLE";
+    case AppUpdater::Status::kErrorInvalidState: return "ERROR_INVALID_STATE";
+    case AppUpdater::Status::kErrorMetadataInvalid: return "ERROR_METADATA_INVALID";
+    case AppUpdater::Status::kErrorPartitionNotFound: return "ERROR_PARTITION_NOT_FOUND";
+    case AppUpdater::Status::kErrorOtaBeginFailed: return "ERROR_OTA_BEGIN_FAILED";
+    case AppUpdater::Status::kErrorWriteFailed: return "ERROR_WRITE_FAILED";
+    case AppUpdater::Status::kErrorImageSizeMismatch: return "ERROR_IMAGE_SIZE_MISMATCH";
+    case AppUpdater::Status::kErrorOtaEndFailed: return "ERROR_OTA_END_FAILED";
+    case AppUpdater::Status::kErrorSetBootPartitionFailed: return "ERROR_SET_BOOT_PARTITION_FAILED";
+    case AppUpdater::Status::kErrorRebootFailed: return "ERROR_REBOOT_FAILED";
+    case AppUpdater::Status::kErrorInvalidArgument: return "ERROR_INVALID_ARGUMENT";
+    case AppUpdater::Status::kErrorCancelled: return "ERROR_CANCELLED";
+    case AppUpdater::Status::kErrorTimeout: return "ERROR_TIMEOUT";
+    case AppUpdater::Status::kErrorVersionIdentical: return "ERROR_VERSION_IDENTICAL";
+    case AppUpdater::Status::kErrorGeneric: return "ERROR_GENERIC";
+    default:
+      snprintf(unknown_buf, sizeof(unknown_buf), "UNKNOWN_STATUS_CODE(%d)", static_cast<int>(status));
+      return unknown_buf;
+  }
+}
+
+AppUpdater::Status AppUpdater::MarkBootSuccessful() {
+    ESP_LOGI("AppUpdater", "Static MarkBootSuccessful: Attempting to mark current boot as successful.");
+    const esp_partition_t *running_partition = esp_ota_get_running_partition();
+    if (!running_partition) {
+        ESP_LOGE("AppUpdater", "Static MarkBootSuccessful: Could not get running partition.");
+        return AppUpdater::Status::kErrorGeneric;
+    }
+    esp_ota_img_states_t ota_state;
+    esp_err_t err = esp_ota_get_state_partition(running_partition, &ota_state);
+    if (err != ESP_OK) {
+        ESP_LOGE("AppUpdater", "Static MarkBootSuccessful: Failed to get OTA state (err=0x%x).", err);
+        return AppUpdater::Status::kErrorGeneric;
+    }
+    ESP_LOGI("AppUpdater", "Static MarkBootSuccessful: Current OTA state: %d", ota_state);
+    if (ota_state == ESP_OTA_IMG_PENDING_VERIFY) {
+        ESP_LOGI("AppUpdater", "Static MarkBootSuccessful: App is PENDING_VERIFY. Marking valid.");
+        err = esp_ota_mark_app_valid_cancel_rollback();
+        if (err != ESP_OK) {
+            ESP_LOGE("AppUpdater", "Static MarkBootSuccessful: esp_ota_mark_app_valid_cancel_rollback failed (err=0x%x).", err);
+            return AppUpdater::Status::kErrorGeneric;
+        }
+        ESP_LOGI("AppUpdater", "Static MarkBootSuccessful: Successfully marked app as valid.");
+    } else {
+        ESP_LOGI("AppUpdater", "Static MarkBootSuccessful: App not PENDING_VERIFY (state: %d). No action needed.", ota_state);
+    }
+    return AppUpdater::Status::kSuccess;
+}
+
+// --- Forwarding Method Implementations ---
+void AppUpdater::SetResetHook(std::function<void()> hook) { impl_->SetResetHook(hook); }
+
+// *** FIX: Implement the overloaded Begin methods. ***
+AppUpdater::Status AppUpdater::Begin(const Metadata& metadata, const BeginConfig& config) {
+    return impl_->Begin(metadata, config);
+}
+
+// This new overload provides the default behavior cleanly.
+AppUpdater::Status AppUpdater::Begin(const Metadata& metadata) {
+    return impl_->Begin(metadata, BeginConfig{});
+}
+
+AppUpdater::Status AppUpdater::Write(const uint8_t* data, size_t size) { return impl_->Write(data, size); }
+AppUpdater::Status AppUpdater::End() { return impl_->End(); }
+AppUpdater::Status AppUpdater::Apply(std::function<void()> pre_restart_hook) { return impl_->Apply(pre_restart_hook); }
+void AppUpdater::Reset() { impl_->Reset(); }
+AppUpdater::State AppUpdater::GetState() const { return impl_->GetState(); }
+std::string AppUpdater::GetLastError() const { return impl_->GetLastError(); }
+size_t AppUpdater::GetBytesWritten() const { return impl_->GetBytesWritten(); }
+AppUpdater::PartitionInfo AppUpdater::GetRunningPartitionInfo() const { return impl_->GetRunningPartitionInfo(); }
+AppUpdater::PartitionInfo AppUpdater::GetNextBootPartitionInfo() const { return impl_->GetNextBootPartitionInfo(); }
+
+} // namespace platform
+
+
+-----------------------
+
+// main.cpp
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "nvs_flash.h"
+#include "esp_log.h"
+#include "esp_chip_info.h"
+#include "esp_app_format.h" // For esp_app_desc_t
+#include "esp_ota_ops.h"    // For esp_app_get_description
+
+// Include the header for our AppUpdater class
+#include "app_updater.h"
+
+#include <vector>
+#include <string>
+#include <cstring>
+
+static const char* TAG = "MAIN_APP";
+
+// --- DUMMY FIRMWARE GENERATION HELPERS (for demonstration) ---
+
+// This struct combines all necessary info to generate a fake firmware chunk
+struct DummyFirmwareConfig {
+    size_t total_size = 1024 * 50; // 50 KB dummy firmware
+    const char* version = "2.0.0";
+    esp_chip_model_t target_chip_id = CHIP_ESP32; // The chip this firmware is "for"
+};
+
+/**
+ * @brief Generates a chunk of a fake firmware image.
+ *
+ * This function creates a predictable data pattern and, more importantly,
+ * crafts a valid-looking `esp_image_header_t` and `esp_app_desc_t` in the
+ * first chunk, which is essential for the AppUpdater's validation logic.
+ *
+ * @param cfg The configuration for the dummy firmware.
+ * @param offset The starting offset of the chunk to generate.
+ * @param buffer The buffer to write the generated chunk into.
+ * @param buffer_size The size of the provided buffer.
+ * @return The number of bytes written to the buffer.
+ */
+size_t get_dummy_firmware_chunk(const DummyFirmwareConfig& cfg, size_t offset, uint8_t* buffer, size_t buffer_size) {
+    if (offset >= cfg.total_size) {
+        return 0; // No more data
+    }
+
+    size_t bytes_to_generate = std::min(buffer_size, cfg.total_size - offset);
+    
+    // Fill with placeholder data
+    for (size_t i = 0; i < bytes_to_generate; ++i) {
+        buffer[i] = static_cast<uint8_t>((offset + i) % 256);
+    }
+
+    // If we are generating the very first chunk, we must create a valid header
+    if (offset == 0 && bytes_to_generate >= sizeof(esp_image_header_t) + sizeof(esp_image_segment_header_t) + sizeof(esp_app_desc_t)) {
+        // 1. Image Header (at offset 0)
+        esp_image_header_t* hdr = reinterpret_cast<esp_image_header_t*>(buffer);
+        memset(hdr, 0, sizeof(esp_image_header_t));
+        hdr->magic = ESP_IMAGE_HEADER_MAGIC;
+        hdr->chip_id = cfg.target_chip_id; // <-- CRITICAL for compatibility check
+        hdr->segment_count = 1;
+
+        // 2. Segment Header (immediately after image header)
+        esp_image_segment_header_t* seg_hdr = reinterpret_cast<esp_image_segment_header_t*>(buffer + sizeof(esp_image_header_t));
+        memset(seg_hdr, 0, sizeof(esp_image_segment_header_t));
+        seg_hdr->load_addr = 0x40080000; // A plausible but fake load address
+        seg_hdr->data_len = cfg.total_size;
+
+        // 3. App Description (at offset 0x20 after the headers)
+        esp_app_desc_t* app_desc = reinterpret_cast<esp_app_desc_t*>(buffer + sizeof(esp_image_header_t) + sizeof(esp_image_segment_header_t));
+        memset(app_desc, 0, sizeof(esp_app_desc_t));
+        app_desc->magic_word = ESP_APP_DESC_MAGIC_WORD;
+        strncpy(app_desc->version, cfg.version, sizeof(app_desc->version) - 1);
+        strncpy(app_desc->project_name, "dummy-ota-firmware", sizeof(app_desc->project_name) - 1);
+    }
+
+    return bytes_to_generate;
+}
+
+// --- MAIN APPLICATION LOGIC ---
+
+/**
+ * @brief This function runs on every boot to check if the app is stable.
+ * In a real application, this would check critical systems (e.g., WiFi, sensors).
+ */
+bool perform_critical_self_tests() {
+    ESP_LOGI(TAG, "Performing critical self-tests...");
+    vTaskDelay(pdMS_TO_TICKS(1000)); // Simulate work
+    ESP_LOGI(TAG, "Self-tests PASSED.");
+    return true; // Return false to simulate a failed boot
+}
+
+/**
+ * @brief Helper function to drive the OTA write process.
+ */
+bool perform_update_write_cycle(platform::AppUpdater& updater, const DummyFirmwareConfig& fw_config) {
+    std::vector<uint8_t> chunk_buffer(4096);
+    while (true) {
+        size_t bytes_written = updater.GetBytesWritten();
+        size_t bytes_read = get_dummy_firmware_chunk(fw_config, bytes_written, chunk_buffer.data(), chunk_buffer.size());
+
+        if (bytes_read == 0) {
+            ESP_LOGI(TAG, "\nFirmware source finished.");
+            break; // End of "file"
+        }
+
+        platform::AppUpdater::Status write_status = updater.Write(chunk_buffer.data(), bytes_read);
+        if (write_status != platform::AppUpdater::Status::kSuccess) {
+            ESP_LOGE(TAG, "\nFATAL: Failed to write chunk! Status: %s", platform::AppUpdater::StatusToString(write_status));
+            ESP_LOGE(TAG, "Error Details: %s", updater.GetLastError().c_str());
+            return false;
+        }
+        printf("Progress: %zu / %zu bytes\r", updater.GetBytesWritten(), fw_config.total_size);
+    }
+    return true;
+}
+
+
+extern "C" void app_main(void) {
+    // --- 1. INITIALIZE SYSTEM ---
+    esp_err_t ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ret = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(ret);
+
+    // --- 2. BOOT VALIDATION (CRITICAL STEP) ---
+    // This code runs on *every* boot. If it's a new app just flashed via OTA,
+    // this step is what prevents a boot-loop if the new app is broken.
+    ESP_LOGI(TAG, "=================================================");
+    ESP_LOGI(TAG, "Step 1: Application Boot Validation");
+    ESP_LOGI(TAG, "=================================================");
+    if (perform_critical_self_tests()) {
+        // If tests pass, mark the app as valid. This cancels any pending rollback.
+        platform::AppUpdater::Status mark_status = platform::AppUpdater::MarkBootSuccessful();
+        if (mark_status == platform::AppUpdater::Status::kSuccess) {
+             ESP_LOGI(TAG, "Successfully marked application boot as successful.");
+        } else {
+            ESP_LOGE(TAG, "Failed to mark boot as successful. This is a critical error!");
+        }
+    } else {
+        ESP_LOGE(TAG, "Critical self-tests FAILED! Not marking boot as successful. Device may auto-rollback.");
+        // To force an immediate rollback, you could call `esp_ota_mark_app_invalid_rollback_and_reboot();`
+    }
+    vTaskDelay(pdMS_TO_TICKS(2000));
+
+    // Get info about the hardware we are actually running on
+    esp_chip_info_t current_chip_info;
+    esp_chip_info(&current_chip_info);
+
+    const esp_app_desc_t* current_app_desc = esp_app_get_description();
+    ESP_LOGI(TAG, "Current App Version: %s", current_app_desc->version);
+    ESP_LOGI(TAG, "Running on chip: %s", CONFIG_IDF_TARGET);
+
+
+    // --- 3. OTA UPDATE DEMONSTRATIONS ---
+    platform::AppUpdater updater;
+
+    // A flag to check if our callback was triggered
+    bool reset_hook_was_called = false;
+    updater.SetResetHook([&reset_hook_was_called]() {
+        ESP_LOGW(TAG, "!!! Custom Reset Hook has been EXECUTED! !!!");
+        reset_hook_was_called = true;
+    });
+
+
+    // --- SCENARIO 1: Successful Update ---
+    ESP_LOGI(TAG, "\n\n=================================================");
+    ESP_LOGI(TAG, "Scenario 1: Successful OTA Update");
+    ESP_LOGI(TAG, "=================================================");
+    vTaskDelay(pdMS_TO_TICKS(2000));
+    {
+        // A. Configure Metadata for the new firmware
+        platform::AppUpdater::Metadata metadata;
+        metadata.version_string = "2.0.0-release";
+
+        DummyFirmwareConfig fw_config;
+        fw_config.version = metadata.version_string.c_str();
+        fw_config.total_size = 1024 * 60; // 60KB
+        fw_config.target_chip_id = current_chip_info.model; // Firmware is for the CORRECT chip
+
+        metadata.image_size = fw_config.total_size;
+
+        // B. Begin the update
+        platform::AppUpdater::Status begin_status = updater.Begin(metadata);
+
+        if (begin_status == platform::AppUpdater::Status::kSuccess) {
+            ESP_LOGI(TAG, "Begin() successful. State is: %d (kReceivingData)", updater.GetState());
+
+            // C. Write the firmware data in a loop
+            if (perform_update_write_cycle(updater, fw_config)) {
+                // D. Finalize the update (verifies integrity)
+                platform::AppUpdater::Status end_status = updater.End();
+                if (end_status == platform::AppUpdater::Status::kSuccess) {
+                    ESP_LOGI(TAG, "End() successful! Firmware is valid and ready.");
+                    ESP_LOGI(TAG, "State is: %d (kReadyToApply)", updater.GetState());
+
+                    // E. Apply the update (this will reboot the device)
+                    ESP_LOGW(TAG, "Applying update in 5 seconds... device will reboot into the new app.");
+                    vTaskDelay(pdMS_TO_TICKS(5000));
+
+                    updater.Apply([]() {
+                        // This is a pre-restart hook. Good for last-minute cleanup.
+                        ESP_LOGW(TAG, "Pre-restart hook executing! Cleaning up...");
+                    });
+
+                    // THIS LINE SHOULD NEVER BE REACHED
+                    ESP_LOGE(TAG, "Error: updater.Apply() returned. Reboot failed.");
+
+                } else {
+                    ESP_LOGE(TAG, "End() failed! Status: %s", platform::AppUpdater::StatusToString(end_status));
+                    ESP_LOGE(TAG, "Error Details: %s", updater.GetLastError().c_str());
+                }
+            }
+        } else {
+            ESP_LOGE(TAG, "Begin() failed! Status: %s", platform::AppUpdater::StatusToString(begin_status));
+            ESP_LOGE(TAG, "Error Details: %s", updater.GetLastError().c_str());
+        }
+    }
+    // In a real application, the code would stop here due to the reboot from Apply().
+    // For this multi-scenario demo, we will pretend the reboot didn't happen and continue.
+    // We must manually reset the updater to simulate a fresh start.
+    ESP_LOGI(TAG, "--- End of Scenario 1 (simulation continues) ---");
+    updater.Reset();
+    reset_hook_was_called = false;
+
+
+    // --- SCENARIO 2: Failed Update (Chip Mismatch) ---
+    ESP_LOGI(TAG, "\n\n=================================================");
+    ESP_LOGI(TAG, "Scenario 2: Failed OTA - Chip Mismatch");
+    ESP_LOGI(TAG, "=================================================");
+    vTaskDelay(pdMS_TO_TICKS(4000));
+    {
+        // A. Configure metadata for firmware targeting the WRONG chip
+        platform::AppUpdater::Metadata metadata = {};
+        DummyFirmwareConfig fw_config = {};
+        
+        // Find a different chip model to simulate incompatibility
+        esp_chip_model_t wrong_chip_id = (current_chip_info.model == CHIP_ESP32) ? CHIP_ESP32S3 : CHIP_ESP32;
+        
+        fw_config.target_chip_id = wrong_chip_id;
+        metadata.image_size = fw_config.total_size;
+
+        ESP_LOGW(TAG, "Attempting to flash firmware for chip ID %d on a device that is chip ID %d.",
+                 wrong_chip_id, current_chip_info.model);
+
+        // B. Begin the update (should succeed)
+        if (updater.Begin(metadata) == platform::AppUpdater::Status::kSuccess) {
+            // C. Write loop (should FAIL on the first write)
+            perform_update_write_cycle(updater, fw_config);
+
+            // D. Check the final state
+            if (updater.GetState() == platform::AppUpdater::State::kError) {
+                ESP_LOGI(TAG, "SUCCESS (test passed): Update failed as expected due to chip mismatch.");
+                ESP_LOGI(TAG, "Final Status: %s", platform::AppUpdater::StatusToString(platform::AppUpdater::Status::kErrorMetadataInvalid));
+                ESP_LOGI(TAG, "Final Error Message: %s", updater.GetLastError().c_str());
+            } else {
+                ESP_LOGE(TAG, "FAILURE (test failed): Update did not fail as expected.");
+            }
+        }
+        // An error automatically triggers an abort. We call Reset() to run the hook and return to Idle.
+        updater.Reset(); 
+        ESP_LOGI(TAG, "Was the reset hook called? %s", reset_hook_was_called ? "Yes" : "No");
+    }
+    reset_hook_was_called = false;
+
+
+    // --- SCENARIO 3: Failed Update (Timeout) ---
+    ESP_LOGI(TAG, "\n\n=================================================");
+    ESP_LOGI(TAG, "Scenario 3: Failed OTA - Inactivity Timeout");
+    ESP_LOGI(TAG, "=================================================");
+    vTaskDelay(pdMS_TO_TICKS(4000));
+    {
+        platform::AppUpdater::Metadata metadata = {};
+        metadata.image_size = 1024 * 50;
+
+        platform::AppUpdater::BeginConfig config = {};
+        config.inactivity_timeout_ms = 5000; // 5-second timeout
+
+        ESP_LOGI(TAG, "Beginning update with a %lu ms timeout.", config.inactivity_timeout_ms);
+        if (updater.Begin(metadata, config) == platform::AppUpdater::Status::kSuccess) {
+            ESP_LOGI(TAG, "Begin successful. Now waiting for longer than the timeout...");
+            vTaskDelay(pdMS_TO_TICKS(6000)); // Wait for 6 seconds
+
+            ESP_LOGI(TAG, "Attempting to write data after timeout has occurred...");
+            platform::AppUpdater::Status write_status = updater.Write((const uint8_t*)"data", 4);
+            
+            if (write_status == platform::AppUpdater::Status::kErrorTimeout) {
+                ESP_LOGI(TAG, "SUCCESS (test passed): Write failed as expected with kErrorTimeout.");
+                ESP_LOGI(TAG, "Final Error Message: %s", updater.GetLastError().c_str());
+            } else {
+                ESP_LOGE(TAG, "FAILURE (test failed): Write did not fail with timeout. Status: %s", platform::AppUpdater::StatusToString(write_status));
+            }
+        }
+        // Timeout automatically calls the reset hook if one is registered.
+        ESP_LOGI(TAG, "Was the reset hook called? %s", reset_hook_was_called ? "Yes" : "No");
+    }
+
+    ESP_LOGI(TAG, "\n\nAll scenarios complete. Entering idle loop.");
+}
