@@ -256,3 +256,84 @@ std::strong_ordering SemVer::ComparePreReleaseTags(
 
   return left_parts.size() <=> right_parts.size();
 }
+
+---------------------------
+
+#include <cassert>
+#include <iostream>
+#include <vector>
+
+#include "semver.h"
+
+// Helper function to print the state of a SemVer object for demonstration.
+void PrintVersionDetails(const std::string& name, const SemVer& version) {
+  std::cout << "--- " << name << " (\"" << version.GetOriginalString()
+            << "\") ---\n";
+  std::cout << "  Is Valid: " << (version.IsValid() ? "Yes" : "No") << "\n";
+  std::cout << "  Normalized: " << version.ToString() << "\n";
+
+  // Safely access the numeric components only if the version is valid.
+  if (version.IsValid()) {
+    std::cout << "  Major: " << version.major.value() << "\n";
+    std::cout << "  Minor: " << version.minor.value() << "\n";
+    std::cout << "  Patch: " << version.patch.value() << "\n";
+    if (version.pre_release_tag) {
+      std::cout << "  Pre-release: " << *version.pre_release_tag << "\n";
+    }
+  }
+  std::cout << std::endl;
+}
+
+int main() {
+  std::cout << "## 1. Creating and Validating Versions ##\n\n";
+
+  SemVer v_valid("1.2.3-rc.1+build.456");
+  SemVer v_incomplete("2.4");
+  SemVer v_invalid("not-a-version");
+
+  PrintVersionDetails("Valid Version", v_valid);
+  PrintVersionDetails("Incomplete Version", v_incomplete);
+  PrintVersionDetails("Invalid Version", v_invalid);
+
+  std::cout << "## 2. Comparing Versions ##\n\n";
+
+  SemVer v1("1.0.0");
+  SemVer v2("2.0.0");
+  SemVer v3("2.1.0");
+  SemVer v4("2.1.1");
+
+  std::cout << "Comparing " << v1.ToString() << " and " << v2.ToString()
+            << ": " << (v1 < v2 ? "Correct (1.0.0 < 2.0.0)" : "Incorrect")
+            << std::endl;
+  assert(v1 < v2);
+  assert(v2 < v3);
+  assert(v3 < v4);
+
+  std::cout << "\n## 3. SemVer Precedence Rules ##\n\n";
+
+  SemVer normal_release("1.0.0");
+  SemVer rc_release("1.0.0-rc.1");
+  SemVer beta_release("1.0.0-beta.11");
+  SemVer alpha_release("1.0.0-alpha");
+
+  std::cout << "Correct Precedence Order:\n"
+            << alpha_release.ToString() << " < " << beta_release.ToString()
+            << " < " << rc_release.ToString() << " < "
+            << normal_release.ToString() << std::endl;
+
+  // Assertions to prove the comparison logic works correctly.
+  assert(alpha_release < beta_release);
+  assert(beta_release < rc_release);
+  assert(rc_release < normal_release);
+
+  // Test numeric identifiers in pre-release tags.
+  SemVer rc2("1.0.0-rc.2");
+  SemVer rc10("1.0.0-rc.10");
+  std::cout << "Comparing numeric pre-release: " << rc2.ToString() << " < "
+            << rc10.ToString() << std::endl;
+  assert(rc2 < rc10);
+
+  std::cout << "\nAll comparison tests passed!\n" << std::endl;
+
+  return 0;
+}
