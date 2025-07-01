@@ -1,0 +1,398 @@
+#ifndef SYNC_MODULE_DATA_SYNC_MANAGER_H_
+#define SYNC_MODULE_DATA_SYNC_MANAGER_H_
+
+/**
+ * @file data_sync_manager.h
+ * @brief Defines a generic, heap-free, and thread-safe C++ module for
+ * tracking and synchronizing field-level data changes in an object.
+ * @author Gemini
+ * @date 2025-06-25
+ */
+
+#include <cstdint>  // For uint64_t
+#include <array>    // For std::array
+#include <mutex>    // For std::mutex and std::lock_guard
+
+/**
+ * @brief Contains all components for the reusable synchronization module.
+ */
+namespace sync_module {
+
+/**
+ * @brief Manages the state of a POD object for efficient data synchronization.
+ *
+ * This class is designed for constrained environments like embedded and real-time
+ * systems where heap allocation is discouraged. It is thread-safe and tracks
+ * changes to individual fields within a data object using a bitmask. This allows
+ * transport layers to send only minimal "delta" payloads.
+ *
+ * It uses a visitor pattern to report changes, ensuring that the manager itself
+ * performs no dynamic memory allocation.
+ *
+ * @tparam ObjectType The user's data struct type (e.g., DeviceStatus).
+ * @tparam SchemaType The user's schema definition, which must provide:
+ * - `enum Field { ... }`
+ * - `constexpr size_t kFieldCount`
+ * - `using DirtyMask = std::array<uint64_t, N>`
+ * - `static void ApplySyncedField(...)`
+ */
+template <typename ObjectType, typename SchemaType>
+class DataSyncManager {
+ public:
+  /// @brief The type used for the dirty field bitmask, defined in the Schema.
+  using DirtyMask = typename SchemaType::DirtyMask;
+
+  /**
+   * @brief Constructs the manager, initializing all data to a zeroed state.
+   */
+  DataSyncManager() {
+    current_data_ = {};
+    synced_data_ = {};
+    for (auto& chunk : dirty_mask_) {
+      chunk = 0;
+    }
+  }
+
+  DataSyncManager(const DataSyncManager&) = delete;
+  DataSyncManager& operator=(const DataSyncManager&) = delete;
+
+  /**
+   * @brief Updates a specific field in the managed data object.
+   *
+   * If the new value is different from the current value, the field is updated
+   * in the internal state and marked as "dirty" in the bitmask.
+   *
+   * @tparam MemberType The data type of the struct member being updated.
+   * @param field_ptr A pointer-to-member for the field to update (e.g.,
+   * `&DeviceStatus::battery_level`).
+   * @param new_value The new value for the specified field.
+   * @param field_index The enum value from the Schema corresponding to the
+   * field.
+   */
+  template <typename MemberType>
+  void UpdateField(MemberType ObjectType::*field_ptr,
+                   const MemberType& new_value,
+                   typename SchemaType::Field field_index) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (current_data_.*field_ptr != new_value) {
+      current_data_.*field_ptr = new_value;
+      SetDirtyBit(static_cast<size_t>(field_index));
+    }
+  }
+
+  /**
+   * @brief Gets a thread-safe copy of the complete current data object.
+   * @note This is ideal for transports like BLE that require the full current
+   * state, not just the delta.
+   * @return A copy of the current data object.
+   */
+  ObjectType GetCurrentData() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return current_data_;
+  }
+
+  /**
+   * @brief Iterates over all changed fields and calls a visitor for each one.
+   *
+   * @note This method is the core of the delta-extraction mechanism. It uses
+   * the Visitor Pattern to avoid heap allocation. The caller provides the
+   * logic (the "visitor"), and this function executes it for each
+   * "dirty" field.
+   *
+   * @tparam Visitor A callable object (e.g., a lambda) with the signature:
+   * `void(typename SchemaType::Field, const ObjectType&)`
+   * @param visitor The visitor function to call for each dirty field.
+   * @return A bitmask representing the fields that were passed to the visitor.
+   */
+  template <typename Visitor>
+  DirtyMask VisitChangedFields(Visitor& visitor) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    DirtyMask processed_mask{};  // Zero-initialized
+
+    for (size_t i = 0; i < SchemaType::kFieldCount; ++i) {
+      if (IsBitDirty(i)) {
+        visitor(static_cast<typename SchemaType::Field>(i), current_data_);
+        // Set the corresponding bit in the mask of fields we are reporting.
+        const size_t chunk_index = i / 64;
+        const size_t bit_index = i % 64;
+        processed_mask[chunk_index] |= (static_cast<uint64_t>(1) << bit_index);
+      }
+    }
+    return processed_mask;
+  }
+
+  /**
+   * @brief Marks fields as synchronized based on a provided bitmask.
+   *
+   * This function is called by the transport layer after a successful data
+   * transmission. It updates the internal `synced_data_` state to match the
+   * `current_data_` for the synced fields, and clears the corresponding dirty
+   * bits.
+   *
+   * @param synced_mask A bitmask of fields that were successfully sent and
+   * acknowledged by the remote endpoint.
+   */
+  void MarkAsSynced(const DirtyMask& synced_mask) {
+    std::lock_guard<std::mutex> lock(mutex_);
+
+    // For each field that was confirmed as synced, update our `synced_data_`.
+    for (size_t i = 0; i < SchemaType::kFieldCount; ++i) {
+      const size_t chunk_index = i / 64;
+      const size_t bit_index = i % 64;
+      if ((synced_mask[chunk_index] >> bit_index) & 1) {
+        // This requires the user-provided helper to map a runtime index to
+        // a compile-time member.
+        SchemaType::ApplySyncedField(
+            synced_data_, current_data_,
+            static_cast<typename SchemaType::Field>(i));
+      }
+    }
+
+    // Clear the bits for the synced fields from our dirty mask.
+    for (size_t i = 0; i < synced_mask.size(); ++i) {
+      if (synced_mask[i] != 0) {
+        dirty_mask_[i] &= ~synced_mask[i];
+      }
+    }
+  }
+
+ private:
+  /// @brief Sets a single bit in the dirty mask array.
+  void SetDirtyBit(size_t field_index) {
+    const size_t chunk_index = field_index / 64;
+    const size_t bit_index = field_index % 64;
+    dirty_mask_[chunk_index] |= (static_cast<uint64_t>(1) << bit_index);
+  }
+
+  /// @brief Checks if a single bit is set in the dirty mask array.
+  bool IsBitDirty(size_t field_index) const {
+    const size_t chunk_index = field_index / 64;
+    const size_t bit_index = field_index % 64;
+    return (dirty_mask_[chunk_index] >> bit_index) & 1;
+  }
+
+  ObjectType current_data_;  ///< The current, live state of the data object.
+  ObjectType synced_data_;   ///< The state last confirmed as synced.
+  DirtyMask dirty_mask_;     ///< The bitmask tracking changed fields.
+  std::mutex mutex_;         ///< Mutex to protect access to all members.
+};
+
+}  // namespace sync_module
+
+#endif  // SYNC_MODULE_DATA_SYNC_MANAGER_H_
+
+-------------------------------
+
+#ifndef MY_APP_DEVICE_STATUS_H_
+#define MY_APP_DEVICE_STATUS_H_
+
+/**
+ * @file device_status.h
+ * @brief Defines the DeviceStatus data model and its synchronization schema.
+ */
+
+#include <cstdint>
+#include <array>
+
+/**
+ * @brief Contains all components specific to the example application.
+ */
+namespace my_app {
+
+/**
+ * @brief Example data structure to be synchronized.
+ * @note Struct members follow Google style (snake_case) for non-class types.
+ */
+struct DeviceStatus {
+  bool is_connected;        ///< Network connectivity status.
+  int8_t wifi_strength;     ///< WiFi signal strength in dBm.
+  uint8_t battery_level;    ///< Battery charge level percentage.
+  uint32_t uptime_seconds;  ///< Device uptime in seconds.
+  float core_voltage;       ///< CPU core voltage.
+};
+
+/**
+ * @brief Defines the schema for the DeviceStatus struct.
+ * @note This user-provided schema links the data struct to the manager.
+ */
+namespace device_status_schema {
+
+/**
+ * @enum Field
+ * @brief Enumerates the fields in DeviceStatus for type-safe indexing.
+ */
+enum Field {
+  kIsConnected = 0,    ///< Index for the is_connected field.
+  kWifiStrength = 1,   ///< Index for the wifi_strength field.
+  kBatteryLevel = 2,   ///< Index for the battery_level field.
+  kUptimeSeconds = 3,  ///< Index for the uptime_seconds field.
+  kCoreVoltage = 4,    ///< Index for the core_voltage field.
+};
+
+/// @brief The total number of fields in the DeviceStatus struct.
+constexpr size_t kFieldCount = 5;
+
+/// @brief The number of uint64_t chunks needed for the bitmask.
+constexpr size_t kMaskChunks = (kFieldCount + 63) / 64;
+
+/// @brief The specific bitmask type for the DeviceStatus object.
+using DirtyMask = std::array<uint64_t, kMaskChunks>;
+
+/**
+ * @brief A mandatory helper function to copy a single field's value.
+ * @note This function is required to map a runtime field index to a
+ * compile-time member access, which is necessary for `MarkAsSynced`.
+ * @param[out] synced The destination struct (`synced_data_`).
+ * @param[in] current The source struct (`current_data_`).
+ * @param field The enum identifier of the field to copy.
+ */
+inline void ApplySyncedField(DeviceStatus& synced, const DeviceStatus& current,
+                             Field field) {
+  switch (field) {
+    case kIsConnected:
+      synced.is_connected = current.is_connected;
+      break;
+    case kWifiStrength:
+      synced.wifi_strength = current.wifi_strength;
+      break;
+    case kBatteryLevel:
+      synced.battery_level = current.battery_level;
+      break;
+    case kUptimeSeconds:
+      synced.uptime_seconds = current.uptime_seconds;
+      break;
+    case kCoreVoltage:
+      synced.core_voltage = current.core_voltage;
+      break;
+  }
+}
+
+}  // namespace device_status_schema
+}  // namespace my_app
+
+#endif  // MY_APP_DEVICE_STATUS_H_
+
+---------------------------
+
+/**
+ * @file main.cc
+ * @brief Main application entry point demonstrating the DataSyncManager.
+ */
+
+#include <cstdio>
+#include <iostream>
+
+#include "data_sync_manager.h"
+#include "device_status.h"
+
+namespace my_app {
+
+/**
+ * @brief An example transport layer that sends changed data to a "cloud".
+ */
+class CloudTransport {
+ public:
+  /**
+   * @brief Finds changed data using the manager and "sends" it.
+   * @param manager The synchronization manager instance for DeviceStatus.
+   */
+  void SyncChangedData(
+      sync_module::DataSyncManager<DeviceStatus, device_status_schema>& manager) {
+    // Use a stack-allocated buffer to avoid heap usage for the payload.
+    std::array<char, 256> payload_buffer{};
+    int current_size = 0;
+
+    current_size +=
+        snprintf(payload_buffer.data(), payload_buffer.size(), "{");
+
+    // Define the visitor that serializes each changed field into the buffer.
+    auto visitor = [&](device_status_schema::Field field,
+                       const DeviceStatus& current) {
+      switch (field) {
+        case device_status_schema::kIsConnected:
+          current_size += snprintf(
+              payload_buffer.data() + current_size,
+              payload_buffer.size() - current_size, "\"connected\":%s,",
+              current.is_connected ? "true" : "false");
+          break;
+        case device_status_schema::kWifiStrength:
+          current_size += snprintf(payload_buffer.data() + current_size,
+                                   payload_buffer.size() - current_size,
+                                   "\"wifi\":%d,", current.wifi_strength);
+          break;
+        case device_status_schema::kBatteryLevel:
+          current_size += snprintf(payload_buffer.data() + current_size,
+                                   payload_buffer.size() - current_size,
+                                   "\"battery\":%d,", current.battery_level);
+          break;
+        case device_status_schema::kUptimeSeconds:
+          current_size += snprintf(payload_buffer.data() + current_size,
+                                   payload_buffer.size() - current_size,
+                                   "\"uptime\":%u,", current.uptime_seconds);
+          break;
+        case device_status_schema::kCoreVoltage:
+          current_size += snprintf(payload_buffer.data() + current_size,
+                                   payload_buffer.size() - current_size,
+                                   "\"voltage\":%.2f,", current.core_voltage);
+          break;
+      }
+    };
+
+    // The manager calls our visitor for each dirty field.
+    device_status_schema::DirtyMask processed_mask =
+        manager.VisitChangedFields(visitor);
+
+    if (processed_mask[0] == 0) {  // Simple check for the first chunk.
+      std::cout << "CloudTransport: No changes to sync." << std::endl;
+      return;
+    }
+
+    if (current_size > 1) {  // Finalize JSON string.
+      payload_buffer[current_size - 1] = '}';
+      payload_buffer[current_size] = '\0';
+    } else {
+      snprintf(payload_buffer.data(), payload_buffer.size(), "{}");
+    }
+
+    std::cout << "CloudTransport: Sending delta payload: "
+              << payload_buffer.data() << std::endl;
+
+    // Simulate a successful network transmission and mark as synced.
+    manager.MarkAsSynced(processed_mask);
+    std::cout << "CloudTransport: Sync successful." << std::endl;
+  }
+};
+
+} // namespace my_app
+
+/**
+ * @brief Main entry point for the demonstration.
+ */
+int main() {
+  // All objects are created on the stack. No heap allocation occurs.
+  sync_module::DataSyncManager<my_app::DeviceStatus,
+                                 my_app::device_status_schema>
+      status_manager;
+  my_app::CloudTransport cloud_transport;
+
+  std::cout << "--- CYCLE 1: Initial update ---" << std::endl;
+  // Use pointer-to-member syntax for type-safe field updates.
+  status_manager.UpdateField(&my_app::DeviceStatus::battery_level, 98,
+                             my_app::device_status_schema::kBatteryLevel);
+  status_manager.UpdateField(&my_app::DeviceStatus::core_voltage, 1.1f,
+                             my_app::device_status_schema::kCoreVoltage);
+  cloud_transport.SyncChangedData(status_manager);
+
+  std::cout << "\n--- CYCLE 2: No changes ---" << std::endl;
+  cloud_transport.SyncChangedData(status_manager);
+
+  std::cout << "\n--- CYCLE 3: Change one value again and add another ---"
+            << std::endl;
+  status_manager.UpdateField(&my_app::DeviceStatus::battery_level, 97,
+                             my_app::device_status_schema::kBatteryLevel);
+  status_manager.UpdateField(&my_app::DeviceStatus::is_connected, true,
+                             my_app::device_status_schema::kIsConnected);
+  cloud_transport.SyncChangedData(status_manager);
+
+  return 0;
+}
