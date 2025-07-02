@@ -496,3 +496,34 @@ if _descriptor._USE_C_DESCRIPTORS == False:
   _OTASTATUS._serialized_end=1325
   _UPDATETYPE._serialized_start=1327
   _UPDATETYPE._serialized_end=1396
+
+-----------
+
+# generate_proto.py
+import grpc_tools.protoc
+import os
+
+def generate():
+    """Runs the protoc compiler programmatically."""
+    proto_file = 'local_ota.proto'
+    
+    if not os.path.exists(proto_file):
+        print(f"❌ Error: '{proto_file}' not found!")
+        return
+
+    print(f"Compiling '{proto_file}'...")
+
+    try:
+        # The command arguments are passed as a list to the main function
+        grpc_tools.protoc.main([
+            'grpc_tools.protoc',
+            f'--proto_path=.',
+            f'--python_out=.',
+            proto_file,
+        ])
+        print(f"✅ Successfully generated local_ota_pb2.py")
+    except Exception as e:
+        print(f"❌ Failed to generate protobuf code: {e}")
+
+if __name__ == "__main__":
+    generate()
