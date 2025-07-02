@@ -1,0 +1,498 @@
+# main.py
+import sys
+import subprocess
+import os
+import json
+import importlib.util
+import asyncio
+
+# --- Dependency Checker ---
+def check_and_install_dependencies():
+    """
+    Checks if required packages are installed and attempts to install them if not.
+    """
+    required_packages = {
+        "bleak": "bleak",
+        "google.protobuf": "protobuf",
+        "crc": "crc"
+    }
+    missing_packages = []
+
+    for import_name, install_name in required_packages.items():
+        if importlib.util.find_spec(import_name) is None:
+            missing_packages.append(install_name)
+
+    if missing_packages:
+        print(f"⚠️  Missing required packages: {', '.join(missing_packages)}")
+        print("Attempting to install them automatically...")
+        
+        python_executable = sys.executable
+        try:
+            subprocess.check_call(
+                [python_executable, "-m", "pip", "install", *missing_packages],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL
+            )
+            print("✅ Packages installed successfully.")
+            print("   Please restart the script to continue.")
+            sys.exit(0)
+        except subprocess.CalledProcessError:
+            print(f"\n❌ Error: Failed to install packages automatically.")
+            print(f"   Please install them manually by running this command:")
+            print(f"   pip install {' '.join(missing_packages)}")
+            sys.exit(1)
+
+check_and_install_dependencies()
+
+# --- Main Application Code ---
+from logger_config import log
+from ble_manager import BLEManager, scan_and_select_device
+from ota_agent import OTA_Agent
+
+def load_config():
+    """Loads settings from config.json."""
+    config_path = "config.json"
+    if not os.path.exists(config_path):
+        log.critical(f"{config_path} not found! Please create it. Exiting.")
+        sys.exit(1)
+    
+    with open(config_path, 'r') as f:
+        data = json.load(f)
+    
+    # Flatten the nested JSON structure into a single config dictionary
+    # for easy access, matching the previous INI-based implementation.
+    config = data.get("OTA_METADATA", {})
+    config.update(data.get("FIRMWARE", {}))
+    return config
+
+def get_firmware_path(default_path: str) -> str | None:
+    """Prompts the user for the firmware file path and validates it."""
+    if not os.path.exists(default_path):
+        log.info(f"Creating a dummy 1MB firmware file: '{default_path}'...")
+        with open(default_path, "wb") as f:
+            f.write(os.urandom(1024 * 1024))
+
+    while True:
+        path = input(f"Enter path to firmware file (press Enter for '{default_path}'): ") or default_path
+        if os.path.exists(path):
+            return path
+        else:
+            log.error("File not found. Please enter a valid path.")
+            if input("Quit? (y/n): ").lower() == 'y':
+                return None
+
+async def main():
+    """Main function to run the OTA Central application."""
+    log.info("--- BLE OTA Update Central ---")
+    
+    config = load_config()
+    device = await scan_and_select_device()
+    if not device:
+        log.info("No device selected. Exiting.")
+        return
+
+    firmware_path = get_firmware_path(config.get('path'))
+    if not firmware_path:
+        log.info("No firmware file provided. Exiting.")
+        return
+
+    ble_manager = BLEManager(device)
+    try:
+        if await ble_manager.connect():
+            agent = OTA_Agent(ble_manager, firmware_path, config)
+            success = await agent.run_update()
+            if not success:
+                log.error("OTA process failed.")
+        else:
+            log.error(f"Could not connect to the device {device.address}.")
+    except Exception as e:
+        log.critical(f"An unexpected error occurred: {e}")
+    finally:
+        await ble_manager.disconnect()
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        log.info("Process interrupted by user.")
+
+------------------------
+
+# ota_agent.py
+import asyncio
+import hashlib
+import math
+import os
+import time
+
+from logger_config import log
+import local_ota_pb2 as ota_pb
+from ota_protocol import (
+    CONTROL_POINT_CHAR_UUID,
+    DATA_TRANSFER_CHAR_UUID,
+    STATUS_PROGRESS_CHAR_UUID,
+    create_packet,
+    parse_packet,
+)
+from ble_manager import BLEManager
+
+FIRMWARE_CHUNK_SIZE = 494
+
+class OTA_Agent:
+    """Manages the OTA update process using a BLEManager."""
+
+    def __init__(self, ble_manager: BLEManager, firmware_path: str, config: dict):
+        self.ble_manager = ble_manager
+        self.firmware_path = firmware_path
+        self.config = config
+        self.firmware_data = None
+        self.image_size = 0
+        self.total_chunks = 0
+        self.notification_queue = asyncio.Queue()
+
+    async def _notification_handler(self, sender_handle: int, data: bytearray):
+        log.debug(f"Received notification (handle: {sender_handle}): {data.hex()}")
+        packet = parse_packet(bytes(data))
+        if packet:
+            await self.notification_queue.put(packet)
+
+    async def _wait_for_ack(self, expected_chunk: int = None, timeout: float = 10.0) -> bool:
+        try:
+            packet = await asyncio.wait_for(self.notification_queue.get(), timeout)
+            if packet.msg_type != ota_pb.MSG_TYPE_OTA_ACK:
+                log.error(f"Expected ACK, but got {ota_pb.MessageType.Name(packet.msg_type)}")
+                return False
+            
+            ack_msg: ota_pb.OtaAck = packet.parsed_message
+            status_name = ota_pb.OtaStatus.Name(ack_msg.status)
+
+            if ack_msg.status != ota_pb.OK:
+                log.error(f"Received non-OK status: {status_name} - '{ack_msg.message}'")
+                return False
+
+            if expected_chunk is not None and ack_msg.received_chunk_num != expected_chunk:
+                log.error(f"ACK mismatch! Expected chunk {expected_chunk}, got {ack_msg.received_chunk_num}")
+                return False
+
+            log.info(f"Received ACK: Status={status_name}, Msg='{ack_msg.message}', Chunk={ack_msg.received_chunk_num}")
+            self.notification_queue.task_done()
+            return True
+            
+        except asyncio.TimeoutError:
+            log.error(f"Timeout: Did not receive an ACK within {timeout} seconds.")
+            return False
+
+    async def run_update(self):
+        log.info("Starting OTA update process...")
+        await self.ble_manager.start_notify(STATUS_PROGRESS_CHAR_UUID, self._notification_handler)
+        
+        req_info_msg = ota_pb.OtaRequestInfo()
+        control_msg = ota_pb.OtaControl(request_info_payload=req_info_msg)
+        packet = create_packet(ota_pb.MSG_TYPE_OTA_CONTROL, control_msg)
+        await self.ble_manager.write_with_response(CONTROL_POINT_CHAR_UUID, packet)
+        
+        try:
+            info_packet = await asyncio.wait_for(self.notification_queue.get(), 10.0)
+            if info_packet.msg_type != ota_pb.MSG_TYPE_OTA_INFO_RESPONSE:
+                 log.error("Device did not respond with Info. Aborting.")
+                 return False
+            
+            info_resp: ota_pb.OtaInfoResponse = info_packet.parsed_message
+            log.info(f"<-- Received OtaInfoResponse: FW={info_resp.current_fw_version}, HW={info_resp.hw_version}, ID={info_resp.product_id}")
+            
+            if info_resp.product_id != self.config['product_id']:
+                log.error(f"Product ID mismatch! Expected: {self.config['product_id']}, Device has: {info_resp.product_id}")
+                return False
+        except asyncio.TimeoutError:
+            log.error("Timeout waiting for OtaInfoResponse. Aborting.")
+            return False
+        
+        if not self._load_firmware(): return False
+        
+        start_msg = ota_pb.OtaStart(
+            update_type=ota_pb.FIRMWARE_APP, image_size=self.image_size,
+            fw_version=self.config['firmware_version_new'], hw_version=self.config['hardware_version'],
+            product_id=self.config['product_id'], ota_scheme_version=self.config['ota_scheme_version']
+        )
+        control_msg = ota_pb.OtaControl(start_payload=start_msg)
+        packet = create_packet(ota_pb.MSG_TYPE_OTA_CONTROL, control_msg)
+        
+        log.info("--> Sending OtaStart...")
+        await self.ble_manager.write_with_response(CONTROL_POINT_CHAR_UUID, packet)
+        if not await self._wait_for_ack(): return False
+        
+        log.info("Starting firmware data transfer...")
+        start_time = time.time()
+        for i in range(self.total_chunks):
+            chunk_num = i + 1
+            chunk_data = self.firmware_data[i * FIRMWARE_CHUNK_SIZE : (i + 1) * FIRMWARE_CHUNK_SIZE]
+            data_msg = ota_pb.OtaData(chunk_num=chunk_num, chunk=chunk_data)
+            packet = create_packet(ota_pb.MSG_TYPE_OTA_DATA, data_msg)
+            
+            log.info(f"--> Sending chunk {chunk_num}/{self.total_chunks} ({len(chunk_data)} bytes)")
+            await self.ble_manager.write_without_response(DATA_TRANSFER_CHAR_UUID, packet)
+            
+            if not await self._wait_for_ack(expected_chunk=chunk_num): return False
+        
+        duration = time.time() - start_time
+        throughput = (self.image_size / 1024) / duration if duration > 0 else 0
+        log.info(f"Data transfer finished in {duration:.2f}s ({throughput:.2f} KB/s)")
+
+        image_hash = hashlib.sha256(self.firmware_data).digest()
+        end_msg = ota_pb.OtaEnd(total_chunks=self.total_chunks, image_hash=image_hash)
+        control_msg = ota_pb.OtaControl(end_payload=end_msg)
+        packet = create_packet(ota_pb.MSG_TYPE_OTA_CONTROL, control_msg)
+        
+        log.info("--> Sending OtaEnd with SHA256 hash...")
+        await self.ble_manager.write_with_response(CONTROL_POINT_CHAR_UUID, packet)
+        if not await self._wait_for_ack(): return False
+            
+        log.info("Waiting for peripheral to validate and commit the image...")
+        if not await self._wait_for_ack(timeout=30.0): return False
+
+        log.info("✅ OTA Update Successful! The device should reboot shortly.")
+        return True
+
+    def _load_firmware(self):
+        try:
+            with open(self.firmware_path, "rb") as f:
+                self.firmware_data = f.read()
+            self.image_size = len(self.firmware_data)
+            self.total_chunks = math.ceil(self.image_size / FIRMWARE_CHUNK_SIZE)
+            log.info(f"Loaded firmware '{self.firmware_path}': Size={self.image_size} bytes, Chunks={self.total_chunks}")
+            return True
+        except FileNotFoundError:
+            log.error(f"Firmware file not found at: {self.firmware_path}")
+            return False
+
+----------------
+
+# ble_manager.py
+import asyncio
+from bleak import BleakScanner, BleakClient
+from bleak.backends.device import BLEDevice
+from typing import Callable
+from logger_config import log
+from ota_protocol import DEVICE_UPDATE_SERVICE_UUID
+
+class BLEManager:
+    """
+    Manages BLE connection, disconnection, and GATT operations for a specific device.
+    """
+    def __init__(self, device: BLEDevice):
+        if not device:
+            raise ValueError("A valid BLEDevice must be provided.")
+        self.device = device
+        self.client = BleakClient(device, disconnected_callback=self._handle_disconnect)
+
+    def _handle_disconnect(self, client: BleakClient):
+        log.warning(f"Device disconnected: {self.device.address}")
+
+    async def connect(self) -> bool:
+        """Establishes a connection to the BLE device."""
+        log.info(f"Attempting to connect to {self.device.address}...")
+        try:
+            await self.client.connect()
+            log.info(f"✅ Successfully connected to {self.device.address}")
+            return self.client.is_connected
+        except Exception as e:
+            log.error(f"Failed to connect: {e}")
+            return False
+
+    async def disconnect(self):
+        """Disconnects from the BLE device."""
+        if self.client.is_connected:
+            log.info(f"Disconnecting from {self.device.address}...")
+            await self.client.disconnect()
+
+    async def write_with_response(self, char_uuid: str, data: bytes):
+        """Writes data to a characteristic and waits for a response (acknowledgement)."""
+        log.debug(f"Writing with response to {char_uuid}: {data.hex()}")
+        try:
+            await self.client.write_gatt_char(char_uuid, data, response=True)
+        except Exception as e:
+            log.error(f"Error writing with response to {char_uuid}: {e}")
+            raise
+
+    async def write_without_response(self, char_uuid: str, data: bytes):
+        """Writes data to a characteristic without waiting for a response."""
+        log.debug(f"Writing without response to {char_uuid}: {data.hex()}")
+        try:
+            await self.client.write_gatt_char(char_uuid, data, response=False)
+        except Exception as e:
+            log.error(f"Error writing without response to {char_uuid}: {e}")
+            raise
+
+    async def start_notify(self, char_uuid: str, callback: Callable[[int, bytearray], None]):
+        """Enables notifications for a characteristic."""
+        log.info(f"Enabling notifications for {char_uuid}")
+        try:
+            await self.client.start_notify(char_uuid, callback)
+        except Exception as e:
+            log.error(f"Error enabling notifications for {char_uuid}: {e}")
+            raise
+
+async def scan_and_select_device() -> BLEDevice | None:
+    """Scans for BLE devices advertising the OTA service and prompts user to select one."""
+    log.info("Scanning for devices with OTA service...")
+    devices = await BleakScanner.discover(service_uuids=[DEVICE_UPDATE_SERVICE_UUID], timeout=5.0)
+
+    if not devices:
+        log.warning("No devices found advertising the OTA Update Service.")
+        return None
+
+    log.info("--- Discovered Devices ---")
+    for i, device in enumerate(devices):
+        name = device.name or "Unknown"
+        log.info(f"{i}: {name} ({device.address}) | RSSI: {device.rssi}")
+    log.info("--------------------------")
+
+    while True:
+        try:
+            choice = input("Select a device by its index (or 'q' to quit): ")
+            if choice.lower() == 'q':
+                return None
+            device_index = int(choice)
+            if 0 <= device_index < len(devices):
+                return devices[device_index]
+            else:
+                log.error("Invalid index. Please try again.")
+        except (ValueError, IndexError):
+            log.error("Invalid input. Please enter a valid number.")
+-----------------------------
+
+
+# ota_protocol.py
+import struct
+import zlib
+from logger_config import log
+import local_ota_pb2 as ota_pb
+
+DEVICE_UPDATE_SERVICE_UUID = "12345678-1234-5678-1234-56789abcdeF0"
+CONTROL_POINT_CHAR_UUID = "0000fff1-0000-1000-8000-00805f9b34fb"
+DATA_TRANSFER_CHAR_UUID = "0000fff2-0000-1000-8000-00805f9b34fb"
+STATUS_PROGRESS_CHAR_UUID = "0000fff3-0000-1000-8000-00805f9b34fb"
+
+START_BYTE = 0xAA
+END_BYTE = 0xDD
+HEADER_FMT = '<BH' # Type (1B), Length (2B, LE)
+CRC_FMT = '<I'      # CRC32 (4B, LE)
+
+class ProtocolPacket:
+    """Represents a parsed incoming packet."""
+    def __init__(self, msg_type, payload):
+        self.msg_type = msg_type
+        self.payload = payload
+        self.parsed_message = self._parse_payload()
+
+    def _parse_payload(self):
+        try:
+            if self.msg_type == ota_pb.MSG_TYPE_OTA_ACK:
+                msg = ota_pb.OtaAck()
+                msg.ParseFromString(self.payload)
+                return msg
+            elif self.msg_type == ota_pb.MSG_TYPE_OTA_INFO_RESPONSE:
+                msg = ota_pb.OtaInfoResponse()
+                msg.ParseFromString(self.payload)
+                return msg
+            else:
+                log.warning(f"Received unhandled message type: {self.msg_type}")
+                return None
+        except Exception as e:
+            log.error(f"Failed to parse protobuf payload: {e}")
+            return None
+
+def create_packet(message_type: ota_pb.MessageType, protobuf_message) -> bytes:
+    """Creates a complete framed packet for sending."""
+    payload = protobuf_message.SerializeToString()
+    payload_len = len(payload)
+    
+    header_part = struct.pack(HEADER_FMT, message_type, payload_len)
+    data_to_crc = header_part + payload
+    crc = zlib.crc32(data_to_crc)
+
+    return (
+        bytes([START_BYTE]) +
+        data_to_crc +
+        struct.pack(CRC_FMT, crc) +
+        bytes([END_BYTE])
+    )
+
+def parse_packet(data: bytes) -> ProtocolPacket | None:
+    """Parses a raw byte array from the peripheral."""
+    if not data or data[0] != START_BYTE or data[-1] != END_BYTE:
+        log.error("Invalid frame: incorrect start/end bytes.")
+        return None
+
+    try:
+        header_len = struct.calcsize(HEADER_FMT)
+        msg_type_int, payload_len = struct.unpack(HEADER_FMT, data[1:1+header_len])
+        
+        payload_end_idx = 1 + header_len + payload_len
+        payload = data[1+header_len:payload_end_idx]
+        
+        crc_received = struct.unpack(CRC_FMT, data[payload_end_idx:-1])[0]
+
+        data_to_check = data[1:payload_end_idx]
+        crc_calculated = zlib.crc32(data_to_check)
+
+        if crc_received != crc_calculated:
+            log.error(f"CRC Mismatch! Got: {crc_received}, Calculated: {crc_calculated}")
+            return None
+
+        return ProtocolPacket(msg_type_int, payload)
+
+    except (struct.error, IndexError) as e:
+        log.error(f"Error parsing packet frame: {e}")
+        return None
+
+--------------------
+
+# local_ota_pb2.py
+# -*- coding: utf-8 -*-
+# Generated by the protocol buffer compiler.  DO NOT EDIT!
+# source: local_ota.proto
+"""Generated protocol buffer code."""
+from google.protobuf.internal import builder as _builder
+from google.protobuf import descriptor as _descriptor
+from google.protobuf import descriptor_pool as _descriptor_pool
+from google.protobuf import symbol_database as _symbol_database
+# @@protoc_insertion_point(imports)
+
+_sym_db = _symbol_database.Default()
+
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x0flocal_ota.proto\x12\tlocal_ota\"\xca\x01\n\x08OtaStart\x12)\n\x0bupdate_type\x18\x01 \x01(\x0e\x32\x14.local_ota.UpdateType\x12\x12\n\nimage_size\x18\x02 \x01(\r\x12\x12\n\nfw_version\x18\x03 \x01(\t\x12\x12\n\nhw_version\x18\x04 \x01(\t\x12\x12\n\nproduct_id\x18\x05 \x01(\r\x12\x1a\n\x12ota_scheme_version\x18\x06 \x01(\r\x12\x11\n\tsignature\x18\x07 \x01(\x0c\"8\n\x06OtaEnd\x12\x14\n\x0ctotal_chunks\x18\x01 \x01(\r\x12\x12\n\nimage_hash\x18\x02 \x01(\x0c\"H\n\x08OtaAbort\x12)\n\x0breason_code\x18\x01 \x01(\x0e\x32\x14.local_ota.OtaStatus\x12\x11\n\x07message\x18\x02 \x01(\t\"\x10\n\x0eOtaRequestInfo\"\xde\x01\n\nOtaControl\x12.\n\rstart_payload\x18\x01 \x01(\x0b\x32\x13.local_ota.OtaStartB\x02\x18\x01H\x00\x12*\n\x0b\x65nd_payload\x18\x02 \x01(\x0b\x32\x11.local_ota.OtaEndB\x02\x18\x01H\x00\x12.\n\rabort_payload\x18\x03 \x01(\x0b\x32\x13.local_ota.OtaAbortB\x02\x18\x01H\x00\x12<\n\x14request_info_payload\x18\x04 \x01(\x0b\x32\x19.local_ota.OtaRequestInfoH\x00\x42\r\n\x0b\x63ontrol_msg\"-\n\x07OtaData\x12\x11\n\tchunk_num\x18\x01 \x01(\r\x12\x0f\n\x05\x63hunk\x18\x02 \x01(\x0c\"d\n\x06OtaAck\x12#\n\x06status\x18\x01 \x01(\x0e\x32\x13.local_ota.OtaStatus\x12\x11\n\x07message\x18\x02 \x01(\t\x12\x1c\n\x14received_chunk_num\x18\x03 \x01(\r\"\xbb\x01\n\x0fOtaInfoResponse\x12\x1a\n\x12\x63urrent_fw_version\x18\x01 \x01(\t\x12\x12\n\nhw_version\x18\x02 \x01(\t\x12\x12\n\nproduct_id\x18\x03 \x01(\r\x12\"\n\x1asupported_ota_scheme_version\x18\x04 \x01(\r\x12\x36\n\x16supported_update_types\x18\x05 \x03(\x0e\x32\x14.local_ota.UpdateType*\x87\x01\n\x0bMessageType\x12\x17\n\x13MSG_TYPE_RESERVED\x10\x00\x12\x18\n\x14MSG_TYPE_OTA_CONTROL\x10\x01\x12\x15\n\x11MSG_TYPE_OTA_DATA\x10\x02\x12\x14\n\x10MSG_TYPE_OTA_ACK\x10\x03\x12\x1e\n\x1aMSG_TYPE_OTA_INFO_RESPONSE\x10\x04*\xe3\x01\n\tOtaStatus\x12\x06\n\x02OK\x10\x00\x12\t\n\x05\x45RROR\x10\x01\x12\x12\n\x0eINVALID_HEADER\x10\x02\x12\x10\n\x0c\x43RC_MISMATCH\x10\x03\x12\x17\n\x13UNSUPPORTED_COMMAND\x10\x04\x12\x0b\n\x07TIMEOUT\x10\x05\x12\x14\n\x10INVALID_SEQUENCE\x10\x06\x12\x15\n\x11VALIDATION_FAILED\x10\x07\x12\x11\n\rCOMMIT_FAILED\x10\x08\x12\x13\n\x0fINVALID_PAYLOAD\x10\t\x12\x15\n\x11INCORRECT_PRODUCT\x10\n\x12\x17\n\x13UNSUPPORTED_SCHEME\x10\x0b\x12\x1d\n\x19UNSUPPORTED_UPDATE_TYPE\x10\x0c*E\n\nUpdateType\x12\x12\n\x0e\x46IRMWARE_APP\x10\x00\x12\x0e\n\nFILESYSTEM\x10\x01\x12\x13\n\x0f\x43ONFIG_DATA\x10\x02\x62\x06proto3')
+
+_builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, globals())
+_builder.BuildTopDescriptorsAndMessages(DESCRIPTOR, 'local_ota_pb2', globals())
+if _descriptor._USE_C_DESCRIPTORS == False:
+
+  DESCRIPTOR._options = None
+  _OTACONTROL.fields_by_name['start_payload']._options = None
+  _OTACONTROL.fields_by_name['start_payload']._serialized_options = b'\030\001'
+  _OTACONTROL.fields_by_name['end_payload']._options = None
+  _OTACONTROL.fields_by_name['end_payload']._serialized_options = b'\030\001'
+  _OTACONTROL.fields_by_name['abort_payload']._options = None
+  _OTACONTROL.fields_by_name['abort_payload']._serialized_options = b'\030\001'
+  _OTASTART._serialized_start=41
+  _OTASTART._serialized_end=243
+  _OTAEND._serialized_start=245
+  _OTAEND._serialized_end=301
+  _OTAABORT._serialized_start=303
+  _OTAABORT._serialized_end=375
+  _OTAREQUESTINFO._serialized_start=377
+  _OTAREQUESTINFO._serialized_end=393
+  _OTACONTROL._serialized_start=396
+  _OTACONTROL._serialized_end=618
+  _OTADATA._serialized_start=620
+  _OTADATA._serialized_end=665
+  _OTAACK._serialized_start=667
+  _OTAACK._serialized_end=767
+  _OTAINFORESPONSE._serialized_start=770
+  _OTAINFORESPONSE._serialized_end=957
+  _MESSAGETYPE._serialized_start=960
+  _MESSAGETYPE._serialized_end=1095
+  _OTASTATUS._serialized_start=1098
+  _OTASTATUS._serialized_end=1325
+  _UPDATETYPE._serialized_start=1327
+  _UPDATETYPE._serialized_end=1396
