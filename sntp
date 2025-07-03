@@ -536,3 +536,13 @@ extern "C" void app_main(void)
 
 ------------
 
+    using TimestampFn = std::function<const char*()>;
+
+    /**
+     * @brief Set a custom timestamp function.
+     * @param fn A function or other callable object that takes no arguments
+     * and returns a 'const char*'.
+     */
+    void SetTimestampFunction(TimestampFn fn) {
+        timestamp_fn_ = fn;
+    }
