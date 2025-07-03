@@ -1,1 +1,209 @@
 
+#!/usr/bin/env python
+#
+# Hybrid C++ Header Generator for YAML
+#
+# This script generates a C++ header file from a YAML configuration using a hybrid approach:
+# - Mappings with a `!Struct` tag become C++ structs and a constexpr instance.
+# - Mappings with other custom tags (e.g., !DataIngestionModule) also become structs.
+# - Mappings WITHOUT tags become C++ namespaces for organizing flat constants.
+# - Simple key-value pairs become `inline constexpr` variables.
+#
+# Features:
+# - Generates Google C++ Style header guards from the output file path.
+# - Allows specifying a custom top-level namespace.
+#
+# Usage:
+#   python generate_hybrid_header.py --input config.yaml --output include/config/generated.hpp --namespace my_app::config
+#
+import argparse
+import os
+import yaml
+import re
+from collections import OrderedDict
+
+def to_pascal_case(name: str) -> str:
+    """Converts a string to PascalCase."""
+    return "".join(word.capitalize() for word in name.replace("-", "_").split("_"))
+
+def to_snake_case(name: str) -> str:
+    """Converts a string from PascalCase or camelCase to lower_snake_case."""
+    name = re.sub(r'(.)([A-Z][a-z]+)', r'\1_\2', name)
+    name = re.sub(r'([a-z0-9])([A-Z])', r'\1_\2', name)
+    return name.lower()
+
+def get_google_style_header_guard(filepath: str) -> str:
+    """Generates a Google C++ style header guard from the file path."""
+    return re.sub(r'[^A-Z0-9_]', '_', filepath.upper()) + '_'
+
+
+# --- Type mapping for custom YAML tags ---
+TAG_TYPE_MAP = {
+    '!str': "const char*", '!SemVer': "const char*", '!LogLevel': "const char*",
+    '!path': "const char*", '!hostname': "const char*", '!email': "const char*",
+    '!uint64': "std::uint64_t", '!uint32': "std::uint32_t", '!uint16': "std::uint16_t", '!uint8': "std::uint8_t",
+    '!int64': "std::int64_t", '!int32': "std::int32_t", '!int16': "std::int16_t", '!int8': "std::int8_t",
+    '!float': "float", '!double': "double", '!bool': "bool",
+}
+
+class CppHybridGenerator:
+    """Manages the generation of the hybrid C++ header file."""
+    def __init__(self, source_filename: str):
+        self.source_filename = source_filename
+        self.struct_definitions = OrderedDict()
+        self.instance_definitions = []
+        self.flat_definitions = []
+
+    def get_cpp_type_and_value(self, node: yaml.Node):
+        """Determines C++ type and value from a YAML node."""
+        tag = node.tag
+        value = node.value
+
+        # Handle explicit tags
+        if tag in TAG_TYPE_MAP:
+            cpp_type = TAG_TYPE_MAP[tag]
+            cpp_val = f'"{value}"' if cpp_type == "const char*" else str(value)
+            if cpp_type == "bool": cpp_val = "true" if value else "false"
+            return cpp_type, cpp_val
+
+        # Fallback to basic Python types
+        if isinstance(value, str): return "const char*", f'"{value}"'
+        if isinstance(value, bool): return "bool", "true" if value else "false"
+        if isinstance(value, int): return "int", str(value)
+        if isinstance(value, float): return "float", str(value)
+
+        return "/* unknown */", "/* unknown */"
+
+    def process_node(self, key: str, node: yaml.Node, indent_level: int):
+        """Recursively process a YAML node."""
+        indent = "    " * indent_level
+        is_struct_tag = node.tag and (node.tag == '!Struct' or (node.tag.startswith('!') and node.tag not in TAG_TYPE_MAP))
+        
+        # --- Case 1: Node is a Mapping (Dictionary) ---
+        if isinstance(node, yaml.MappingNode):
+            # If it's tagged as a struct, generate a struct definition and an instance
+            if is_struct_tag:
+                struct_name = node.tag[1:] if node.tag != '!Struct' else to_pascal_case(key)
+                self.define_struct(struct_name, node)
+                self.define_instance(key, struct_name, node)
+            # Otherwise, it's a namespace for flat constants
+            else:
+                namespace_name = to_snake_case(key)
+                self.flat_definitions.append(f"\n{indent}namespace {namespace_name} {{")
+                for sub_key_node, sub_value_node in node.value:
+                    self.process_node(sub_key_node.value, sub_value_node, indent_level + 1)
+                self.flat_definitions.append(f"{indent}}} // namespace {namespace_name}")
+
+        # --- Case 2: Node is a Sequence (List) ---
+        elif isinstance(node, yaml.SequenceNode):
+            if not node.value: return # Skip empty lists
+            # Check if it's a polymorphic list of structs
+            first_item = node.value[0]
+            if isinstance(first_item, yaml.MappingNode) and first_item.tag and first_item.tag not in TAG_TYPE_MAP:
+                variant_types = sorted(list(set(item.tag[1:] for item in node.value)))
+                variant_name = f"{to_pascal_case(key)}Variant"
+                
+                # Define all structs in the variant
+                for struct_type in variant_types:
+                    sample_node = next(item for item in node.value if item.tag[1:] == struct_type)
+                    self.define_struct(struct_type, sample_node)
+                
+                # Define the variant type alias
+                self.struct_definitions[variant_name] = f"using {variant_name} = std::variant<{', '.join(variant_types)}>;\n"
+                
+                # Define the instance (a vector of variants)
+                initializers = []
+                for item_node in node.value:
+                    _, val_str = self.get_formatted_initializer(item_node, 1)
+                    initializers.append(val_str)
+                
+                instance_val = "{{\n        {},\n    }}".format(",\n        ".join(initializers))
+                self.instance_definitions.append(
+                    f"inline constexpr std::vector<{variant_name}> k{to_pascal_case(key)} = \n{instance_val};"
+                )
+        # --- Case 3: Simple key-value pair ---
+        else:
+            cpp_type, cpp_val = self.get_cpp_type_and_value(node)
+            var_name = f"k{to_pascal_case(key)}"
+            self.flat_definitions.append(f"{indent}inline constexpr {cpp_type} {var_name} = {cpp_val};")
+
+    def define_struct(self, struct_name: str, node: yaml.MappingNode):
+        if struct_name in self.struct_definitions: return
+        members = []
+        for key_node, value_node in node.value:
+            cpp_type, _ = self.get_cpp_type_and_value(value_node)
+            # If a member is a struct, its type is its PascalCase name
+            if isinstance(value_node, yaml.MappingNode) and value_node.tag == '!Struct':
+                cpp_type = to_pascal_case(key_node.value)
+            members.append(f"    {cpp_type} {to_snake_case(key_node.value)};")
+        
+        self.struct_definitions[struct_name] = "struct " + struct_name + " {\n" + "\n".join(members) + "\n};\n"
+
+    def get_formatted_initializer(self, node: yaml.Node, indent: int):
+        indent_str = "    " * indent
+        if isinstance(node, yaml.MappingNode):
+            lines = ["{"]
+            for key_node, val_node in node.value:
+                _, val_str = self.get_formatted_initializer(val_node, indent + 1)
+                lines.append(f"{indent_str}    .{to_snake_case(key_node.value)} = {val_str},")
+            lines.append(f"{indent_str}}}")
+            return "", "\n".join(lines)
+        else:
+            return self.get_cpp_type_and_value(node)
+
+    def define_instance(self, key: str, struct_name: str, node: yaml.MappingNode):
+        var_name = f"k{to_pascal_case(key)}"
+        _, initializer_str = self.get_formatted_initializer(node, 0)
+        self.instance_definitions.append(
+            f"inline constexpr {struct_name} {var_name} =\n{initializer_str};\n"
+        )
+
+    def generate(self, root_node: yaml.Node, output_filepath: str, namespace: str):
+        """Generates the full C++ header content string."""
+        for key_node, value_node in root_node.value:
+            self.process_node(key_node.value, value_node, 1)
+
+        include_guard = get_google_style_header_guard(output_filepath)
+        header = [
+            f"// This file is auto-generated from {self.source_filename}. Do not edit!",
+            f"#ifndef {include_guard}",
+            f"#define {include_guard}",
+            "",
+            "#include <cstdint>", "#include <string>", "#include <vector>", "#include <variant>", ""
+        ]
+        
+        # Assemble in order: flat defs (namespaces), structs, instances
+        header.append(f"namespace {namespace} {{")
+        header.extend(self.flat_definitions)
+        header.append("\n// --- Struct Definitions ---")
+        header.extend(self.struct_definitions.values())
+        header.append("\n// --- Constexpr Instances ---")
+        header.extend(self.instance_definitions)
+        header.append(f"}} // namespace {namespace}")
+        header.append(f"\n#endif // {include_guard}")
+        return "\n".join(header)
+
+def main():
+    parser = argparse.ArgumentParser(description="Generate a hybrid C++ header from a YAML config.")
+    parser.add_argument("-i", "--input", required=True, help="Input YAML file path.")
+    parser.add_argument("-o", "--output", required=True, help="Output C++ header file path.")
+    parser.add_argument("-n", "--namespace", default="config", help="Top-level C++ namespace for the generated code.")
+    args = parser.parse_args()
+
+    if not os.path.exists(args.input):
+        print(f"Error: Input file not found at '{args.input}'")
+        return
+        
+    with open(args.input, 'r') as f:
+        # Use yaml.compose to get a node graph that preserves tags
+        root_node = yaml.compose(f)
+
+    generator = CppHybridGenerator(os.path.basename(args.input))
+    content = generator.generate(root_node, args.output, args.namespace)
+
+    with open(args.output, 'w') as f:
+        f.write(content)
+    print(f"Successfully generated hybrid C++ header at '{args.output}'")
+
+if __name__ == "__main__":
+    main()
