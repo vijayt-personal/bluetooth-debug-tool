@@ -1,0 +1,240 @@
+#ifndef VENDOR_BIT_UTILS_HPP_
+#define VENDOR_BIT_UTILS_HPP_
+
+#include <cstdint>
+
+/**
+ * @file bit_utils.hpp
+ * @brief A lightweight, header-only utility for common bitwise and byte-level
+ * operations in C++ for embedded systems.
+ */
+
+namespace vendor {
+namespace bit_utils {
+
+// --- Standard Bitwise Operations ---
+
+/**
+ * @brief Sets a specific bit in a value.
+ * @tparam T The integral type of the value.
+ * @param value The original value.
+ * @param position The bit position to set (0-indexed).
+ * @return The value with the specified bit set.
+ */
+template <typename T>
+[[nodiscard]] constexpr T SetBit(T value, int position) {
+  return value | (static_cast<T>(1) << position);
+}
+
+/**
+ * @brief Clears a specific bit in a value.
+ * @tparam T The integral type of the value.
+ * @param value The original value.
+ * @param position The bit position to clear (0-indexed).
+ * @return The value with the specified bit cleared.
+ */
+template <typename T>
+[[nodiscard]] constexpr T ClearBit(T value, int position) {
+  return value & ~(static_cast<T>(1) << position);
+}
+
+/**
+ * @brief Toggles a specific bit in a value.
+ * @tparam T The integral type of the value.
+ * @param value The original value.
+ * @param position The bit position to toggle (0-indexed).
+ * @return The value with the specified bit toggled.
+ */
+template <typename T>
+[[nodiscard]] constexpr T ToggleBit(T value, int position) {
+  return value ^ (static_cast<T>(1) << position);
+}
+
+/**
+ * @brief Checks if a specific bit is set in a value.
+ * @tparam T The integral type of the value.
+ * @param value The value to check.
+ * @param position The bit position to check (0-indexed).
+ * @return True if the bit is set, false otherwise.
+ */
+template <typename T>
+[[nodiscard]] constexpr bool IsBitSet(T value, int position) {
+  return (value >> position) & static_cast<T>(1);
+}
+
+// --- Byte Joining ---
+
+/**
+ * @brief Joins two bytes into a 16-bit integer (Little Endian).
+ * @param low_byte The least significant byte.
+ * @param high_byte The most significant byte.
+ * @return The combined 16-bit value.
+ */
+[[nodiscard]] constexpr uint16_t JoinBytesLe(uint8_t low_byte,
+                                             uint8_t high_byte) {
+  return static_cast<uint16_t>(low_byte) |
+         (static_cast<uint16_t>(high_byte) << 8);
+}
+
+/**
+ * @brief Joins two bytes into a 16-bit integer (Big Endian).
+ * @param high_byte The most significant byte.
+ * @param low_byte The least significant byte.
+ * @return The combined 16-bit value.
+ */
+[[nodiscard]] constexpr uint16_t JoinBytesBe(uint8_t high_byte,
+                                             uint8_t low_byte) {
+  return (static_cast<uint16_t>(high_byte) << 8) |
+         static_cast<uint16_t>(low_byte);
+}
+
+/**
+ * @brief Joins four bytes into a 32-bit integer (Little Endian).
+ * @param b1 The least significant byte.
+ * @param b2 The second byte.
+ * @param b3 The third byte.
+ * @param b4 The most significant byte.
+ * @return The combined 32-bit value.
+ */
+[[nodiscard]] constexpr uint32_t JoinBytesLe(uint8_t b1, uint8_t b2, uint8_t b3,
+                                             uint8_t b4) {
+  return static_cast<uint32_t>(b1) | (static_cast<uint32_t>(b2) << 8) |
+         (static_cast<uint32_t>(b3) << 16) | (static_cast<uint32_t>(b4) << 24);
+}
+
+/**
+ * @brief Joins four bytes into a 32-bit integer (Big Endian).
+ * @param b4 The most significant byte.
+ * @param b3 The third byte.
+ * @param b2 The second byte.
+ * @param b1 The least significant byte.
+ * @return The combined 32-bit value.
+ */
+[[nodiscard]] constexpr uint32_t JoinBytesBe(uint8_t b4, uint8_t b3, uint8_t b2,
+                                             uint8_t b1) {
+  return (static_cast<uint32_t>(b4) << 24) | (static_cast<uint32_t>(b3) << 16) |
+         (static_cast<uint32_t>(b2) << 8) | static_cast<uint32_t>(b1);
+}
+
+// --- Byte Splitting (Struct & Buffer) ---
+
+/** @struct SplitBytes16
+ * @brief Holds the two bytes of a split 16-bit value.
+ */
+struct SplitBytes16 {
+  uint8_t low;
+  uint8_t high;
+};
+
+/**
+ * @brief Splits a 16-bit value into two bytes (Little Endian).
+ * @param value The 16-bit value to split.
+ * @return A SplitBytes16 struct containing the high and low bytes.
+ */
+[[nodiscard]] constexpr SplitBytes16 SplitBytesLe16(uint16_t value) {
+  return {static_cast<uint8_t>(value & 0xFF), static_cast<uint8_t>(value >> 8)};
+}
+
+/**
+ * @brief Splits a 16-bit value into a provided buffer (Little Endian).
+ * @param value The 16-bit value to split.
+ * @param[out] buffer A pointer to a buffer of at least 2 bytes.
+ * buffer[0] will be the low byte, buffer[1] the high byte.
+ */
+inline void SplitBytesLe16(uint16_t value, uint8_t* buffer) {
+  buffer[0] = static_cast<uint8_t>(value & 0xFF);
+  buffer[1] = static_cast<uint8_t>(value >> 8);
+}
+
+/** @struct SplitBytes32
+ * @brief Holds the four bytes of a split 32-bit value.
+ */
+struct SplitBytes32 {
+  uint8_t b1;
+  uint8_t b2;
+  uint8_t b3;
+  uint8_t b4;
+};
+
+/**
+ * @brief Splits a 32-bit value into four bytes (Big Endian).
+ * @param value The 32-bit value to split.
+ * @return A SplitBytes32 struct containing the four bytes in order from most
+ * significant (b4) to least significant (b1).
+ */
+[[nodiscard]] constexpr SplitBytes32 SplitBytesBe32(uint32_t value) {
+  return {static_cast<uint8_t>((value >> 24) & 0xFF),
+          static_cast<uint8_t>((value >> 16) & 0xFF),
+          static_cast<uint8_t>((value >> 8) & 0xFF),
+          static_cast<uint8_t>(value & 0xFF)};
+}
+
+/**
+ * @brief Splits a 32-bit value into a provided buffer (Big Endian).
+ * @param value The 32-bit value to split.
+ * @param[out] buffer A pointer to a buffer of at least 4 bytes. The bytes will
+ * be ordered from most significant to least significant.
+ */
+inline void SplitBytesBe32(uint32_t value, uint8_t* buffer) {
+  buffer[0] = static_cast<uint8_t>((value >> 24) & 0xFF);
+  buffer[1] = static_cast<uint8_t>((value >> 16) & 0xFF);
+  buffer[2] = static_cast<uint8_t>((value >> 8) & 0xFF);
+  buffer[3] = static_cast<uint8_t>(value & 0xFF);
+}
+
+}  // namespace bit_utils
+}  // namespace vendor
+
+#endif  // VENDOR_BIT_UTILS_HPP_
+
+---------------
+
+#include <iostream>
+#include <vector>
+#include <iomanip>
+#include "bit_utils.hpp"
+
+void PrintBuffer(const uint8_t* buffer, size_t size) {
+  std::cout << "Buffer contents: [ ";
+  for (size_t i = 0; i < size; ++i) {
+    // Cast to int to prevent cout from interpreting it as a char
+    std::cout << "0x" << std::hex << static_cast<int>(buffer[i]) << " ";
+  }
+  std::cout << std::dec << "]" << std::endl;
+}
+
+int main() {
+  // --- Bitwise Operations ---
+  uint8_t flags = 0b10010000;
+  std::cout << "Initial flags: 0b" << std::bitset<8>(flags) << std::endl;
+  flags = vendor::bit_utils::SetBit(flags, 2);    // Set bit 2
+  flags = vendor::bit_utils::ClearBit(flags, 7);  // Clear bit 7
+  std::cout << "Modified flags: 0b" << std::bitset<8>(flags) << std::endl;
+
+  // --- Byte Joining ---
+  uint16_t word = vendor::bit_utils::JoinBytesBe(0xAB, 0xCD);
+  uint32_t dword = vendor::bit_utils::JoinBytesLe(0xEF, 0xBE, 0xAD, 0xDE);
+  std::cout << "\nJoined 16-bit (BE): 0x" << std::hex << word << std::endl;   // 0xabcd
+  std::cout << "Joined 32-bit (LE): 0x" << std::hex << dword << std::endl; // 0xdeadbeef
+
+  // --- Byte Splitting (Struct return) ---
+  auto split_data = vendor::bit_utils::SplitBytesBe32(0xCAFEBABE);
+  std::cout << "\nSplit 32-bit (BE) via struct: 0x" << std::hex
+            << static_cast<int>(split_data.b4)
+            << static_cast<int>(split_data.b3)
+            << static_cast<int>(split_data.b2)
+            << static_cast<int>(split_data.b1) << std::endl;
+
+  // --- Byte Splitting (Buffer population) ---
+  std::cout << "\nSplitting 0xABCD into a buffer (Little Endian)..." << std::endl;
+  uint8_t my_buffer[2];
+  vendor::bit_utils::SplitBytesLe16(0xABCD, my_buffer);
+  PrintBuffer(my_buffer, 2); // Expects [ 0xcd 0xab ]
+
+  std::cout << "\nSplitting 0xDEADBEEF into a buffer (Big Endian)..." << std::endl;
+  std::vector<uint8_t> my_vec_buffer(4);
+  vendor::bit_utils::SplitBytesBe32(0xDEADBEEF, my_vec_buffer.data());
+  PrintBuffer(my_vec_buffer.data(), 4); // Expects [ 0xde 0xad 0xbe 0xef ]
+
+  return 0;
+}
