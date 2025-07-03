@@ -1,4 +1,3 @@
-
 #!/usr/bin/env python
 #
 # Hybrid C++ Header Generator for YAML
@@ -10,8 +9,9 @@
 # - Simple key-value pairs become `inline constexpr` variables.
 #
 # Features:
-# - Generates Google C++ Style header guards from the output file path.
-# - Allows specifying a custom top-level namespace.
+# - Generates cleaner, more minimal headers.
+# - Includes headers like <vector> and <variant> only when necessary.
+# - Header guard is based on namespace and filename.
 #
 # Usage:
 #   python generate_hybrid_header.py --input config.yaml --output include/config/generated.hpp --namespace my_app::config
@@ -32,15 +32,17 @@ def to_snake_case(name: str) -> str:
     name = re.sub(r'([a-z0-9])([A-Z])', r'\1_\2', name)
     return name.lower()
 
-def get_google_style_header_guard(filepath: str) -> str:
-    """Generates a Google C++ style header guard from the file path."""
-    return re.sub(r'[^A-Z0-9_]', '_', filepath.upper()) + '_'
+def get_header_guard(namespace: str, filename: str) -> str:
+    """Generates a header guard from the namespace and filename."""
+    ns_part = namespace.upper().replace('::', '_')
+    file_part = os.path.basename(filename).upper().replace('.', '_')
+    return f"{ns_part}_{file_part}_"
 
 
 # --- Type mapping for custom YAML tags ---
 TAG_TYPE_MAP = {
-    '!str': "const char*", '!SemVer': "const char*", '!LogLevel': "const char*",
-    '!path': "const char*", '!hostname': "const char*", '!email': "const char*",
+    '!str': "std::string_view", '!SemVer': "std::string_view", '!LogLevel': "std::string_view",
+    '!path': "std::string_view", '!hostname': "std::string_view", '!email': "std::string_view",
     '!uint64': "std::uint64_t", '!uint32': "std::uint32_t", '!uint16': "std::uint16_t", '!uint8': "std::uint8_t",
     '!int64': "std::int64_t", '!int32': "std::int32_t", '!int16': "std::int16_t", '!int8': "std::int8_t",
     '!float': "float", '!double': "double", '!bool': "bool",
@@ -53,6 +55,7 @@ class CppHybridGenerator:
         self.struct_definitions = OrderedDict()
         self.instance_definitions = []
         self.flat_definitions = []
+        self.required_includes = {"<cstdint>"} # Start with the most basic include
 
     def get_cpp_type_and_value(self, node: yaml.Node):
         """Determines C++ type and value from a YAML node."""
@@ -62,12 +65,16 @@ class CppHybridGenerator:
         # Handle explicit tags
         if tag in TAG_TYPE_MAP:
             cpp_type = TAG_TYPE_MAP[tag]
-            cpp_val = f'"{value}"' if cpp_type == "const char*" else str(value)
+            if "string_view" in cpp_type:
+                self.required_includes.add("<string_view>")
+            cpp_val = f'"{value}"' if "string_view" in cpp_type else str(value)
             if cpp_type == "bool": cpp_val = "true" if value else "false"
             return cpp_type, cpp_val
 
         # Fallback to basic Python types
-        if isinstance(value, str): return "const char*", f'"{value}"'
+        if isinstance(value, str):
+            self.required_includes.add("<string_view>")
+            return "std::string_view", f'"{value}"'
         if isinstance(value, bool): return "bool", "true" if value else "false"
         if isinstance(value, int): return "int", str(value)
         if isinstance(value, float): return "float", str(value)
@@ -96,10 +103,12 @@ class CppHybridGenerator:
 
         # --- Case 2: Node is a Sequence (List) ---
         elif isinstance(node, yaml.SequenceNode):
+            self.required_includes.add("<vector>")
             if not node.value: return # Skip empty lists
             # Check if it's a polymorphic list of structs
             first_item = node.value[0]
             if isinstance(first_item, yaml.MappingNode) and first_item.tag and first_item.tag not in TAG_TYPE_MAP:
+                self.required_includes.add("<variant>")
                 variant_types = sorted(list(set(item.tag[1:] for item in node.value)))
                 variant_name = f"{to_pascal_case(key)}Variant"
                 
@@ -161,23 +170,38 @@ class CppHybridGenerator:
     def generate(self, root_node: yaml.Node, output_filepath: str, namespace: str):
         """Generates the full C++ header content string."""
         for key_node, value_node in root_node.value:
-            self.process_node(key_node.value, value_node, 1)
+            self.process_node(key_node.value, value_node, 0)
 
-        include_guard = get_google_style_header_guard(output_filepath)
+        include_guard = get_header_guard(namespace, output_filepath)
+        
+        # Start building the header content
         header = [
             f"// This file is auto-generated from {self.source_filename}. Do not edit!",
             f"#ifndef {include_guard}",
             f"#define {include_guard}",
-            "",
-            "#include <cstdint>", "#include <string>", "#include <vector>", "#include <variant>", ""
+            ""
         ]
         
-        # Assemble in order: flat defs (namespaces), structs, instances
+        # Add includes only if they are required
+        if self.required_includes:
+            for inc in sorted(list(self.required_includes)):
+                header.append(f"#include {inc}")
+            header.append("")
+
+        # Assemble the body of the header
         header.append(f"namespace {namespace} {{")
         header.extend(self.flat_definitions)
-        header.append("\n// --- Struct Definitions ---")
+        
+        # Add a newline if there are both flat defs and structs/instances
+        if self.flat_definitions and (self.struct_definitions or self.instance_definitions):
+            header.append("")
+            
         header.extend(self.struct_definitions.values())
-        header.append("\n// --- Constexpr Instances ---")
+
+        # Add a newline if there are both structs and instances
+        if self.struct_definitions and self.instance_definitions:
+            header.append("")
+
         header.extend(self.instance_definitions)
         header.append(f"}} // namespace {namespace}")
         header.append(f"\n#endif // {include_guard}")
