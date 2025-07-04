@@ -1,0 +1,265 @@
+#ifndef ROLLING_AVERAGE_SAMPLE_H_
+#define ROLLING_AVERAGE_SAMPLE_H_
+
+#include <array>
+#include <numeric>
+#include <cstddef>
+#include <cassert>
+#include <functional>
+#include <limits>
+#include <optional>
+
+/**
+ * @class RollingAverageSample
+ * @brief Heap-optimized rolling average over a fixed number of samples using std::array.
+ *
+ * @tparam T The numeric type of the samples.
+ * @tparam MaxSize The maximum number of samples the buffer can hold (compile-time constant).
+ * @tparam TSum The type for the internal sum. Defaults to double.
+ */
+template <typename T, size_t MaxSize, typename TSum = double>
+class RollingAverageSample {
+public:
+    using ThresholdCallback = std::function<void(T, bool)>;
+
+    explicit RollingAverageSample(size_t window_size)
+        : window_size_(window_size),
+          min_threshold_(std::numeric_limits<T>::lowest()),
+          max_threshold_(std::numeric_limits<T>::max())
+    {
+        assert(window_size > 0 && "Window size must be greater than 0");
+        assert(window_size <= MaxSize && "Window size cannot exceed MaxSize");
+    }
+
+    void SetThresholds(T min_val, T max_val) {
+        min_threshold_ = min_val;
+        max_threshold_ = max_val;
+    }
+
+    void SetThresholdCallback(ThresholdCallback callback) {
+        threshold_callback_ = callback;
+    }
+
+    void AddSample(T sample) {
+        if (threshold_callback_) {
+            if (sample < min_threshold_) threshold_callback_(sample, true);
+            if (sample > max_threshold_) threshold_callback_(sample, false);
+        }
+
+        if (count_ == window_size_) { // Window is full, overwrite oldest
+            sum_ -= samples_[next_index_];
+        } else { // Still filling up
+            count_++;
+        }
+
+        samples_[next_index_] = sample;
+        sum_ += sample;
+        next_index_ = (next_index_ + 1) % window_size_;
+    }
+
+    std::optional<TSum> GetAverage(bool require_full_window = false) const {
+        if (count_ == 0) {
+            return std::nullopt;
+        }
+        if (require_full_window && count_ < window_size_) {
+            return std::nullopt;
+        }
+        return sum_ / count_;
+    }
+
+    void Clear() {
+        sum_ = 0;
+        count_ = 0;
+        next_index_ = 0;
+    }
+
+    size_t GetSampleCount() const { return count_; }
+    size_t GetWindowSize() const { return window_size_; }
+
+private:
+    std::array<T, MaxSize> samples_{};
+    size_t window_size_;
+    size_t count_ = 0;
+    size_t next_index_ = 0;
+    TSum sum_ = 0;
+    T min_threshold_;
+    T max_threshold_;
+    ThresholdCallback threshold_callback_ = nullptr;
+};
+
+#endif // ROLLING_AVERAGE_SAMPLE_H_
+
+
+#ifndef ROLLING_AVERAGE_TIME_H_
+#define ROLLING_AVERAGE_TIME_H_
+
+#include <array>
+#include <numeric>
+#include <cstddef>
+#include <functional>
+#include <cassert>
+#include <limits>
+#include <optional>
+
+/**
+ * @class RollingAverageTime
+ * @brief Heap-optimized time-based rolling average using a circular buffer on std::array.
+ *
+ * @tparam T The numeric type of the samples.
+ * @tparam TTimestamp The data type for the timestamp (e.g., int64_t).
+ * @tparam MaxSize The maximum number of samples the buffer can hold.
+ * @tparam TSum The type for the internal sum. Defaults to double.
+ */
+template <typename T, typename TTimestamp, size_t MaxSize, typename TSum = double>
+class RollingAverageTime {
+private:
+    struct TimedSample { T value; TTimestamp timestamp; };
+
+public:
+    using ThresholdCallback = std::function<void(T, bool)>;
+
+    RollingAverageTime(TTimestamp window_duration, std::function<TTimestamp()> timestamp_fn)
+        : window_duration_(window_duration),
+          get_timestamp_(timestamp_fn),
+          min_threshold_(std::numeric_limits<T>::lowest()),
+          max_threshold_(std::numeric_limits<T>::max())
+    {
+        assert(get_timestamp_ && "Timestamp function must be provided");
+    }
+    
+    void SetThresholds(T min_val, T max_val) {
+        min_threshold_ = min_val;
+        max_threshold_ = max_val;
+    }
+
+    void SetThresholdCallback(ThresholdCallback callback) {
+        threshold_callback_ = callback;
+    }
+
+    void AddSample(T sample) {
+        if (threshold_callback_) {
+            if (sample < min_threshold_) threshold_callback_(sample, true);
+            if (sample > max_threshold_) threshold_callback_(sample, false);
+        }
+
+        PruneExpiredSamples();
+
+        if (count_ == MaxSize) { // Buffer is full, overwrite the oldest sample
+            sum_ -= samples_[head_].value;
+            head_ = (head_ + 1) % MaxSize;
+            count_--; // Make room
+        }
+
+        samples_[tail_] = {sample, get_timestamp_()};
+        tail_ = (tail_ + 1) % MaxSize;
+        count_++;
+        sum_ += sample;
+    }
+
+    std::optional<TSum> GetAverage(bool require_full_window = false) {
+        PruneExpiredSamples();
+        if (count_ == 0) {
+            return std::nullopt;
+        }
+        if (require_full_window) {
+            const TTimestamp first_sample_ts = samples_[head_].timestamp;
+            if (get_timestamp_() - first_sample_ts < window_duration_) {
+                return std::nullopt;
+            }
+        }
+        return sum_ / count_;
+    }
+
+    void Clear() {
+        head_ = 0;
+        tail_ = 0;
+        count_ = 0;
+        sum_ = 0;
+    }
+
+    size_t GetSampleCount() {
+        PruneExpiredSamples();
+        return count_;
+    }
+
+private:
+    void PruneExpiredSamples() {
+        if (!get_timestamp_ || count_ == 0) return;
+        const TTimestamp expiration_time = get_timestamp_() - window_duration_;
+        while (count_ > 0 && samples_[head_].timestamp < expiration_time) {
+            sum_ -= samples_[head_].value;
+            head_ = (head_ + 1) % MaxSize;
+            count_--;
+        }
+    }
+
+    std::array<TimedSample, MaxSize> samples_{};
+    size_t head_ = 0;
+    size_t tail_ = 0;
+    size_t count_ = 0;
+    TSum sum_ = 0;
+    
+    TTimestamp window_duration_;
+    std::function<TTimestamp()> get_timestamp_;
+    T min_threshold_;
+    T max_threshold_;
+    ThresholdCallback threshold_callback_ = nullptr;
+};
+
+#endif // ROLLING_AVERAGE_TIME_H_
+
+                       --------------
+#include <stdio.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "esp_timer.h"
+#include "esp_log.h"
+
+#include "rolling_average_sample.h"
+#include "rolling_average_time.h"
+
+static const char *TAG = "HEAP_OPT_TEST";
+
+void sample_based_test_task(void *pvParameters) {
+    ESP_LOGI(TAG, "--- Starting Sample-Based Test ---");
+    // Max buffer size is 20, but we only use a window of 5.
+    // This object now lives entirely on the stack.
+    RollingAverageSample<int, 20> avg(5);
+
+    for (int i = 1; i <= 7; ++i) {
+        avg.AddSample(i * 10);
+        if (auto val = avg.GetAverage(true)) {
+            ESP_LOGI(TAG, "Sample window full! Average: %.2f", *val);
+        } else {
+            ESP_LOGW(TAG, "Sample window not full yet. Current count: %d", avg.GetSampleCount());
+        }
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
+    ESP_LOGI(TAG, "Sample-based test finished.");
+    vTaskDelete(NULL);
+}
+
+void time_based_test_task(void *pvParameters) {
+    ESP_LOGI(TAG, "--- Starting Time-Based Test ---");
+    const int64_t window_us = 3 * 1000 * 1000;
+
+    // Max buffer of 50 samples, time window is 3 seconds.
+    // This object also lives entirely on the stack.
+    RollingAverageTime<float, int64_t, 50> time_avg(window_us, &esp_timer_get_time);
+
+    for (int i = 0; i < 5; ++i) {
+        time_avg.AddSample((float)i * 5.0f);
+        ESP_LOGI(TAG, "Time test: Added sample. Current count: %d", time_avg.GetSampleCount());
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+
+    ESP_LOGI(TAG, "Final average after 5 seconds: %.2f", *time_avg.GetAverage());
+    ESP_LOGI(TAG, "Time-based test finished.");
+    vTaskDelete(NULL);
+}
+
+extern "C" void app_main(void) {
+    xTaskCreate(&sample_based_test_task, "sample_test_task", 4096, NULL, 5, NULL);
+    vTaskDelay(pdMS_TO_TICKS(100)); // Stagger tasks
+    xTaskCreate(&time_based_test_task, "time_test_task", 4096, NULL, 5, NULL);
+}
