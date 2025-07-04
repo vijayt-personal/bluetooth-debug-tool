@@ -1,307 +1,199 @@
 /**
- * @file ble_peripheral.cc
- * @brief Implementation of the BLE Peripheral interface using NimBLE.
+ * @file ble_peripheral.h
+ * @brief BLE Peripheral interface for handling BLE server, advertising, and
+ * modern BLE 5 features.
  */
-#include "ble_peripheral.h"
-#include "NimBLEDevice.h"
-#include "NimBLELog.h" // For logging
+#ifndef PLATFORM_BLE_PERIPHERAL_H_
+#define PLATFORM_BLE_PERIPHERAL_H_
 
-#include <map>
+#include <cstddef>
+#include <cstdint>
+#include <functional>
+#include <memory>
 #include <string>
+#include <tuple>
 #include <vector>
+
+// To enable BLE 5 features, define this as 1 in your project's build flags
+// (e.g., CXXFLAGS+="-DENABLE_BLE5_FEATURES=1")
+#ifndef ENABLE_BLE5_FEATURES
+#define ENABLE_BLE5_FEATURES 0
+#endif
 
 namespace platform {
 namespace connectivity {
 
-// --- PIMPL Implementation Class ---
-// This class contains all the private members and implementation details.
-class BlePeripheral::BlePeripheralImpl {
+class BlePeripheral {
 public:
-    // --- Types ---
-    struct CharacteristicInfo {
-        uint32_t properties;
-        CharCallback callback;
-        NimBLECharacteristic* pCharHandle{nullptr};
+    /**
+     * @brief Represents the current state of the BLE peripheral.
+     * kIdle: Not connected and not advertising.
+     * kAdvertising: Advertising, but not connected.
+     * kConnected: Connected to a peer device.
+     */
+    enum class BleState { kIdle, kAdvertising, kConnected };
+
+    /** @brief Defines properties for a BLE characteristic. Can be combined using bitwise OR. */
+    enum class CharProperty : uint32_t {
+        kRead            = 0x02,
+        kWriteNoResponse = 0x04,
+        kWrite           = 0x08,
+        kNotify          = 0x10,
+        kIndicate        = 0x20,
     };
 
-    // --- Nested Callback Handlers ---
-    class ServerCallbacks : public NimBLEServerCallbacks {
-    public:
-        explicit ServerCallbacks(BlePeripheralImpl& parent) : parent_(parent) {}
-        void onConnect(NimBLEServer* pServer, NimBLEConnInfo& connInfo) override {
-            NIMBLE_LOGI("BLE_PERIPHERAL", "Client connected: %s", connInfo.getAddress().toString().c_str());
-            parent_.state_ = BleState::kConnected;
-            if (parent_.onConnect_) {
-                parent_.onConnect_();
-            }
-        }
-        void onDisconnect(NimBLEServer* pServer, NimBLEConnInfo& connInfo, int reason) override {
-            NIMBLE_LOGI("BLE_PERIPHERAL", "Client disconnected, reason: %d", reason);
-            parent_.state_ = BleState::kDisconnected;
-            if (parent_.onDisconnect_) {
-                parent_.onDisconnect_();
-            }
-        }
-    private:
-        BlePeripheralImpl& parent_;
+    /** @brief Specifies the type of notification to send for a characteristic update. */
+    enum class NotificationType { kNone, kNotify, kIndicate };
+
+    /** @brief Bitmask for selecting BLE PHYs. */
+    enum PhyMask : uint8_t {
+        kPhy1m   = (1 << 0),
+        kPhy2m   = (1 << 1),
+        kPhyCoded= (1 << 2),
     };
 
-    class CharacteristicCallbacks : public NimBLECharacteristicCallbacks {
-    public:
-        explicit CharacteristicCallbacks(BlePeripheralImpl& parent) : parent_(parent) {}
-        void onWrite(NimBLECharacteristic* pCharacteristic, NimBLEConnInfo& connInfo) override {
-            const auto& uuid = pCharacteristic->getUUID();
-            NIMBLE_LOGD("BLE_PERIPHERAL", "Write to characteristic: %s", uuid.toString().c_str());
-            auto* char_info = parent_.FindCharacteristic(uuid.toString());
-            if (char_info && char_info->callback) {
-                const std::string& value = pCharacteristic->getValue();
-                char_info->callback(value.data(), value.size());
-            }
-        }
-    private:
-        BlePeripheralImpl& parent_;
-    };
+    /** @brief Callback function type for characteristic events (e.g., onWrite). */
+    using CharCallback = std::function<void(const void *data, size_t size)>;
+    /** @brief Callback function type for MTU change events. */
+    using MtuChangedCallback = std::function<void(uint16_t effective_mtu)>;
 
-    // --- Constructor ---
-    BlePeripheralImpl()
-        : server_callbacks_(*this),
-          char_callbacks_(*this) {}
+    BlePeripheral();
+    ~BlePeripheral();
 
-    // --- Public Interface Implementation ---
-    void Init(const std::string& device_name);
-    void RegisterService(const std::string& service_uuid,
-                         const std::vector<std::tuple<std::string, uint32_t, CharCallback>>& characteristics);
-    void SetCharacteristicValue(const std::string& char_uuid, const void* value, size_t size, bool notify);
+    // Disable copy and move semantics to prevent accidental duplication.
+    BlePeripheral(const BlePeripheral &) = delete;
+    BlePeripheral &operator=(const BlePeripheral &) = delete;
+    BlePeripheral(BlePeripheral &&) = delete;
+    BlePeripheral &operator=(BlePeripheral &&) = delete;
+    
+    /**
+     * @brief Sets the desired MTU for the device.
+     * @note MUST be called before Init().
+     * @param mtu The desired MTU size (e.g., 517).
+     */
+    void SetDesiredMtu(uint16_t mtu);
+
+    /**
+     * @brief Initializes the BLE stack and peripheral.
+     * @param device_name The name for the device to advertise.
+     */
+    void Init(const std::string &device_name);
+
+    /**
+     * @brief Registers a service with its characteristics.
+     * @param service_uuid The UUID of the service.
+     * @param characteristics A vector of tuples, each containing a characteristic's
+     * UUID, its properties (bitwise OR'd), and an optional callback.
+     */
+    void RegisterService(const std::string &service_uuid,
+                         const std::vector<std::tuple<std::string, uint32_t, CharCallback>> &characteristics);
+
+    /**
+     * @brief Sets the value of a characteristic and optionally notifies/indicates the client.
+     * @param char_uuid The UUID of the characteristic to update.
+     * @param value Pointer to the data to set.
+     * @param size The size of the data.
+     * @param notification_type The type of notification to send. Checks if the property is supported.
+     */
+    void SetCharacteristicValue(const std::string &char_uuid, const void *value, size_t size,
+                                NotificationType notification_type = NotificationType::kNone);
+
+    // --- Advertising Management ---
+
+    /** @brief Sets the GAP appearance in the advertising packet. */
     void SetAppearance(uint16_t appearance);
+
+    /** @brief Adds a service UUID to the advertising packet. */
     void AddServiceUuid(const std::string& uuid);
-    void SetServiceData(const std::string& service_uuid, const std::string& data);
+
+    /**
+     * @brief Sets service-specific data in the advertising packet.
+     * @param service_uuid The UUID of the service this data belongs to.
+     * @param data The data to advertise.
+     */
+    void SetServiceData(const std::string &service_uuid, const std::string &data);
+
+    /**
+     * @brief Sets manufacturer-specific data in the advertising packet.
+     * @param data The data payload. Should typically start with a 2-byte company ID.
+     */
     void SetManufacturerData(const std::string& data);
+
+    /** @brief Sets the entire raw advertising payload. */
     void SetRawAdvertisingData(const std::vector<uint8_t>& data);
+
+    /** @brief Sets the entire raw scan response payload. */
     void SetRawScanResponseData(const std::vector<uint8_t>& data);
-    void ClearAdvertisingData(bool clear_scan_response);
-    void StartLegacyAdvertising(bool connectable, uint16_t interval_ms);
+
+    /** @brief Clears all previously set advertising data. */
+    void ClearAdvertisingData(bool clear_scan_response = true);
+
+    /**
+     * @brief Starts legacy BLE advertising.
+     * @param connectable If true, allows clients to connect.
+     * @param interval_ms The desired advertising interval in milliseconds.
+     */
+    void StartLegacyAdvertising(bool connectable = true, uint16_t interval_ms = 100);
+
 #if ENABLE_BLE5_FEATURES
-    void StartExtendedAdvertising(bool connectable, bool scannable, uint16_t interval_ms);
+    /**
+     * @brief Starts BLE 5 extended advertising. (BLE 5 ONLY)
+     * @param connectable If true, allows clients to connect.
+     * @param scannable If true, allows clients to send scan requests.
+     * @param interval_ms The desired advertising interval in milliseconds.
+     */
+    void StartExtendedAdvertising(bool connectable = true, bool scannable = true, uint16_t interval_ms = 100);
+
+    /**
+     * @brief Sets the preferred PHYs for connections. (BLE 5 ONLY)
+     * @param tx_phys_mask A bitmask of preferred transmit PHYs (e.g., kPhy1m | kPhy2m).
+     * @param rx_phys_mask A bitmask of preferred receive PHYs.
+     */
     void SetPreferredPhy(uint8_t tx_phys_mask, uint8_t rx_phys_mask);
 #endif
+
+    /** @brief Stops any active advertising. */
     void StopAdvertising();
+
+    /** @brief Disconnects any currently connected client. */
     void Disconnect();
-    void SetConnectionCallback(std::function<void()> callback) { onConnect_ = std::move(callback); }
-    void SetDisconnectionCallback(std::function<void()> callback) { onDisconnect_ = std::move(callback); }
-    BleState GetState() const { return state_; }
+
+    /** @brief Registers a callback to be invoked when a client connects. */
+    void SetConnectionCallback(std::function<void()> callback);
+
+    /** @brief Registers a callback to be invoked when a client disconnects. */
+    void SetDisconnectionCallback(std::function<void()> callback);
+
+    /** @brief Registers a callback to be invoked when the MTU is negotiated. */
+    void SetMtuChangedCallback(MtuChangedCallback callback);
+
+    /** @brief Gets the current connection state. */
+    BleState GetState() const;
 
 private:
-    CharacteristicInfo* FindCharacteristic(const std::string& uuid);
-
-    // --- Member Variables ---
-    bool initialized_{false};
-    BleState state_{BleState::kIdle};
-    NimBLEServer* pServer_{nullptr};
-    NimBLEAdvertising* pAdvertising_{nullptr};
-    ServerCallbacks server_callbacks_;
-    CharacteristicCallbacks char_callbacks_;
-    std::map<std::string, std::map<std::string, CharacteristicInfo>> serviceCharTable_;
-    std::function<void()> onConnect_{nullptr};
-    std::function<void()> onDisconnect_{nullptr};
+    class BlePeripheralImpl;
+    std::unique_ptr<BlePeripheralImpl> impl_;
 };
 
-// --- BlePeripheralImpl Method Definitions ---
+// --- Operator overloads for convenient bitwise operations on enums ---
 
-BlePeripheral::BlePeripheralImpl::CharacteristicInfo* BlePeripheral::BlePeripheralImpl::FindCharacteristic(const std::string& uuid) {
-    for (auto& servicePair : serviceCharTable_) {
-        auto it = servicePair.second.find(uuid);
-        if (it != servicePair.second.end()) {
-            return &it->second;
-        }
-    }
-    NIMBLE_LOGW("BLE_PERIPHERAL", "Characteristic %s not found", uuid.c_str());
-    return nullptr;
+inline BlePeripheral::CharProperty operator|(BlePeripheral::CharProperty a, BlePeripheral::CharProperty b) {
+    return static_cast<BlePeripheral::CharProperty>(static_cast<uint32_t>(a) | static_cast<uint32_t>(b));
 }
 
-void BlePeripheral::BlePeripheralImpl::Init(const std::string& device_name) {
-    if (initialized_) {
-        NIMBLE_LOGW("BLE_PERIPHERAL", "Already initialized");
-        return;
-    }
-    NIMBLE_LOGI("BLE_PERIPHERAL", "Initializing with device name: %s", device_name.c_str());
-    NimBLEDevice::init(device_name);
-    NimBLEDevice::setMTU(517); // Max MTU for BLE 5
-    NimBLEDevice::setPower(ESP_PWR_LVL_P9);
-
-    pServer_ = NimBLEDevice::createServer();
-    pServer_->setCallbacks(&server_callbacks_);
-
-    pAdvertising_ = NimBLEDevice::getAdvertising();
-    if (pAdvertising_) {
-        pAdvertising_->setName(device_name);
-        pAdvertising_->setScanResponse(true);
-    }
-
-    initialized_ = true;
-    state_ = BleState::kIdle;
+inline uint32_t operator|(uint32_t val, BlePeripheral::CharProperty prop) {
+    return val | static_cast<uint32_t>(prop);
 }
 
-void BlePeripheral::BlePeripheralImpl::RegisterService(
-    const std::string& service_uuid,
-    const std::vector<std::tuple<std::string, uint32_t, BlePeripheral::CharCallback>>& characteristics) {
-    if (!pServer_) {
-        NIMBLE_LOGE("BLE_PERIPHERAL", "Server not initialized. Call Init() first.");
-        return;
-    }
-    NIMBLE_LOGI("BLE_PERIPHERAL", "Registering service: %s", service_uuid.c_str());
-    NimBLEService* pService = pServer_->createService(service_uuid);
-
-    for (const auto& [char_uuid, properties, callback] : characteristics) {
-        NimBLECharacteristic* pChar = pService->createCharacteristic(char_uuid, properties);
-        pChar->setCallbacks(&char_callbacks_);
-        serviceCharTable_[service_uuid][char_uuid] = {properties, callback, pChar};
-        NIMBLE_LOGD("BLE_PERIPHERAL", "  - Characteristic: %s", char_uuid.c_str());
-    }
-    pService->start();
+inline bool operator&(uint32_t val, BlePeripheral::CharProperty prop) {
+    return (val & static_cast<uint32_t>(prop)) != 0;
 }
-
-void BlePeripheral::BlePeripheralImpl::SetCharacteristicValue(const std::string& char_uuid, const void* value, size_t size, bool notify) {
-    auto* char_info = FindCharacteristic(char_uuid);
-    if (!char_info || !char_info->pCharHandle) {
-        return;
-    }
-    char_info->pCharHandle->setValue(static_cast<const uint8_t*>(value), size);
-    if (notify && (char_info->properties & (CharProperty::kNotify | CharProperty::kIndicate))) {
-        if (char_info->properties & CharProperty::kNotify) {
-            char_info->pCharHandle->notify();
-        }
-        if (char_info->properties & CharProperty::kIndicate) {
-            char_info->pCharHandle->indicate();
-        }
-    }
-}
-
-void BlePeripheral::BlePeripheralImpl::SetAppearance(uint16_t appearance) {
-    if (pAdvertising_) pAdvertising_->setAppearance(appearance);
-}
-
-void BlePeripheral::BlePeripheralImpl::AddServiceUuid(const std::string& uuid) {
-     if (pAdvertising_) pAdvertising_->addServiceUUID(uuid);
-}
-
-void BlePeripheral::BlePeripheralImpl::SetServiceData(const std::string& service_uuid, const std::string& data) {
-    if (pAdvertising_) pAdvertising_->setServiceData(service_uuid, data);
-}
-
-void BlePeripheral::BlePeripheralImpl::SetManufacturerData(const std::string& data) {
-    if (pAdvertising_) pAdvertising_->setManufacturerData(data);
-}
-
-void BlePeripheral::BlePeripheralImpl::SetRawAdvertisingData(const std::vector<uint8_t>& data) {
-    if (pAdvertising_) pAdvertising_->setAdvertisingData(std::string(data.begin(), data.end()));
-}
-
-void BlePeripheral::BlePeripheralImpl::SetRawScanResponseData(const std::vector<uint8_t>& data) {
-     if (pAdvertising_) pAdvertising_->setScanResponseData(std::string(data.begin(), data.end()));
-}
-
-void BlePeripheral::BlePeripheralImpl::ClearAdvertisingData(bool clear_scan_response) {
-    if (!pAdvertising_) return;
-    
-    // Stop advertising before modifying the object
-    if (pAdvertising_->isAdvertising()) {
-        pAdvertising_->stop();
-    }
-    
-    // Resetting the advertising object is the cleanest way to clear it.
-    pAdvertising_->reset();
-    
-    // Restore default settings
-    pAdvertising_->setName(NimBLEDevice::getDeviceName());
-    pAdvertising_->setScanResponse(clear_scan_response);
-}
-
-void BlePeripheral::BlePeripheralImpl::StartLegacyAdvertising(bool connectable, uint16_t interval_ms) {
-    if (!pAdvertising_) return;
-    NIMBLE_LOGI("BLE_PERIPHERAL", "Starting legacy advertising...");
-    pAdvertising_->setConnectable(connectable);
-    // Convert ms to 0.625ms units for the interval
-    uint16_t interval_units = interval_ms / 0.625;
-    pAdvertising_->setMinInterval(interval_units);
-    pAdvertising_->setMaxInterval(interval_units);
-    pAdvertising_->start();
-    state_ = BleState::kAdvertising;
-}
-
-#if ENABLE_BLE5_FEATURES
-void BlePeripheral::BlePeripheralImpl::StartExtendedAdvertising(bool connectable, bool scannable, uint16_t interval_ms) {
-    if (!pAdvertising_) return;
-    NIMBLE_LOGI("BLE_PERIPHERAL", "Starting extended advertising...");
-    pAdvertising_->setConnectable(connectable);
-    pAdvertising_->setScannable(scannable);
-    // Convert ms to 0.625ms units for the interval
-    uint16_t interval_units = interval_ms / 0.625;
-    pAdvertising_->setMinInterval(interval_units);
-    pAdvertising_->setMaxInterval(interval_units);
-    // Use instance 0 for extended advertising. No duration limit (0), no max events (0).
-    pAdvertising_->start(0, nullptr, 0);
-    state_ = BleState::kAdvertising;
-}
-
-void BlePeripheral::BlePeripheralImpl::SetPreferredPhy(uint8_t tx_phys_mask, uint8_t rx_phys_mask) {
-    NIMBLE_LOGI("BLE_PERIPHERAL", "Setting preferred PHY: TX=%d, RX=%d", tx_phys_mask, rx_phys_mask);
-    NimBLEDevice::setPhy(static_cast<esp_ble_phy_t>(tx_phys_mask), static_cast<esp_ble_phy_t>(rx_phys_mask));
-}
-#endif
-
-void BlePeripheral::BlePeripheralImpl::StopAdvertising() {
-    if (pAdvertising_ && pAdvertising_->isAdvertising()) {
-        NIMBLE_LOGI("BLE_PERIPHERAL", "Stopping advertising");
-        pAdvertising_->stop();
-        state_ = BleState::kIdle;
-    }
-}
-
-void BlePeripheral::BlePeripheralImpl::Disconnect() {
-    if (pServer_ && state_ == BleState::kConnected) {
-        auto connected_peers = pServer_->getPeerDevices();
-        if (!connected_peers.empty()) {
-            uint16_t conn_id = connected_peers.begin()->first;
-            NIMBLE_LOGI("BLE_PERIPHERAL", "Requesting disconnect from client with ConnID: %d", conn_id);
-            pServer_->disconnect(conn_id);
-        }
-    }
-}
-
-// --- BlePeripheral Public Method Forwarding ---
-// The public methods just call the implementation methods.
-
-BlePeripheral::BlePeripheral() : impl_(std::make_unique<BlePeripheralImpl>()) {}
-BlePeripheral::~BlePeripheral() = default;
-
-void BlePeripheral::Init(const std::string& device_name) { impl_->Init(device_name); }
-void BlePeripheral::RegisterService(const std::string& service_uuid, const std::vector<std::tuple<std::string, uint32_t, CharCallback>>& characteristics) {
-    impl_->RegisterService(service_uuid, characteristics);
-}
-void BlePeripheral::SetCharacteristicValue(const std::string& char_uuid, const void* value, size_t size, bool notify) {
-    impl_->SetCharacteristicValue(char_uuid, value, size, notify);
-}
-void BlePeripheral::SetAppearance(uint16_t appearance) { impl_->SetAppearance(appearance); }
-void BlePeripheral::AddServiceUuid(const std::string& uuid) { impl_->AddServiceUuid(uuid); }
-void BlePeripheral::SetServiceData(const std::string& service_uuid, const std::string& data) { impl_->SetServiceData(service_uuid, data); }
-void BlePeripheral::SetManufacturerData(const std::string& data) { impl_->SetManufacturerData(data); }
-void BlePeripheral::SetRawAdvertisingData(const std::vector<uint8_t>& data) { impl_->SetRawAdvertisingData(data); }
-void BlePeripheral::SetRawScanResponseData(const std::vector<uint8_t>& data) { impl_->SetRawScanResponseData(data); }
-void BlePeripheral::ClearAdvertisingData(bool clear_scan_response) { impl_->ClearAdvertisingData(clear_scan_response); }
-void BlePeripheral::StartLegacyAdvertising(bool connectable, uint16_t interval_ms) { impl_->StartLegacyAdvertising(connectable, interval_ms); }
-#if ENABLE_BLE5_FEATURES
-void BlePeripheral::StartExtendedAdvertising(bool connectable, bool scannable, uint16_t interval_ms) { impl_->StartExtendedAdvertising(connectable, scannable, interval_ms); }
-void BlePeripheral::SetPreferredPhy(uint8_t tx_phys_mask, uint8_t rx_phys_mask) { impl_->SetPreferredPhy(tx_phys_mask, rx_phys_mask); }
-#endif
-void BlePeripheral::StopAdvertising() { impl_->StopAdvertising(); }
-void BlePeripheral::Disconnect() { impl_->Disconnect(); }
-void BlePeripheral::SetConnectionCallback(std::function<void()> callback) { impl_->SetConnectionCallback(std::move(callback)); }
-void BlePeripheral::SetDisconnectionCallback(std::function<void()> callback) { impl_->SetDisconnectionCallback(std::move(callback)); }
-BlePeripheral::BleState BlePeripheral::GetState() const { return impl_->GetState(); }
 
 } // namespace connectivity
 } // namespace platform
-----------------
+
+#endif // PLATFORM_BLE_PERIPHERAL_H_
+--------------------
 
 /**
  * @file ble_peripheral.cc
@@ -336,13 +228,22 @@ public:
         void onConnect(NimBLEServer* pServer, NimBLEConnInfo& connInfo) override {
             NIMBLE_LOGI("BLE_PERIPHERAL", "Client connected: %s", connInfo.getAddress().toString().c_str());
             parent_.state_ = BleState::kConnected;
+            
+            // Invoke MTU changed callback with the negotiated MTU
+            uint16_t effective_mtu = connInfo.getMTU();
+            NIMBLE_LOGI("BLE_PERIPHERAL", "Negotiated MTU: %d", effective_mtu);
+            if (parent_.onMtuChanged_) {
+                parent_.onMtuChanged_(effective_mtu);
+            }
+
             if (parent_.onConnect_) {
                 parent_.onConnect_();
             }
         }
         void onDisconnect(NimBLEServer* pServer, NimBLEConnInfo& connInfo, int reason) override {
             NIMBLE_LOGI("BLE_PERIPHERAL", "Client disconnected, reason: %d", reason);
-            parent_.state_ = BleState::kDisconnected;
+            // After disconnection, the state becomes idle.
+            parent_.state_ = BleState::kIdle;
             if (parent_.onDisconnect_) {
                 parent_.onDisconnect_();
             }
@@ -373,10 +274,11 @@ public:
           char_callbacks_(*this) {}
 
     // --- Public Interface Implementation ---
+    void SetDesiredMtu(uint16_t mtu);
     void Init(const std::string& device_name);
     void RegisterService(const std::string& service_uuid,
                          const std::vector<std::tuple<std::string, uint32_t, CharCallback>>& characteristics);
-    void SetCharacteristicValue(const std::string& char_uuid, const void* value, size_t size, bool notify);
+    void SetCharacteristicValue(const std::string& char_uuid, const void* value, size_t size, NotificationType notification_type);
     void SetAppearance(uint16_t appearance);
     void AddServiceUuid(const std::string& uuid);
     void SetServiceData(const std::string& service_uuid, const std::string& data);
@@ -393,6 +295,7 @@ public:
     void Disconnect();
     void SetConnectionCallback(std::function<void()> callback) { onConnect_ = std::move(callback); }
     void SetDisconnectionCallback(std::function<void()> callback) { onDisconnect_ = std::move(callback); }
+    void SetMtuChangedCallback(MtuChangedCallback callback) { onMtuChanged_ = std::move(callback); }
     BleState GetState() const { return state_; }
 
 private:
@@ -400,6 +303,7 @@ private:
 
     // --- Member Variables ---
     bool initialized_{false};
+    uint16_t desired_mtu_{23}; // Default BLE MTU
     BleState state_{BleState::kIdle};
     NimBLEServer* pServer_{nullptr};
     NimBLEAdvertising* pAdvertising_{nullptr};
@@ -408,6 +312,7 @@ private:
     std::map<std::string, std::map<std::string, CharacteristicInfo>> serviceCharTable_;
     std::function<void()> onConnect_{nullptr};
     std::function<void()> onDisconnect_{nullptr};
+    MtuChangedCallback onMtuChanged_{nullptr};
 };
 
 // --- BlePeripheralImpl Method Definitions ---
@@ -423,6 +328,14 @@ BlePeripheral::BlePeripheralImpl::CharacteristicInfo* BlePeripheral::BlePeripher
     return nullptr;
 }
 
+void BlePeripheral::BlePeripheralImpl::SetDesiredMtu(uint16_t mtu) {
+    if (initialized_) {
+        NIMBLE_LOGW("BLE_PERIPHERAL", "SetDesiredMtu must be called before Init().");
+        return;
+    }
+    desired_mtu_ = mtu;
+}
+
 void BlePeripheral::BlePeripheralImpl::Init(const std::string& device_name) {
     if (initialized_) {
         NIMBLE_LOGW("BLE_PERIPHERAL", "Already initialized");
@@ -430,7 +343,7 @@ void BlePeripheral::BlePeripheralImpl::Init(const std::string& device_name) {
     }
     NIMBLE_LOGI("BLE_PERIPHERAL", "Initializing with device name: %s", device_name.c_str());
     NimBLEDevice::init(device_name);
-    NimBLEDevice::setMTU(517); // Max MTU for BLE 5
+    NimBLEDevice::setMTU(desired_mtu_);
     NimBLEDevice::setPower(ESP_PWR_LVL_P9);
 
     pServer_ = NimBLEDevice::createServer();
@@ -465,18 +378,34 @@ void BlePeripheral::BlePeripheralImpl::RegisterService(
     pService->start();
 }
 
-void BlePeripheral::BlePeripheralImpl::SetCharacteristicValue(const std::string& char_uuid, const void* value, size_t size, bool notify) {
+void BlePeripheral::BlePeripheralImpl::SetCharacteristicValue(const std::string& char_uuid, const void* value, size_t size, NotificationType notification_type) {
     auto* char_info = FindCharacteristic(char_uuid);
     if (!char_info || !char_info->pCharHandle) {
         return;
     }
+
     char_info->pCharHandle->setValue(static_cast<const uint8_t*>(value), size);
-    if (notify && (char_info->properties & (CharProperty::kNotify | CharProperty::kIndicate))) {
+
+    if (notification_type == NotificationType::kNone) {
+        return;
+    }
+
+    // Check if connected before trying to notify/indicate
+    if (state_ != BleState::kConnected) {
+        return;
+    }
+
+    if (notification_type == NotificationType::kNotify) {
         if (char_info->properties & CharProperty::kNotify) {
             char_info->pCharHandle->notify();
+        } else {
+            NIMBLE_LOGW("BLE_PERIPHERAL", "Attempted to notify on characteristic %s which does not support it.", char_uuid.c_str());
         }
+    } else if (notification_type == NotificationType::kIndicate) {
         if (char_info->properties & CharProperty::kIndicate) {
             char_info->pCharHandle->indicate();
+        } else {
+            NIMBLE_LOGW("BLE_PERIPHERAL", "Attempted to indicate on characteristic %s which does not support it.", char_uuid.c_str());
         }
     }
 }
@@ -508,17 +437,19 @@ void BlePeripheral::BlePeripheralImpl::SetRawScanResponseData(const std::vector<
 void BlePeripheral::BlePeripheralImpl::ClearAdvertisingData(bool clear_scan_response) {
     if (!pAdvertising_) return;
     
-    // Stop advertising before modifying the object
-    if (pAdvertising_->isAdvertising()) {
+    bool was_advertising = pAdvertising_->isAdvertising();
+    if (was_advertising) {
         pAdvertising_->stop();
     }
     
-    // Resetting the advertising object is the cleanest way to clear it.
     pAdvertising_->reset();
     
-    // Restore default settings
     pAdvertising_->setName(NimBLEDevice::getDeviceName());
     pAdvertising_->setScanResponse(clear_scan_response);
+
+    if (was_advertising) {
+        pAdvertising_->start();
+    }
 }
 
 void BlePeripheral::BlePeripheralImpl::StartLegacyAdvertising(bool connectable, uint16_t interval_ms) {
@@ -558,7 +489,9 @@ void BlePeripheral::BlePeripheralImpl::StopAdvertising() {
     if (pAdvertising_ && pAdvertising_->isAdvertising()) {
         NIMBLE_LOGI("BLE_PERIPHERAL", "Stopping advertising");
         pAdvertising_->stop();
-        state_ = BleState::kIdle;
+        if (state_ == BleState::kAdvertising) {
+            state_ = BleState::kIdle;
+        }
     }
 }
 
@@ -579,12 +512,13 @@ void BlePeripheral::BlePeripheralImpl::Disconnect() {
 BlePeripheral::BlePeripheral() : impl_(std::make_unique<BlePeripheralImpl>()) {}
 BlePeripheral::~BlePeripheral() = default;
 
+void BlePeripheral::SetDesiredMtu(uint16_t mtu) { impl_->SetDesiredMtu(mtu); }
 void BlePeripheral::Init(const std::string& device_name) { impl_->Init(device_name); }
 void BlePeripheral::RegisterService(const std::string& service_uuid, const std::vector<std::tuple<std::string, uint32_t, CharCallback>>& characteristics) {
     impl_->RegisterService(service_uuid, characteristics);
 }
-void BlePeripheral::SetCharacteristicValue(const std::string& char_uuid, const void* value, size_t size, bool notify) {
-    impl_->SetCharacteristicValue(char_uuid, value, size, notify);
+void BlePeripheral::SetCharacteristicValue(const std::string& char_uuid, const void* value, size_t size, NotificationType notification_type) {
+    impl_->SetCharacteristicValue(char_uuid, value, size, notification_type);
 }
 void BlePeripheral::SetAppearance(uint16_t appearance) { impl_->SetAppearance(appearance); }
 void BlePeripheral::AddServiceUuid(const std::string& uuid) { impl_->AddServiceUuid(uuid); }
@@ -602,6 +536,7 @@ void BlePeripheral::StopAdvertising() { impl_->StopAdvertising(); }
 void BlePeripheral::Disconnect() { impl_->Disconnect(); }
 void BlePeripheral::SetConnectionCallback(std::function<void()> callback) { impl_->SetConnectionCallback(std::move(callback)); }
 void BlePeripheral::SetDisconnectionCallback(std::function<void()> callback) { impl_->SetDisconnectionCallback(std::move(callback)); }
+void BlePeripheral::SetMtuChangedCallback(MtuChangedCallback callback) { impl_->SetMtuChangedCallback(std::move(callback)); }
 BlePeripheral::BleState BlePeripheral::GetState() const { return impl_->GetState(); }
 
 } // namespace connectivity
