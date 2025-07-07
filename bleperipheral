@@ -138,18 +138,17 @@ public:
 #if ENABLE_BLE5_FEATURES
     /**
      * @brief Starts BLE 5 extended advertising. (BLE 5 ONLY)
-     * @param connectable If true, allows clients to connect.
-     * @param scannable If true, allows clients to send scan requests.
+     * @param connectable If true, allows clients to connect. Connectable advertisements are also scannable.
      * @param interval_ms The desired advertising interval in milliseconds.
      */
-    void StartExtendedAdvertising(bool connectable = true, bool scannable = true, uint16_t interval_ms = 100);
+    void StartExtendedAdvertising(bool connectable = true, uint16_t interval_ms = 100);
 
     /**
-     * @brief Sets the preferred PHYs for connections. (BLE 5 ONLY)
+     * @brief Sets the default PHYs for new connections. (BLE 5 ONLY)
      * @param tx_phys_mask A bitmask of preferred transmit PHYs (e.g., kPhy1m | kPhy2m).
      * @param rx_phys_mask A bitmask of preferred receive PHYs.
      */
-    void SetPreferredPhy(uint8_t tx_phys_mask, uint8_t rx_phys_mask);
+    void SetDefaultPhy(uint8_t tx_phys_mask, uint8_t rx_phys_mask);
 #endif
 
     /** @brief Stops any active advertising. */
@@ -193,7 +192,7 @@ inline bool operator&(uint32_t val, BlePeripheral::CharProperty prop) {
 } // namespace platform
 
 #endif // PLATFORM_BLE_PERIPHERAL_H_
---------------------
+
 
 /**
  * @file ble_peripheral.cc
@@ -229,7 +228,6 @@ public:
             NIMBLE_LOGI("BLE_PERIPHERAL", "Client connected: %s", connInfo.getAddress().toString().c_str());
             parent_.state_ = BleState::kConnected;
             
-            // Invoke MTU changed callback with the negotiated MTU
             uint16_t effective_mtu = connInfo.getMTU();
             NIMBLE_LOGI("BLE_PERIPHERAL", "Negotiated MTU: %d", effective_mtu);
             if (parent_.onMtuChanged_) {
@@ -242,7 +240,6 @@ public:
         }
         void onDisconnect(NimBLEServer* pServer, NimBLEConnInfo& connInfo, int reason) override {
             NIMBLE_LOGI("BLE_PERIPHERAL", "Client disconnected, reason: %d", reason);
-            // After disconnection, the state becomes idle.
             parent_.state_ = BleState::kIdle;
             if (parent_.onDisconnect_) {
                 parent_.onDisconnect_();
@@ -288,8 +285,8 @@ public:
     void ClearAdvertisingData(bool clear_scan_response);
     void StartLegacyAdvertising(bool connectable, uint16_t interval_ms);
 #if ENABLE_BLE5_FEATURES
-    void StartExtendedAdvertising(bool connectable, bool scannable, uint16_t interval_ms);
-    void SetPreferredPhy(uint8_t tx_phys_mask, uint8_t rx_phys_mask);
+    void StartExtendedAdvertising(bool connectable, uint16_t interval_ms);
+    void SetDefaultPhy(uint8_t tx_phys_mask, uint8_t rx_phys_mask);
 #endif
     void StopAdvertising();
     void Disconnect();
@@ -300,15 +297,19 @@ public:
 
 private:
     CharacteristicInfo* FindCharacteristic(const std::string& uuid);
+    void ApplyAdvertisingData();
 
     // --- Member Variables ---
     bool initialized_{false};
-    uint16_t desired_mtu_{23}; // Default BLE MTU
+    std::string device_name_;
+    uint16_t desired_mtu_{23};
     BleState state_{BleState::kIdle};
     NimBLEServer* pServer_{nullptr};
     NimBLEAdvertising* pAdvertising_{nullptr};
     ServerCallbacks server_callbacks_;
     CharacteristicCallbacks char_callbacks_;
+    NimBLEAdvertisementData adv_data_;
+    NimBLEAdvertisementData scan_resp_data_;
     std::map<std::string, std::map<std::string, CharacteristicInfo>> serviceCharTable_;
     std::function<void()> onConnect_{nullptr};
     std::function<void()> onDisconnect_{nullptr};
@@ -328,6 +329,13 @@ BlePeripheral::BlePeripheralImpl::CharacteristicInfo* BlePeripheral::BlePeripher
     return nullptr;
 }
 
+void BlePeripheral::BlePeripheralImpl::ApplyAdvertisingData() {
+    if (pAdvertising_) {
+        pAdvertising_->setAdvertisementData(adv_data_);
+        pAdvertising_->setScanResponseData(scan_resp_data_);
+    }
+}
+
 void BlePeripheral::BlePeripheralImpl::SetDesiredMtu(uint16_t mtu) {
     if (initialized_) {
         NIMBLE_LOGW("BLE_PERIPHERAL", "SetDesiredMtu must be called before Init().");
@@ -342,7 +350,8 @@ void BlePeripheral::BlePeripheralImpl::Init(const std::string& device_name) {
         return;
     }
     NIMBLE_LOGI("BLE_PERIPHERAL", "Initializing with device name: %s", device_name.c_str());
-    NimBLEDevice::init(device_name);
+    device_name_ = device_name; // Store the device name
+    NimBLEDevice::init(device_name_);
     NimBLEDevice::setMTU(desired_mtu_);
     NimBLEDevice::setPower(ESP_PWR_LVL_P9);
 
@@ -351,7 +360,7 @@ void BlePeripheral::BlePeripheralImpl::Init(const std::string& device_name) {
 
     pAdvertising_ = NimBLEDevice::getAdvertising();
     if (pAdvertising_) {
-        pAdvertising_->setName(device_name);
+        ClearAdvertisingData(true); // Set up initial advertising data with device name
         pAdvertising_->setScanResponse(true);
     }
 
@@ -386,12 +395,7 @@ void BlePeripheral::BlePeripheralImpl::SetCharacteristicValue(const std::string&
 
     char_info->pCharHandle->setValue(static_cast<const uint8_t*>(value), size);
 
-    if (notification_type == NotificationType::kNone) {
-        return;
-    }
-
-    // Check if connected before trying to notify/indicate
-    if (state_ != BleState::kConnected) {
+    if (notification_type == NotificationType::kNone || state_ != BleState::kConnected) {
         return;
     }
 
@@ -411,52 +415,51 @@ void BlePeripheral::BlePeripheralImpl::SetCharacteristicValue(const std::string&
 }
 
 void BlePeripheral::BlePeripheralImpl::SetAppearance(uint16_t appearance) {
-    if (pAdvertising_) pAdvertising_->setAppearance(appearance);
+    adv_data_.setAppearance(appearance);
+    ApplyAdvertisingData();
 }
 
 void BlePeripheral::BlePeripheralImpl::AddServiceUuid(const std::string& uuid) {
-     if (pAdvertising_) pAdvertising_->addServiceUUID(uuid);
+    adv_data_.addServiceUUID(uuid);
+    ApplyAdvertisingData();
 }
 
 void BlePeripheral::BlePeripheralImpl::SetServiceData(const std::string& service_uuid, const std::string& data) {
-    if (pAdvertising_) pAdvertising_->setServiceData(service_uuid, data);
+    adv_data_.setServiceData(service_uuid, data);
+    ApplyAdvertisingData();
 }
 
 void BlePeripheral::BlePeripheralImpl::SetManufacturerData(const std::string& data) {
-    if (pAdvertising_) pAdvertising_->setManufacturerData(data);
+    adv_data_.setManufacturerData(data);
+    ApplyAdvertisingData();
 }
 
 void BlePeripheral::BlePeripheralImpl::SetRawAdvertisingData(const std::vector<uint8_t>& data) {
-    if (pAdvertising_) pAdvertising_->setAdvertisingData(std::string(data.begin(), data.end()));
+    adv_data_ = NimBLEAdvertisementData(); // Clear existing data
+    adv_data_.addData(std::string(data.begin(), data.end()));
+    ApplyAdvertisingData();
 }
 
 void BlePeripheral::BlePeripheralImpl::SetRawScanResponseData(const std::vector<uint8_t>& data) {
-     if (pAdvertising_) pAdvertising_->setScanResponseData(std::string(data.begin(), data.end()));
+    scan_resp_data_ = NimBLEAdvertisementData(); // Clear existing data
+    scan_resp_data_.addData(std::string(data.begin(), data.end()));
+    ApplyAdvertisingData();
 }
 
 void BlePeripheral::BlePeripheralImpl::ClearAdvertisingData(bool clear_scan_response) {
-    if (!pAdvertising_) return;
-    
-    bool was_advertising = pAdvertising_->isAdvertising();
-    if (was_advertising) {
-        pAdvertising_->stop();
-    }
-    
-    pAdvertising_->reset();
-    
-    pAdvertising_->setName(NimBLEDevice::getDeviceName());
-    pAdvertising_->setScanResponse(clear_scan_response);
+    adv_data_ = NimBLEAdvertisementData();
+    adv_data_.setName(device_name_); // Restore the device name
 
-    if (was_advertising) {
-        pAdvertising_->start();
+    if (clear_scan_response) {
+        scan_resp_data_ = NimBLEAdvertisementData();
     }
+    ApplyAdvertisingData();
 }
 
 void BlePeripheral::BlePeripheralImpl::StartLegacyAdvertising(bool connectable, uint16_t interval_ms) {
     if (!pAdvertising_) return;
     NIMBLE_LOGI("BLE_PERIPHERAL", "Starting legacy advertising...");
     pAdvertising_->setConnectable(connectable);
-    // Convert ms to 0.625ms units for the interval
     uint16_t interval_units = interval_ms / 0.625;
     pAdvertising_->setMinInterval(interval_units);
     pAdvertising_->setMaxInterval(interval_units);
@@ -465,23 +468,24 @@ void BlePeripheral::BlePeripheralImpl::StartLegacyAdvertising(bool connectable, 
 }
 
 #if ENABLE_BLE5_FEATURES
-void BlePeripheral::BlePeripheralImpl::StartExtendedAdvertising(bool connectable, bool scannable, uint16_t interval_ms) {
+void BlePeripheral::BlePeripheralImpl::StartExtendedAdvertising(bool connectable, uint16_t interval_ms) {
     if (!pAdvertising_) return;
     NIMBLE_LOGI("BLE_PERIPHERAL", "Starting extended advertising...");
     pAdvertising_->setConnectable(connectable);
-    pAdvertising_->setScannable(scannable);
-    // Convert ms to 0.625ms units for the interval
+    
     uint16_t interval_units = interval_ms / 0.625;
     pAdvertising_->setMinInterval(interval_units);
     pAdvertising_->setMaxInterval(interval_units);
-    // Use instance 0 for extended advertising. No duration limit (0), no max events (0).
-    pAdvertising_->start(0, nullptr, 0);
+
+    // Correct signature: start(instance, duration, max_events)
+    // Using instance 0, no duration limit (0), no max events limit (0).
+    pAdvertising_->start(0, 0, 0);
     state_ = BleState::kAdvertising;
 }
 
-void BlePeripheral::BlePeripheralImpl::SetPreferredPhy(uint8_t tx_phys_mask, uint8_t rx_phys_mask) {
-    NIMBLE_LOGI("BLE_PERIPHERAL", "Setting preferred PHY: TX=%d, RX=%d", tx_phys_mask, rx_phys_mask);
-    NimBLEDevice::setPhy(static_cast<esp_ble_phy_t>(tx_phys_mask), static_cast<esp_ble_phy_t>(rx_phys_mask));
+void BlePeripheral::BlePeripheralImpl::SetDefaultPhy(uint8_t tx_phys_mask, uint8_t rx_phys_mask) {
+    NIMBLE_LOGI("BLE_PERIPHERAL", "Setting default PHY for new connections: TX=%d, RX=%d", tx_phys_mask, rx_phys_mask);
+    NimBLEDevice::setDefaultPhy(static_cast<esp_ble_phy_t>(tx_phys_mask), static_cast<esp_ble_phy_t>(rx_phys_mask));
 }
 #endif
 
@@ -507,8 +511,6 @@ void BlePeripheral::BlePeripheralImpl::Disconnect() {
 }
 
 // --- BlePeripheral Public Method Forwarding ---
-// The public methods just call the implementation methods.
-
 BlePeripheral::BlePeripheral() : impl_(std::make_unique<BlePeripheralImpl>()) {}
 BlePeripheral::~BlePeripheral() = default;
 
@@ -529,8 +531,8 @@ void BlePeripheral::SetRawScanResponseData(const std::vector<uint8_t>& data) { i
 void BlePeripheral::ClearAdvertisingData(bool clear_scan_response) { impl_->ClearAdvertisingData(clear_scan_response); }
 void BlePeripheral::StartLegacyAdvertising(bool connectable, uint16_t interval_ms) { impl_->StartLegacyAdvertising(connectable, interval_ms); }
 #if ENABLE_BLE5_FEATURES
-void BlePeripheral::StartExtendedAdvertising(bool connectable, bool scannable, uint16_t interval_ms) { impl_->StartExtendedAdvertising(connectable, scannable, interval_ms); }
-void BlePeripheral::SetPreferredPhy(uint8_t tx_phys_mask, uint8_t rx_phys_mask) { impl_->SetPreferredPhy(tx_phys_mask, rx_phys_mask); }
+void BlePeripheral::StartExtendedAdvertising(bool connectable, uint16_t interval_ms) { impl_->StartExtendedAdvertising(connectable, interval_ms); }
+void BlePeripheral::SetDefaultPhy(uint8_t tx_phys_mask, uint8_t rx_phys_mask) { impl_->SetDefaultPhy(tx_phys_mask, rx_phys_mask); }
 #endif
 void BlePeripheral::StopAdvertising() { impl_->StopAdvertising(); }
 void BlePeripheral::Disconnect() { impl_->Disconnect(); }
@@ -541,3 +543,4 @@ BlePeripheral::BleState BlePeripheral::GetState() const { return impl_->GetState
 
 } // namespace connectivity
 } // namespace platform
+
