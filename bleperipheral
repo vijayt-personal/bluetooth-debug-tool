@@ -215,7 +215,6 @@ namespace platform {
 namespace connectivity {
 
 // --- PIMPL Implementation Class ---
-// This class contains all the private members and implementation details.
 class BlePeripheral::BlePeripheralImpl {
 public:
     // --- Types ---
@@ -302,7 +301,8 @@ public:
 
 private:
     CharacteristicInfo* FindCharacteristic(const std::string& uuid);
-    void RebuildAndApplyAdvertisingData();
+    void ApplyAdvertisingState();
+    void RebuildAdvertisementFromComponents();
 
     // --- Member Variables ---
     bool initialized_{false};
@@ -318,7 +318,9 @@ private:
     std::function<void()> onDisconnect_{nullptr};
     MtuChangedCallback onMtuChanged_{nullptr};
 
-    // --- Advertising Data Components ---
+    // --- Advertising Data Objects and Components ---
+    NimBLEAdvertisementData adv_data_;
+    NimBLEAdvertisementData scan_resp_data_;
     uint8_t adv_flags_{BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP};
     uint16_t appearance_{0};
     std::string manufacturer_data_;
@@ -339,26 +341,7 @@ BlePeripheral::BlePeripheralImpl::CharacteristicInfo* BlePeripheral::BlePeripher
     return nullptr;
 }
 
-void BlePeripheral::BlePeripheralImpl::RebuildAndApplyAdvertisingData() {
-    auto adv_data = NimBLEAdvertisementData();
-    adv_data.setFlags(adv_flags_);
-
-    if (appearance_ != 0) {
-        adv_data.setAppearance(appearance_);
-    }
-    if (!manufacturer_data_.empty()) {
-        adv_data.setManufacturerData(manufacturer_data_);
-    }
-    for (const auto& uuid : service_uuids_) {
-        adv_data.addServiceUUID(uuid);
-    }
-    for (const auto& pair : service_data_map_) {
-        adv_data.setServiceData(pair.first, pair.second);
-    }
-
-    auto scan_resp_data = NimBLEAdvertisementData();
-    scan_resp_data.setName(device_name_);
-
+void BlePeripheral::BlePeripheralImpl::ApplyAdvertisingState() {
     if (!pAdvertising_) {
         return;
     }
@@ -368,12 +351,38 @@ void BlePeripheral::BlePeripheralImpl::RebuildAndApplyAdvertisingData() {
         pAdvertising_->stop();
     }
 
-    pAdvertising_->setAdvertisementData(adv_data);
-    pAdvertising_->setScanResponseData(scan_resp_data);
+    pAdvertising_->setAdvertisementData(adv_data_);
+    pAdvertising_->setScanResponseData(scan_resp_data_);
 
     if (is_advertising) {
         pAdvertising_->start();
     }
+}
+
+void BlePeripheral::BlePeripheralImpl::RebuildAdvertisementFromComponents() {
+    // Completely clear and rebuild the main advertisement packet
+    adv_data_ = NimBLEAdvertisementData();
+    adv_data_.setFlags(adv_flags_);
+
+    if (appearance_ != 0) {
+        adv_data_.setAppearance(appearance_);
+    }
+    if (!manufacturer_data_.empty()) {
+        adv_data_.setManufacturerData(manufacturer_data_);
+    }
+    for (const auto& uuid : service_uuids_) {
+        adv_data_.addServiceUUID(uuid);
+    }
+    for (const auto& pair : service_data_map_) {
+        adv_data_.setServiceData(pair.first, pair.second);
+    }
+
+    // Completely clear and rebuild the scan response packet
+    scan_resp_data_ = NimBLEAdvertisementData();
+    scan_resp_data_.setName(device_name_);
+
+    // Apply the newly built packets
+    ApplyAdvertisingState();
 }
 
 void BlePeripheral::BlePeripheralImpl::SetDesiredMtu(uint16_t mtu) {
@@ -401,7 +410,7 @@ void BlePeripheral::BlePeripheralImpl::Init(const std::string& device_name) {
     pAdvertising_ = NimBLEDevice::getAdvertising();
     if (pAdvertising_) {
         pAdvertising_->enableScanResponse(true);
-        RebuildAndApplyAdvertisingData(); 
+        RebuildAdvertisementFromComponents(); 
     }
 
     initialized_ = true;
@@ -422,70 +431,56 @@ void BlePeripheral::BlePeripheralImpl::RegisterService(
         NimBLECharacteristic* pChar = pService->createCharacteristic(char_uuid, properties);
         pChar->setCallbacks(&char_callbacks_);
         serviceCharTable_[service_uuid][char_uuid] = {properties, callback, pChar};
-        NIMBLE_LOGD("BLE_PERIPHERAL", "  - Characteristic: %s", char_uuid.c_str());
     }
     pService->start();
 }
 
 void BlePeripheral::BlePeripheralImpl::SetCharacteristicValue(const std::string& char_uuid, const void* value, size_t size, NotificationType notification_type) {
     auto* char_info = FindCharacteristic(char_uuid);
-    if (!char_info || !char_info->pCharHandle) {
-        return;
-    }
-
+    if (!char_info || !char_info->pCharHandle) return;
     char_info->pCharHandle->setValue(static_cast<const uint8_t*>(value), size);
+    if (notification_type == NotificationType::kNone || state_ != BleState::kConnected) return;
 
-    if (notification_type == NotificationType::kNone || state_ != BleState::kConnected) {
-        return;
-    }
-
-    if (notification_type == NotificationType::kNotify) {
-        if (char_info->properties & CharProperty::kNotify) {
-            char_info->pCharHandle->notify();
-        } else {
-            NIMBLE_LOGW("BLE_PERIPHERAL", "Attempted to notify on characteristic %s which does not support it.", char_uuid.c_str());
-        }
-    } else if (notification_type == NotificationType::kIndicate) {
-        if (char_info->properties & CharProperty::kIndicate) {
-            char_info->pCharHandle->indicate();
-        } else {
-            NIMBLE_LOGW("BLE_PERIPHERAL", "Attempted to indicate on characteristic %s which does not support it.", char_uuid.c_str());
-        }
+    if (notification_type == NotificationType::kNotify && (char_info->properties & CharProperty::kNotify)) {
+        char_info->pCharHandle->notify();
+    } else if (notification_type == NotificationType::kIndicate && (char_info->properties & CharProperty::kIndicate)) {
+        char_info->pCharHandle->indicate();
     }
 }
 
 void BlePeripheral::BlePeripheralImpl::SetAppearance(uint16_t appearance) {
     appearance_ = appearance;
-    RebuildAndApplyAdvertisingData();
+    RebuildAdvertisementFromComponents();
 }
 
 void BlePeripheral::BlePeripheralImpl::AddServiceUuid(const std::string& uuid) {
     if (std::find(service_uuids_.begin(), service_uuids_.end(), uuid) == service_uuids_.end()) {
         service_uuids_.push_back(uuid);
     }
-    RebuildAndApplyAdvertisingData();
+    RebuildAdvertisementFromComponents();
 }
 
-void BlePeripheral::BlePeripheralImpl::SetServiceData(const std::string& service_uuid, const std::string& data) {
-    service_data_map_[service_uuid] = data;
-    RebuildAndApplyAdvertisingData();
+void BlePeripheral::BlePeripheralImpl::SetServiceData(const std::string& service_uuid, const uint8_t* data, size_t size) {
+    service_data_map_[service_uuid] = std::string(reinterpret_cast<const char*>(data), size);
+    RebuildAdvertisementFromComponents();
 }
 
-void BlePeripheral::BlePeripheralImpl::SetManufacturerData(const std::string& data) {
-    manufacturer_data_ = data;
-    RebuildAndApplyAdvertisingData();
+void BlePeripheral::BlePeripheralImpl::SetManufacturerData(const uint8_t* data, size_t size) {
+    manufacturer_data_ = std::string(reinterpret_cast<const char*>(data), size);
+    RebuildAdvertisementFromComponents();
 }
 
-void BlePeripheral::BlePeripheralImpl::SetRawAdvertisingData(const std::string& data) {
-    auto adv_data = NimBLEAdvertisementData();
-    adv_data.addData(data);
-    pAdvertising_->setAdvertisementData(adv_data);
+void BlePeripheral::BlePeripheralImpl::SetRawAdvertisingData(const uint8_t* data, size_t size) {
+    adv_data_ = NimBLEAdvertisementData();
+    // The NimBLE addData function is not const-correct, so a cast is needed.
+    adv_data_.addData(const_cast<uint8_t*>(data), size);
+    ApplyAdvertisingState();
 }
 
-void BlePeripheral::BlePeripheralImpl::SetRawScanResponseData(const std::string& data) {
-    auto scan_resp_data = NimBLEAdvertisementData();
-    scan_resp_data.addData(data);
-    pAdvertising_->setScanResponseData(scan_resp_data);
+void BlePeripheral::BlePeripheralImpl::SetRawScanResponseData(const uint8_t* data, size_t size) {
+    scan_resp_data_ = NimBLEAdvertisementData();
+    scan_resp_data_.addData(const_cast<uint8_t*>(data), size);
+    ApplyAdvertisingState();
 }
 
 void BlePeripheral::BlePeripheralImpl::ClearAdvertisingData(bool clear_scan_response) {
@@ -493,8 +488,7 @@ void BlePeripheral::BlePeripheralImpl::ClearAdvertisingData(bool clear_scan_resp
     manufacturer_data_.clear();
     service_uuids_.clear();
     service_data_map_.clear();
-    
-    RebuildAndApplyAdvertisingData();
+    RebuildAdvertisementFromComponents();
 }
 
 void BlePeripheral::BlePeripheralImpl::StartLegacyAdvertising(bool connectable, uint16_t interval_ms) {
@@ -504,9 +498,7 @@ void BlePeripheral::BlePeripheralImpl::StartLegacyAdvertising(bool connectable, 
     uint16_t interval_units = interval_ms / 0.625;
     pAdvertising_->setMinInterval(interval_units);
     pAdvertising_->setMaxInterval(interval_units);
-    
-    RebuildAndApplyAdvertisingData();
-    
+    RebuildAdvertisementFromComponents();
     pAdvertising_->start();
     state_ = BleState::kAdvertising;
 }
@@ -516,13 +508,10 @@ void BlePeripheral::BlePeripheralImpl::StartExtendedAdvertising(bool connectable
     if (!pAdvertising_) return;
     NIMBLE_LOGI("BLE_PERIPHERAL", "Starting extended advertising...");
     pAdvertising_->setConnectableMode(connectable ? BLE_GAP_CONN_MODE_UND : BLE_GAP_CONN_MODE_NON);
-    
     uint16_t interval_units = interval_ms / 0.625;
     pAdvertising_->setMinInterval(interval_units);
     pAdvertising_->setMaxInterval(interval_units);
-
-    RebuildAndApplyAdvertisingData();
-
+    RebuildAdvertisementFromComponents();
     pAdvertising_->start(0, 0, 0);
     state_ = BleState::kAdvertising;
 }
@@ -548,7 +537,6 @@ void BlePeripheral::BlePeripheralImpl::Disconnect() {
         auto connected_peers = pServer_->getPeerDevices();
         if (!connected_peers.empty()) {
             uint16_t conn_id = connected_peers.begin()->first;
-            NIMBLE_LOGI("BLE_PERIPHERAL", "Requesting disconnect from client with ConnID: %d", conn_id);
             pServer_->disconnect(conn_id);
         }
     }
@@ -569,28 +557,28 @@ void BlePeripheral::SetCharacteristicValue(const std::string& char_uuid, const v
 void BlePeripheral::SetAppearance(uint16_t appearance) { impl_->SetAppearance(appearance); }
 void BlePeripheral::AddServiceUuid(const std::string& uuid) { impl_->AddServiceUuid(uuid); }
 void BlePeripheral::SetServiceData(const std::string &service_uuid, const uint8_t* data, size_t size) {
-    impl_->SetServiceData(service_uuid, std::string(reinterpret_cast<const char*>(data), size));
+    impl_->SetServiceData(service_uuid, data, size);
 }
 void BlePeripheral::SetServiceData(const std::string &service_uuid, const std::vector<uint8_t>& data) {
-    impl_->SetServiceData(service_uuid, std::string(data.begin(), data.end()));
+    impl_->SetServiceData(service_uuid, data.data(), data.size());
 }
 void BlePeripheral::SetManufacturerData(const uint8_t* data, size_t size) {
-    impl_->SetManufacturerData(std::string(reinterpret_cast<const char*>(data), size));
+    impl_->SetManufacturerData(data, size);
 }
 void BlePeripheral::SetManufacturerData(const std::vector<uint8_t>& data) {
-    impl_->SetManufacturerData(std::string(data.begin(), data.end()));
+    impl_->SetManufacturerData(data.data(), data.size());
 }
 void BlePeripheral::SetRawAdvertisingData(const uint8_t* data, size_t size) {
-    impl_->SetRawAdvertisingData(std::string(reinterpret_cast<const char*>(data), size));
+    impl_->SetRawAdvertisingData(data, size);
 }
 void BlePeripheral::SetRawAdvertisingData(const std::vector<uint8_t>& data) {
-    impl_->SetRawAdvertisingData(std::string(data.begin(), data.end()));
+    impl_->SetRawAdvertisingData(data.data(), data.size());
 }
 void BlePeripheral::SetRawScanResponseData(const uint8_t* data, size_t size) {
-    impl_->SetRawScanResponseData(std::string(reinterpret_cast<const char*>(data), size));
+    impl_->SetRawScanResponseData(data, size);
 }
 void BlePeripheral::SetRawScanResponseData(const std::vector<uint8_t>& data) {
-    impl_->SetRawScanResponseData(std::string(data.begin(), data.end()));
+    impl_->SetRawScanResponseData(data.data(), data.size());
 }
 void BlePeripheral::ClearAdvertisingData(bool clear_scan_response) { impl_->ClearAdvertisingData(clear_scan_response); }
 void BlePeripheral::StartLegacyAdvertising(bool connectable, uint16_t interval_ms) { impl_->StartLegacyAdvertising(connectable, interval_ms); }
@@ -607,62 +595,3 @@ BlePeripheral::BleState BlePeripheral::GetState() const { return impl_->GetState
 
 } // namespace connectivity
 } // namespace platform
-#include <iostream>
-#include <string>
-#include <vector>
-#include <chrono>   // For std::chrono
-#include <thread>   // For std::this_thread
-#include "ble_peripheral.h" // Include the header for our class
-
-// For a real ESP32 project, you would include these for logging and delays
-// #include "esp_log.h"
-// #include "freertos/FreeRTOS.h"
-// #include "freertos/task.h"
-
-// Use our class from the platform::connectivity namespace
-using platform::connectivity::BlePeripheral;
-
-// Create an instance of our peripheral
-BlePeripheral ble_peripheral;
-
-// Main application entry point
-// In an ESP-IDF project, this would be `extern "C" void app_main(void)`
-int main() {
-    std::cout << "BLE Peripheral - Dynamic Raw Byte Service Data Example" << std::endl;
-
-    // 1. Initialize the peripheral
-    ble_peripheral.Init("Dynamic-Data-Device");
-
-    // 2. Define the UUID for the service data we will update
-    const std::string service_data_uuid = "00001234-0000-1000-8000-00805f9b34fb";
-    
-    // 3. Set some initial service data using a raw byte array
-    uint8_t initial_data[] = {0x01, 0x02, 0x03}; // Example initial bytes
-    std::cout << "Setting initial service data using raw bytes." << std::endl;
-    ble_peripheral.SetServiceData(service_data_uuid, initial_data, sizeof(initial_data));
-
-    // 4. Start advertising
-    ble_peripheral.StartLegacyAdvertising();
-    std::cout << "Advertising started. Check for 'Dynamic-Data-Device' with a BLE scanner." << std::endl;
-
-    // 5. Main application loop to dynamically update the data
-    uint8_t update_counter = 0;
-    while (true) {
-        // Delay for 5 seconds
-        // On ESP32 this would be: vTaskDelay(5000 / portTICK_PERIOD_MS);
-        std::this_thread::sleep_for(std::chrono::seconds(5));
-
-        // Prepare the new data as a vector of bytes
-        std::vector<uint8_t> new_data_bytes;
-        new_data_bytes.push_back(0xDE); // A constant header byte
-        new_data_bytes.push_back(0xAD); // Another constant header byte
-        new_data_bytes.push_back(update_counter++); // The dynamic counter byte
-        
-        std::cout << "Updating service data with new byte array. Counter: " << (int)new_data_bytes[2] << std::endl;
-
-        // Use the direct uint8_t* overload.
-        ble_peripheral.SetServiceData(service_data_uuid, new_data_bytes.data(), new_data_bytes.size());
-    }
-
-    return 0;
-}
