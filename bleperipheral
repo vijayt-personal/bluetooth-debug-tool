@@ -119,13 +119,19 @@ public:
      */
     void SetManufacturerData(const std::string& data);
 
-    /** @brief Sets the entire raw advertising payload. */
+    /** @brief Sets the entire raw advertising payload from a byte vector. */
     void SetRawAdvertisingData(const std::vector<uint8_t>& data);
 
-    /** @brief Sets the entire raw scan response payload. */
-    void SetRawScanResponseData(const std::vector<uint8_t>& data);
+    /** @brief Sets the entire raw advertising payload from a string. */
+    void SetRawAdvertisingData(const std::string& data);
 
-    /** @brief Clears all previously set advertising data. */
+    /** @brief Sets the entire raw scan response payload from a byte vector. */
+    void SetRawScanResponseData(const std::vector<uint8_t>& data);
+    
+    /** @brief Sets the entire raw scan response payload from a string. */
+    void SetRawScanResponseData(const std::string& data);
+
+    /** @brief Clears advertising data. Resets scan response to include device name by default. */
     void ClearAdvertisingData(bool clear_scan_response = true);
 
     /**
@@ -192,7 +198,6 @@ inline bool operator&(uint32_t val, BlePeripheral::CharProperty prop) {
 } // namespace platform
 
 #endif // PLATFORM_BLE_PERIPHERAL_H_
-
 
 /**
  * @file ble_peripheral.cc
@@ -280,8 +285,8 @@ public:
     void AddServiceUuid(const std::string& uuid);
     void SetServiceData(const std::string& service_uuid, const std::string& data);
     void SetManufacturerData(const std::string& data);
-    void SetRawAdvertisingData(const std::vector<uint8_t>& data);
-    void SetRawScanResponseData(const std::vector<uint8_t>& data);
+    void SetRawAdvertisingData(const std::string& data);
+    void SetRawScanResponseData(const std::string& data);
     void ClearAdvertisingData(bool clear_scan_response);
     void StartLegacyAdvertising(bool connectable, uint16_t interval_ms);
 #if ENABLE_BLE5_FEATURES
@@ -360,8 +365,8 @@ void BlePeripheral::BlePeripheralImpl::Init(const std::string& device_name) {
 
     pAdvertising_ = NimBLEDevice::getAdvertising();
     if (pAdvertising_) {
-        ClearAdvertisingData(true); // Set up initial advertising data with device name
-        pAdvertising_->setScanResponse(true);
+        ClearAdvertisingData(true); // Set up initial advertising and scan response data
+        pAdvertising_->enableScanResponse(true);
     }
 
     initialized_ = true;
@@ -434,24 +439,25 @@ void BlePeripheral::BlePeripheralImpl::SetManufacturerData(const std::string& da
     ApplyAdvertisingData();
 }
 
-void BlePeripheral::BlePeripheralImpl::SetRawAdvertisingData(const std::vector<uint8_t>& data) {
+void BlePeripheral::BlePeripheralImpl::SetRawAdvertisingData(const std::string& data) {
     adv_data_ = NimBLEAdvertisementData(); // Clear existing data
-    adv_data_.addData(std::string(data.begin(), data.end()));
+    adv_data_.addData(data);
     ApplyAdvertisingData();
 }
 
-void BlePeripheral::BlePeripheralImpl::SetRawScanResponseData(const std::vector<uint8_t>& data) {
+void BlePeripheral::BlePeripheralImpl::SetRawScanResponseData(const std::string& data) {
     scan_resp_data_ = NimBLEAdvertisementData(); // Clear existing data
-    scan_resp_data_.addData(std::string(data.begin(), data.end()));
+    scan_resp_data_.addData(data);
     ApplyAdvertisingData();
 }
 
 void BlePeripheral::BlePeripheralImpl::ClearAdvertisingData(bool clear_scan_response) {
     adv_data_ = NimBLEAdvertisementData();
-    adv_data_.setName(device_name_); // Restore the device name
+    adv_data_.setName(device_name_); // Restore the device name to main advertisement
 
     if (clear_scan_response) {
         scan_resp_data_ = NimBLEAdvertisementData();
+        scan_resp_data_.setName(device_name_); // Set device name in scan response by default
     }
     ApplyAdvertisingData();
 }
@@ -459,7 +465,7 @@ void BlePeripheral::BlePeripheralImpl::ClearAdvertisingData(bool clear_scan_resp
 void BlePeripheral::BlePeripheralImpl::StartLegacyAdvertising(bool connectable, uint16_t interval_ms) {
     if (!pAdvertising_) return;
     NIMBLE_LOGI("BLE_PERIPHERAL", "Starting legacy advertising...");
-    pAdvertising_->setConnectable(connectable);
+    pAdvertising_->setConnectableMode(connectable ? BLE_GAP_CONN_MODE_UND : BLE_GAP_CONN_MODE_NON);
     uint16_t interval_units = interval_ms / 0.625;
     pAdvertising_->setMinInterval(interval_units);
     pAdvertising_->setMaxInterval(interval_units);
@@ -471,14 +477,13 @@ void BlePeripheral::BlePeripheralImpl::StartLegacyAdvertising(bool connectable, 
 void BlePeripheral::BlePeripheralImpl::StartExtendedAdvertising(bool connectable, uint16_t interval_ms) {
     if (!pAdvertising_) return;
     NIMBLE_LOGI("BLE_PERIPHERAL", "Starting extended advertising...");
-    pAdvertising_->setConnectable(connectable);
+    pAdvertising_->setConnectableMode(connectable ? BLE_GAP_CONN_MODE_UND : BLE_GAP_CONN_MODE_NON);
     
     uint16_t interval_units = interval_ms / 0.625;
     pAdvertising_->setMinInterval(interval_units);
     pAdvertising_->setMaxInterval(interval_units);
 
     // Correct signature: start(instance, duration, max_events)
-    // Using instance 0, no duration limit (0), no max events limit (0).
     pAdvertising_->start(0, 0, 0);
     state_ = BleState::kAdvertising;
 }
@@ -526,8 +531,10 @@ void BlePeripheral::SetAppearance(uint16_t appearance) { impl_->SetAppearance(ap
 void BlePeripheral::AddServiceUuid(const std::string& uuid) { impl_->AddServiceUuid(uuid); }
 void BlePeripheral::SetServiceData(const std::string& service_uuid, const std::string& data) { impl_->SetServiceData(service_uuid, data); }
 void BlePeripheral::SetManufacturerData(const std::string& data) { impl_->SetManufacturerData(data); }
-void BlePeripheral::SetRawAdvertisingData(const std::vector<uint8_t>& data) { impl_->SetRawAdvertisingData(data); }
-void BlePeripheral::SetRawScanResponseData(const std::vector<uint8_t>& data) { impl_->SetRawScanResponseData(data); }
+void BlePeripheral::SetRawAdvertisingData(const std::vector<uint8_t>& data) { impl_->SetRawAdvertisingData(std::string(data.begin(), data.end())); }
+void BlePeripheral::SetRawAdvertisingData(const std::string& data) { impl_->SetRawAdvertisingData(data); }
+void BlePeripheral::SetRawScanResponseData(const std::vector<uint8_t>& data) { impl_->SetRawScanResponseData(std::string(data.begin(), data.end())); }
+void BlePeripheral::SetRawScanResponseData(const std::string& data) { impl_->SetRawScanResponseData(data); }
 void BlePeripheral::ClearAdvertisingData(bool clear_scan_response) { impl_->ClearAdvertisingData(clear_scan_response); }
 void BlePeripheral::StartLegacyAdvertising(bool connectable, uint16_t interval_ms) { impl_->StartLegacyAdvertising(connectable, interval_ms); }
 #if ENABLE_BLE5_FEATURES
