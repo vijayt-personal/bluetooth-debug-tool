@@ -106,30 +106,39 @@ public:
     /** @brief Adds a service UUID to the advertising packet. */
     void AddServiceUuid(const std::string& uuid);
 
-    /**
-     * @brief Sets service-specific data in the advertising packet.
-     * @param service_uuid The UUID of the service this data belongs to.
-     * @param data The data to advertise.
-     */
+    /** @brief Sets service-specific data from a string. */
     void SetServiceData(const std::string &service_uuid, const std::string &data);
+    
+    /** @brief Sets service-specific data from raw bytes. */
+    void SetServiceData(const std::string &service_uuid, const uint8_t* data, size_t size);
 
-    /**
-     * @brief Sets manufacturer-specific data in the advertising packet.
-     * @param data The data payload. Should typically start with a 2-byte company ID.
-     */
+    /** @brief Sets service-specific data from a byte vector. */
+    void SetServiceData(const std::string &service_uuid, const std::vector<uint8_t>& data);
+
+
+    /** @brief Sets manufacturer-specific data from a string. */
     void SetManufacturerData(const std::string& data);
+
+    /** @brief Sets manufacturer-specific data from raw bytes. */
+    void SetManufacturerData(const uint8_t* data, size_t size);
+
+    /** @brief Sets manufacturer-specific data from a byte vector. */
+    void SetManufacturerData(const std::vector<uint8_t>& data);
+
 
     /** @brief Sets the entire raw advertising payload from a byte vector. */
     void SetRawAdvertisingData(const std::vector<uint8_t>& data);
 
-    /** @brief Sets the entire raw advertising payload from a string. */
-    void SetRawAdvertisingData(const std::string& data);
+    /** @brief Sets the entire raw advertising payload from raw bytes. */
+    void SetRawAdvertisingData(const uint8_t* data, size_t size);
+
 
     /** @brief Sets the entire raw scan response payload from a byte vector. */
     void SetRawScanResponseData(const std::vector<uint8_t>& data);
     
-    /** @brief Sets the entire raw scan response payload from a string. */
-    void SetRawScanResponseData(const std::string& data);
+    /** @brief Sets the entire raw scan response payload from raw bytes. */
+    void SetRawScanResponseData(const uint8_t* data, size_t size);
+
 
     /** @brief Clears advertising data. Resets scan response to include device name by default. */
     void ClearAdvertisingData(bool clear_scan_response = true);
@@ -182,8 +191,8 @@ private:
 
 // --- Operator overloads for convenient bitwise operations on enums ---
 
-inline BlePeripheral::CharProperty operator|(BlePeripheral::CharProperty a, BlePeripheral::CharProperty b) {
-    return static_cast<BlePeripheral::CharProperty>(static_cast<uint32_t>(a) | static_cast<uint32_t>(b));
+inline uint32_t operator|(BlePeripheral::CharProperty a, BlePeripheral::CharProperty b) {
+    return static_cast<uint32_t>(a) | static_cast<uint32_t>(b);
 }
 
 inline uint32_t operator|(uint32_t val, BlePeripheral::CharProperty prop) {
@@ -453,11 +462,13 @@ void BlePeripheral::BlePeripheralImpl::SetRawScanResponseData(const std::string&
 
 void BlePeripheral::BlePeripheralImpl::ClearAdvertisingData(bool clear_scan_response) {
     adv_data_ = NimBLEAdvertisementData();
-    adv_data_.setName(device_name_); // Restore the device name to main advertisement
+    // Set standard flags in main advertising packet
+    adv_data_.setFlags(BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP);
 
     if (clear_scan_response) {
         scan_resp_data_ = NimBLEAdvertisementData();
-        scan_resp_data_.setName(device_name_); // Set device name in scan response by default
+        // Set device name ONLY in scan response packet
+        scan_resp_data_.setName(device_name_);
     }
     ApplyAdvertisingData();
 }
@@ -483,7 +494,6 @@ void BlePeripheral::BlePeripheralImpl::StartExtendedAdvertising(bool connectable
     pAdvertising_->setMinInterval(interval_units);
     pAdvertising_->setMaxInterval(interval_units);
 
-    // Correct signature: start(instance, duration, max_events)
     pAdvertising_->start(0, 0, 0);
     state_ = BleState::kAdvertising;
 }
@@ -530,11 +540,27 @@ void BlePeripheral::SetCharacteristicValue(const std::string& char_uuid, const v
 void BlePeripheral::SetAppearance(uint16_t appearance) { impl_->SetAppearance(appearance); }
 void BlePeripheral::AddServiceUuid(const std::string& uuid) { impl_->AddServiceUuid(uuid); }
 void BlePeripheral::SetServiceData(const std::string& service_uuid, const std::string& data) { impl_->SetServiceData(service_uuid, data); }
+void BlePeripheral::SetServiceData(const std::string &service_uuid, const uint8_t* data, size_t size) {
+    impl_->SetServiceData(service_uuid, std::string(reinterpret_cast<const char*>(data), size));
+}
+void BlePeripheral::SetServiceData(const std::string &service_uuid, const std::vector<uint8_t>& data) {
+    impl_->SetServiceData(service_uuid, std::string(data.begin(), data.end()));
+}
 void BlePeripheral::SetManufacturerData(const std::string& data) { impl_->SetManufacturerData(data); }
+void BlePeripheral::SetManufacturerData(const uint8_t* data, size_t size) {
+    impl_->SetManufacturerData(std::string(reinterpret_cast<const char*>(data), size));
+}
+void BlePeripheral::SetManufacturerData(const std::vector<uint8_t>& data) {
+    impl_->SetManufacturerData(std::string(data.begin(), data.end()));
+}
 void BlePeripheral::SetRawAdvertisingData(const std::vector<uint8_t>& data) { impl_->SetRawAdvertisingData(std::string(data.begin(), data.end())); }
-void BlePeripheral::SetRawAdvertisingData(const std::string& data) { impl_->SetRawAdvertisingData(data); }
+void BlePeripheral::SetRawAdvertisingData(const uint8_t* data, size_t size) {
+    impl_->SetRawAdvertisingData(std::string(reinterpret_cast<const char*>(data), size));
+}
 void BlePeripheral::SetRawScanResponseData(const std::vector<uint8_t>& data) { impl_->SetRawScanResponseData(std::string(data.begin(), data.end())); }
-void BlePeripheral::SetRawScanResponseData(const std::string& data) { impl_->SetRawScanResponseData(data); }
+void BlePeripheral::SetRawScanResponseData(const uint8_t* data, size_t size) {
+    impl_->SetRawScanResponseData(std::string(reinterpret_cast<const char*>(data), size));
+}
 void BlePeripheral::ClearAdvertisingData(bool clear_scan_response) { impl_->ClearAdvertisingData(clear_scan_response); }
 void BlePeripheral::StartLegacyAdvertising(bool connectable, uint16_t interval_ms) { impl_->StartLegacyAdvertising(connectable, interval_ms); }
 #if ENABLE_BLE5_FEATURES
@@ -555,6 +581,8 @@ BlePeripheral::BleState BlePeripheral::GetState() const { return impl_->GetState
 #include <iostream>
 #include <string>
 #include <vector>
+#include <chrono>   // For std::chrono
+#include <thread>   // For std::this_thread
 #include "ble_peripheral.h" // Include the header for our class
 
 // For a real ESP32 project, you would include these for logging and delays
@@ -565,108 +593,49 @@ BlePeripheral::BleState BlePeripheral::GetState() const { return impl_->GetState
 // Use our class from the platform::connectivity namespace
 using platform::connectivity::BlePeripheral;
 
-// 1. Create an instance of our peripheral
+// Create an instance of our peripheral
 BlePeripheral ble_peripheral;
-uint32_t notification_counter = 0;
-
-// 2. Define callback functions for various BLE events
-void on_connect() {
-    std::cout << "EVENT: Client Connected!" << std::endl;
-}
-
-void on_disconnect() {
-    std::cout << "EVENT: Client Disconnected!" << std::endl;
-    // You might want to restart advertising here
-    // ble_peripheral.StartLegacyAdvertising();
-}
-
-void on_mtu_changed(uint16_t effective_mtu) {
-    std::cout << "EVENT: MTU changed to " << effective_mtu << " bytes" << std::endl;
-}
-
-void on_write_request(const void* data, size_t size) {
-    // Cast the received data to a string to print it
-    std::string received_data(static_cast<const char*>(data), size);
-    std::cout << "EVENT: Wrote to characteristic, received: \"" << received_data << "\"" << std::endl;
-
-    // Optional: Echo the data back on the same characteristic
-    ble_peripheral.SetCharacteristicValue(
-        "beb5483e-36e1-4688-b7f5-ea07361b26a8", // Echo Characteristic UUID
-        received_data.c_str(),
-        received_data.length());
-}
 
 // Main application entry point
 // In an ESP-IDF project, this would be `extern "C" void app_main(void)`
 int main() {
-    std::cout << "BLE Peripheral Example starting..." << std::endl;
+    std::cout << "BLE Peripheral - Dynamic Raw Byte Service Data Example" << std::endl;
 
-    // 3. Initialize the peripheral
-    ble_peripheral.SetDesiredMtu(200); // Optional: Request a larger MTU
-    ble_peripheral.Init("My-ESP32-Device");
+    // 1. Initialize the peripheral
+    ble_peripheral.Init("Dynamic-Data-Device");
 
-    // 4. Register our callback functions
-    ble_peripheral.SetConnectionCallback(on_connect);
-    ble_peripheral.SetDisconnectionCallback(on_disconnect);
-    ble_peripheral.SetMtuChangedCallback(on_mtu_changed);
-
-    // 5. Define a service and its characteristics
-    const std::string service_uuid = "4fafc201-1fb5-459e-8fcc-c5c9c331914b";
+    // 2. Define the UUID for the service data we will update
+    const std::string service_data_uuid = "00001234-0000-1000-8000-00805f9b34fb";
     
-    // UUIDs for our characteristics
-    const std::string temp_char_uuid = "beb5483e-36e1-4688-b7f5-ea07361b26a8"; // Read / Write
-    const std::string notify_char_uuid = "8d82a849-5638-4432-a639-684e27e25f8c"; // Notify
+    // 3. Set some initial service data using a raw byte array
+    uint8_t initial_data[] = {0x01, 0x02, 0x03}; // Example initial bytes
+    std::cout << "Setting initial service data using raw bytes." << std::endl;
+    // Use the new, cleaner overload
+    ble_peripheral.SetServiceData(service_data_uuid, initial_data, sizeof(initial_data));
 
-    // Create a list of characteristics for our service
-    std::vector<std::tuple<std::string, uint32_t, BlePeripheral::CharCallback>> characteristics = {
-        {
-            // Characteristic 1: Supports Read and Write
-            temp_char_uuid,
-            BlePeripheral::CharProperty::kRead | BlePeripheral::CharProperty::kWrite,
-            on_write_request // Callback to handle writes from the client
-        },
-        {
-            // Characteristic 2: Supports Notify
-            notify_char_uuid,
-            BlePeripheral::CharProperty::kNotify,
-            nullptr // No callback needed for a notify-only characteristic
-        }
-    };
-    
-    // Register the service and its characteristics
-    ble_peripheral.RegisterService(service_uuid, characteristics);
-
-    // 6. Set initial values for characteristics
-    const char* initial_value = "Hello BLE!";
-    ble_peripheral.SetCharacteristicValue(temp_char_uuid, initial_value, strlen(initial_value));
-
-    // 7. Configure and start advertising
-    ble_peripheral.SetAppearance(0x04C1); // Generic Computer icon
-    ble_peripheral.SetManufacturerData("MyCompany");
+    // 4. Start advertising
     ble_peripheral.StartLegacyAdvertising();
-    std::cout << "Advertising started." << std::endl;
+    std::cout << "Advertising started. Check for 'Dynamic-Data-Device' with a BLE scanner." << std::endl;
 
-
-    // 8. Main application loop
+    // 5. Main application loop to dynamically update the data
+    uint8_t update_counter = 0;
     while (true) {
-        // Check if a client is connected
-        if (ble_peripheral.GetState() == BlePeripheral::BleState::kConnected) {
-            // If connected, update the notification characteristic every 2 seconds
-            std::string message = "Notification #" + std::to_string(notification_counter++);
-            
-            std::cout << "Sending: \"" << message << "\"" << std::endl;
-            
-            ble_peripheral.SetCharacteristicValue(
-                notify_char_uuid,
-                message.c_str(),
-                message.length(),
-                BlePeripheral::NotificationType::kNotify // Send a notification
-            );
-        }
+        // Delay for 5 seconds
+        // On ESP32 this would be: vTaskDelay(5000 / portTICK_PERIOD_MS);
+        std::this_thread::sleep_for(std::chrono::seconds(5));
 
-        // Delay for 2 seconds
-        // On ESP32 this would be: vTaskDelay(2000 / portTICK_PERIOD_MS);
-        std::this_thread::sleep_for(std::chrono::seconds(2));
+        // Prepare the new data as a vector of bytes
+        std::vector<uint8_t> new_data_bytes;
+        new_data_bytes.push_back(0xDE); // A constant header byte
+        new_data_bytes.push_back(0xAD); // Another constant header byte
+        new_data_bytes.push_back(update_counter++); // The dynamic counter byte
+        
+        std::cout << "Updating service data with new byte array. Counter: " << (int)new_data_bytes[2] << std::endl;
+
+        // ========================================================================
+        // == THIS IS THE KEY STEP: Use the new, direct uint8_t* overload.      ==
+        // ========================================================================
+        ble_peripheral.SetServiceData(service_data_uuid, new_data_bytes.data(), new_data_bytes.size());
     }
 
     return 0;
