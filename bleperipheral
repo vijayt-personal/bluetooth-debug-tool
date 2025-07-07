@@ -551,3 +551,123 @@ BlePeripheral::BleState BlePeripheral::GetState() const { return impl_->GetState
 } // namespace connectivity
 } // namespace platform
 
+
+#include <iostream>
+#include <string>
+#include <vector>
+#include "ble_peripheral.h" // Include the header for our class
+
+// For a real ESP32 project, you would include these for logging and delays
+// #include "esp_log.h"
+// #include "freertos/FreeRTOS.h"
+// #include "freertos/task.h"
+
+// Use our class from the platform::connectivity namespace
+using platform::connectivity::BlePeripheral;
+
+// 1. Create an instance of our peripheral
+BlePeripheral ble_peripheral;
+uint32_t notification_counter = 0;
+
+// 2. Define callback functions for various BLE events
+void on_connect() {
+    std::cout << "EVENT: Client Connected!" << std::endl;
+}
+
+void on_disconnect() {
+    std::cout << "EVENT: Client Disconnected!" << std::endl;
+    // You might want to restart advertising here
+    // ble_peripheral.StartLegacyAdvertising();
+}
+
+void on_mtu_changed(uint16_t effective_mtu) {
+    std::cout << "EVENT: MTU changed to " << effective_mtu << " bytes" << std::endl;
+}
+
+void on_write_request(const void* data, size_t size) {
+    // Cast the received data to a string to print it
+    std::string received_data(static_cast<const char*>(data), size);
+    std::cout << "EVENT: Wrote to characteristic, received: \"" << received_data << "\"" << std::endl;
+
+    // Optional: Echo the data back on the same characteristic
+    ble_peripheral.SetCharacteristicValue(
+        "beb5483e-36e1-4688-b7f5-ea07361b26a8", // Echo Characteristic UUID
+        received_data.c_str(),
+        received_data.length());
+}
+
+// Main application entry point
+// In an ESP-IDF project, this would be `extern "C" void app_main(void)`
+int main() {
+    std::cout << "BLE Peripheral Example starting..." << std::endl;
+
+    // 3. Initialize the peripheral
+    ble_peripheral.SetDesiredMtu(200); // Optional: Request a larger MTU
+    ble_peripheral.Init("My-ESP32-Device");
+
+    // 4. Register our callback functions
+    ble_peripheral.SetConnectionCallback(on_connect);
+    ble_peripheral.SetDisconnectionCallback(on_disconnect);
+    ble_peripheral.SetMtuChangedCallback(on_mtu_changed);
+
+    // 5. Define a service and its characteristics
+    const std::string service_uuid = "4fafc201-1fb5-459e-8fcc-c5c9c331914b";
+    
+    // UUIDs for our characteristics
+    const std::string temp_char_uuid = "beb5483e-36e1-4688-b7f5-ea07361b26a8"; // Read / Write
+    const std::string notify_char_uuid = "8d82a849-5638-4432-a639-684e27e25f8c"; // Notify
+
+    // Create a list of characteristics for our service
+    std::vector<std::tuple<std::string, uint32_t, BlePeripheral::CharCallback>> characteristics = {
+        {
+            // Characteristic 1: Supports Read and Write
+            temp_char_uuid,
+            BlePeripheral::CharProperty::kRead | BlePeripheral::CharProperty::kWrite,
+            on_write_request // Callback to handle writes from the client
+        },
+        {
+            // Characteristic 2: Supports Notify
+            notify_char_uuid,
+            BlePeripheral::CharProperty::kNotify,
+            nullptr // No callback needed for a notify-only characteristic
+        }
+    };
+    
+    // Register the service and its characteristics
+    ble_peripheral.RegisterService(service_uuid, characteristics);
+
+    // 6. Set initial values for characteristics
+    const char* initial_value = "Hello BLE!";
+    ble_peripheral.SetCharacteristicValue(temp_char_uuid, initial_value, strlen(initial_value));
+
+    // 7. Configure and start advertising
+    ble_peripheral.SetAppearance(0x04C1); // Generic Computer icon
+    ble_peripheral.SetManufacturerData("MyCompany");
+    ble_peripheral.StartLegacyAdvertising();
+    std::cout << "Advertising started." << std::endl;
+
+
+    // 8. Main application loop
+    while (true) {
+        // Check if a client is connected
+        if (ble_peripheral.GetState() == BlePeripheral::BleState::kConnected) {
+            // If connected, update the notification characteristic every 2 seconds
+            std::string message = "Notification #" + std::to_string(notification_counter++);
+            
+            std::cout << "Sending: \"" << message << "\"" << std::endl;
+            
+            ble_peripheral.SetCharacteristicValue(
+                notify_char_uuid,
+                message.c_str(),
+                message.length(),
+                BlePeripheral::NotificationType::kNotify // Send a notification
+            );
+        }
+
+        // Delay for 2 seconds
+        // On ESP32 this would be: vTaskDelay(2000 / portTICK_PERIOD_MS);
+        std::this_thread::sleep_for(std::chrono::seconds(2));
+    }
+
+    return 0;
+}
