@@ -586,3 +586,114 @@ int main() {
 }
 
               
+#ifndef CLOUD_POLICY_CONFIG_HPP_
+#define CLOUD_POLICY_CONFIG_HPP_
+
+// This header file determines which cloud policy is used for the entire application.
+// To switch providers, you can either change the alias here or control the
+// selection with a compile-time flag from your build system (e.g., -DUSE_AZURE_POLICY).
+
+#include "aws_iot_policy.hpp"
+// #include "azure_iot_policy.hpp" // <-- Example of another policy
+
+#if defined(USE_AZURE_POLICY)
+    #error "Azure Policy not yet implemented."
+    // using CloudPolicy = visium::AzureIotPolicy;
+#else // Default to AWS
+    // This 'using' statement creates a generic alias for our chosen policy.
+    using CloudPolicy = visium::AwsIotPolicy;
+#endif
+
+#endif // CLOUD_POLICY_CONFIG_HPP_
+
+#ifndef DEVICE_MANAGER_HPP_
+#define DEVICE_MANAGER_HPP_
+
+#include "cloud_communicator.hpp"
+#include "cloud_policy_config.hpp" // <-- Includes the generic alias
+
+class DeviceManager {
+public:
+    // The constructor takes the policy's specific configuration struct,
+    // but the DeviceManager itself doesn't know what's inside it.
+    explicit DeviceManager(const CloudPolicy::Config& policy_config);
+    void Run();
+
+private:
+    void OnConnectionStatusChanged(bool connected);
+    bool OnDeviceCommandReceived(const visium::Command& command);
+
+    // Members are now defined in terms of the generic CloudPolicy alias.
+    CloudPolicy policy_;
+    visium::CloudCommunicator<CloudPolicy> cloud_comm_;
+};
+
+#endif // DEVICE_MANAGER_HPP_
+
+#include "device_manager.hpp"
+#include "log_print.h"
+#include <thread>
+#include <chrono>
+
+DeviceManager::DeviceManager(const CloudPolicy::Config& policy_config)
+    : cloud_comm_(
+        std::move(policy_),
+        [] { // Lambda for communicator config
+            visium::CloudCommunicator<CloudPolicy>::Config config;
+            return config;
+        }(),
+        policy_config) // Pass the provided policy config
+{
+    LOG_PRINT(log_print::kINFO, "DeviceManager constructor: Setting callbacks.");
+
+    cloud_comm_.SetConnectionStatusCallback([this](bool c) { this->OnConnectionStatusChanged(c); });
+    cloud_comm_.SetControlCommandCallback([this](const visium::Command& cmd) { return this->OnDeviceCommandReceived(cmd); });
+
+    cloud_comm_.Start();
+}
+
+void DeviceManager::Run() {
+    LOG_PRINT(log_print::kINFO, "DeviceManager: Starting main loop.");
+    while (true) {
+        cloud_comm_.Process();
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+}
+
+// Callback handler implementations are unchanged.
+void DeviceManager::OnConnectionStatusChanged(bool connected) {
+    LOG_PRINT(log_print::kINFO, "DeviceManager Handler: Connection status is now %s.", connected ? "CONNECTED" : "DISCONNECTED");
+}
+
+bool DeviceManager::OnDeviceCommandReceived(const visium::Command& command) {
+    // ... switch statement to handle commands as before ...
+    return true;
+}
+
+#include "device_manager.hpp"
+#include "cloud_policy_config.hpp" // Includes the alias
+#include "aws_iot_policy.hpp"      // Needed here to create the concrete config
+
+// ... Placeholder Dependencies (log_print, etc.) ...
+
+int main() {
+    LOG_PRINT(log_print::kINFO, "Composition Root: Assembling application components...");
+
+    // 1. Create the configuration for the *currently selected* policy.
+    //    main.cpp is the only place that needs to know the concrete policy type
+    //    to create the correct configuration structure.
+    CloudPolicy::Config policy_config;
+    policy_config.aws_endpoint = "your-endpoint.iot.region.amazonaws.com";
+    policy_config.thing_name = "MyThing";
+    policy_config.client_id = "MyThing";
+    // ... load certificates into policy_config ...
+
+    // 2. Create the DeviceManager, passing it the concrete configuration.
+    //    The DeviceManager itself only knows about the generic CloudPolicy::Config.
+    DeviceManager my_device(policy_config);
+    
+    // 3. Run the application.
+    my_device.Run();
+
+    return 0;
+}
