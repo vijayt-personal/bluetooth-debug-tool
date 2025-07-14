@@ -454,17 +454,195 @@ const rapidjson::Value& AwsIotPolicy::GetCachedShadowState() const {
     return local_shadow_cache_;
 }
 
-// ... All other methods are unchanged. Providing them in full as requested.
-void AwsIotPolicy::Process() { if (client_ && client_->IsConnected()) PollShadow(); }
-bool AwsIotPolicy::Connect() { return client_ ? client_->Connect() : false; }
-void AwsIotPolicy::Disconnect() { if (client_) client_->Disconnect(); }
+void AwsIotPolicy::Process() { 
+    if (client_ && client_->IsConnected()) {
+        PollShadow();
+    }
+}
 
-bool AwsIotPolicy::SendData(PacketType type, const void* payload) { /* as before */ }
-void AwsIotPolicy::OnMqttConnected() { /* as before */ }
-void AwsIotPolicy::OnMqttDisconnected() { /* as before */ }
-void AwsIotPolicy::HandleShadowCallback(const std::string& update_type, std::string_view payload) { /* as before */ }
-void AwsIotPolicy::ProcessShadowDelta(const rapidjson::Value& delta_state) { /* as before */ }
-void AwsIotPolicy::PollShadow() { /* as before */ }
-bool AwsIotPolicy::ReportState(const std::string& state_payload, int qos) { /* as before */ }
+bool AwsIotPolicy::Connect() { 
+    return client_ ? client_->Connect() : false;
+}
+
+void AwsIotPolicy::Disconnect() { 
+    if (client_) {
+        client_->Disconnect();
+    }
+}
+
+bool AwsIotPolicy::SendData(PacketType type, const void* payload) {
+    if (!client_ || !client_->IsConnected() || !payload) return false;
+    rapidjson::Document doc;
+    doc.SetObject();
+    rapidjson::Document::AllocatorType& allocator = doc.GetAllocator();
+    const std::string* topic_to_use = nullptr;
+    int qos = 0;
+
+    switch (type) {
+        case PacketType::DeviceStatus: {
+            topic_to_use = &status_topic_;
+            const auto* data = static_cast<const DeviceStatusPayload*>(payload);
+            doc.AddMember("battery", data->battery_percent, allocator);
+            doc.AddMember("uptime", data->uptime_seconds, allocator);
+            break;
+        }
+        case PacketType::TimeSeriesData: {
+            topic_to_use = &timeseries_topic_;
+            const auto* data = static_cast<const TimeSeriesPayload*>(payload);
+            doc.AddMember("temp", data->temperature, allocator);
+            doc.AddMember("humidity", data->humidity, allocator);
+            break;
+        }
+        case PacketType::CriticalAlert: {
+            topic_to_use = &alerts_topic_;
+            qos = 1;
+            const auto* data = static_cast<const AlertPayload*>(payload);
+            doc.AddMember("errorCode", data->error_code, allocator);
+            doc.AddMember("message", rapidjson::Value(data->message, allocator).Move(), allocator);
+            break;
+        }
+        default:
+            return false;
+    }
+
+    rapidjson::StringBuffer buffer;
+    rapidjson::Writer<rapidjson::StringBuffer> writer(buffer);
+    doc.Accept(writer);
+    return client_->Publish(*topic_to_use, buffer.GetString(), qos);
+}
+
+void AwsIotPolicy::OnMqttConnected() {
+    LOG_PRINT(log_print::kINFO, "MQTT Connected. Subscribing to shadow topics for thing: %s", config_->thing_name.c_str());
+    auto shadow_handler = [this](const std::string& type, std::string_view payload) { this->HandleShadowCallback(type, payload); };
+    if (client_->SubscribeToShadowUpdates(shadow_handler) && client_->SubscribeToShadowGetResponses(shadow_handler)) {
+        LOG_PRINT(log_print::kINFO, "Shadow subscriptions successful.");
+        initial_shadow_received_ = false;
+        get_shadow_attempts_ = 0;
+        current_get_shadow_backoff_ms_ = 5000;
+        if (on_connected_) on_connected_();
+    } else {
+        LOG_PRINT(log_print::kERROR, "Failed to subscribe to shadow topics! Disconnecting.");
+        client_->Disconnect();
+    }
+}
+
+void AwsIotPolicy::OnMqttDisconnected() { 
+    if (on_disconnected_) {
+        on_disconnected_();
+    }
+}
+
+void AwsIotPolicy::HandleShadowCallback(const std::string& update_type, std::string_view payload) {
+    if (payload.empty()) return;
+    std::string mutable_payload(payload);
+    rapidjson::Document doc;
+    doc.ParseInsitu(&mutable_payload[0]);
+    if (doc.HasParseError()) return;
+
+    uint32_t incoming_version = 0;
+    if (doc.HasMember("version") && doc["version"].IsUint()) {
+        incoming_version = doc["version"].GetUint();
+    }
+    if (incoming_version > 0 && incoming_version <= last_processed_shadow_version_) return;
+
+    if (update_type == "delta") {
+        if (doc.HasMember("state") && doc["state"].IsObject()) {
+            last_processed_shadow_version_ = incoming_version;
+            ProcessShadowDelta(doc["state"]);
+        }
+    } else if (update_type == "accepted") {
+        if (!has_performed_initial_get_ && doc.HasMember("state")) {
+            local_shadow_cache_.CopyFrom(doc["state"], local_shadow_cache_.GetAllocator());
+            has_performed_initial_get_ = true;
+        }
+        last_processed_shadow_version_ = incoming_version;
+        if (doc.HasMember("state") && doc["state"].IsObject() && doc["state"].HasMember("delta") && doc["state"]["delta"].IsObject()) {
+            ProcessShadowDelta(doc["state"]["delta"]);
+        }
+    } else if (update_type == "rejected") {
+        int error_code = 0;
+        if (doc.HasMember("code") && doc["code"].IsInt()) error_code = doc["code"].GetInt();
+        if (error_code == 404) {
+            has_performed_initial_get_ = true;
+        }
+    }
+}
+
+void AwsIotPolicy::ProcessShadowDelta(const rapidjson::Value& delta_state) {
+    if (!delta_state.IsObject() || !on_command_) return;
+    rapidjson::Document report(rapidjson::kObjectType);
+    auto& report_allocator = report.GetAllocator();
+    bool command_actioned = false;
+
+    if (!local_shadow_cache_.HasMember("reported")) {
+        local_shadow_cache_.AddMember("reported", rapidjson::Value(rapidjson::kObjectType).Move(), local_shadow_cache_.GetAllocator());
+    }
+    auto& cached_reported = local_shadow_cache_["reported"];
+
+    for (auto itr = delta_state.MemberBegin(); itr != delta_state.MemberEnd(); ++itr) {
+        const std::string key = itr->name.GetString();
+        const rapidjson::Value& raw_value = itr->value;
+        Command command{CommandType::Unknown};
+
+        if (key == "power" && raw_value.IsString()) {
+            command.type = CommandType::SetPower;
+            command.value = (strcmp(raw_value.GetString(), "ON") == 0);
+        } else if (key == "intensity" && raw_value.IsInt()) {
+            command.type = CommandType::SetIntensity;
+            command.value = raw_value.GetInt();
+        } else if (key == "config" && raw_value.IsObject()) {
+            command.type = CommandType::SetConfig;
+            rapidjson::StringBuffer buffer;
+            rapidjson::Writer<rapidjson::StringBuffer> writer(buffer);
+            raw_value.Accept(writer);
+            command.value = std::string(buffer.GetString());
+        }
+
+        if (command.type != CommandType::Unknown) {
+            if (on_command_(command)) {
+                command_actioned = true;
+                report.AddMember(rapidjson::Value(key.c_str(), report_allocator).Move(), rapidjson::Value(raw_value, report_allocator).Move(), report_allocator);
+                rapidjson::Value cache_key(key.c_str(), local_shadow_cache_.GetAllocator());
+                if (cached_reported.HasMember(cache_key)) {
+                    cached_reported[cache_key].CopyFrom(raw_value, local_shadow_cache_.GetAllocator());
+                } else {
+                    cached_reported.AddMember(cache_key, rapidjson::Value(raw_value, local_shadow_cache_.GetAllocator()).Move(), local_shadow_cache_.GetAllocator());
+                }
+            }
+        }
+    }
+
+    if (command_actioned) {
+        rapidjson::StringBuffer buffer;
+        rapidjson::Writer<rapidjson::StringBuffer> writer(buffer);
+        report.Accept(writer);
+        ReportState(buffer.GetString());
+    }
+}
+
+void AwsIotPolicy::PollShadow() {
+    if (has_performed_initial_get_) return;
+    uint32_t retry_base = 5000;
+    uint32_t max_retry = 30000;
+    uint16_t max_attempts = 10;
+    
+    if (system_uptime::ExceedsMs(last_get_shadow_attempt_ms_, current_get_shadow_backoff_ms_)) {
+        if (get_shadow_attempts_ >= max_attempts) {
+            has_performed_initial_get_ = true;
+            return;
+        }
+        if (client_ && client_->GetShadow()) {
+            last_get_shadow_attempt_ms_ = system_uptime::GetMs();
+            get_shadow_attempts_++;
+            current_get_shadow_backoff_ms_ = std::min(current_get_shadow_backoff_ms_ + retry_base, max_retry);
+        }
+    }
+}
+
+bool AwsIotPolicy::ReportState(const std::string& state_payload, int qos) {
+    if (!client_ || !client_->IsConnected()) return false;
+    std::string shadow_payload = "{\"state\":{\"reported\":" + state_payload + "}}";
+    return client_->UpdateShadow(shadow_payload, qos);
+}
 
 } // namespace visium
