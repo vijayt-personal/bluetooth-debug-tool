@@ -4,28 +4,33 @@ import subprocess
 
 def compile_protos():
     """
-    Finds all .proto files in the '../protos' directory and compiles them
-    into Python modules in the 'input' directory within the client folder.
+    Finds all .proto files in the project's 'protos' directory and compiles
+    them into Python modules in the 'client/input' directory.
     This script should be run from the project's root directory.
     e.g., python client/generate_protos.py
     """
-    # Relative path from this script's location (client/) to the protos dir
-    protos_dir = os.path.join(os.path.dirname(__file__), '..', 'protos')
-    # Output directory is relative to this script
-    output_dir = os.path.join(os.path.dirname(__file__), 'input')
-
-    # Ensure the output directory exists and is a package
-    if not os.path.exists(output_dir):
-        os.makedirs(output_dir)
-    
-    init_file = os.path.join(output_dir, '__init__.py')
-    if not os.path.exists(init_file):
-        with open(init_file, 'w') as f:
-            pass # Create empty __init__.py
-
-    print(f"Compiling .proto files from '{os.path.abspath(protos_dir)}' into '{os.path.abspath(output_dir)}'")
-    
     try:
+        # Get the absolute path to the directory containing this script (client/)
+        client_dir = os.path.dirname(os.path.abspath(__file__))
+        
+        # Get the absolute path to the project root (one level up from client/)
+        project_root = os.path.dirname(client_dir)
+
+        # Define absolute paths for source and output
+        protos_dir = os.path.join(project_root, 'protos')
+        output_dir = os.path.join(client_dir, 'input')
+
+        # Ensure the output directory exists and is a package
+        if not os.path.exists(output_dir):
+            os.makedirs(output_dir)
+        
+        init_file = os.path.join(output_dir, '__init__.py')
+        if not os.path.exists(init_file):
+            with open(init_file, 'w') as f:
+                pass # Create empty __init__.py
+
+        print(f"Compiling .proto files from '{protos_dir}' into '{output_dir}'")
+        
         # Find all .proto files to be compiled
         proto_files = [os.path.join(protos_dir, f) for f in os.listdir(protos_dir) if f.endswith('.proto')]
         if not proto_files:
@@ -33,7 +38,6 @@ def compile_protos():
             return
 
         # The command to run the protobuf compiler
-        # We use the project root as the proto_path for clean imports
         command = [
             sys.executable,
             '-m',
@@ -44,16 +48,19 @@ def compile_protos():
         command.extend(proto_files)
 
         # Execute the command
-        subprocess.run(command, check=True)
+        subprocess.run(command, check=True, capture_output=True, text=True)
         print("Protobuf files compiled successfully.")
 
     except subprocess.CalledProcessError as e:
-        print(f"Error: Failed to compile .proto files.\n{e}")
-        print("Please ensure 'grpcio-tools' is installed (`pip install -r client/requirements.txt`)")
+        print(f"\n--- PROTOBUF COMPILATION FAILED ---")
+        print(f"Error: Failed to compile .proto files.\n")
+        print(f"Stderr: {e.stderr}")
+        print("\nTroubleshooting:")
+        print("1. Ensure you have activated your virtual environment.")
+        print("2. Ensure 'grpcio-tools' is installed (`pip install -r client/requirements.txt`)")
         sys.exit(1)
     except FileNotFoundError:
-        print("Error: 'protoc' command not found.")
-        print("Please ensure 'grpcio-tools' is installed (`pip install -r client/requirements.txt`)")
+        print("Error: Could not find the 'protos' directory. This script should be in a 'client' folder at the project root.")
         sys.exit(1)
 
 
