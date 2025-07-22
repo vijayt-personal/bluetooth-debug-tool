@@ -1,0 +1,533 @@
+# BLE Interface Specification
+
+## Overview
+
+This document provides a high-level overview of the custom BLE services exposed by the device. Each service has a dedicated protocol document that details its characteristics, data structures, and operational flow.
+
+## General BLE Behavior
+
+This section defines the recommended parameters for advertising, connection, and communication timeouts to ensure a consistent and reliable user experience.
+
+### Connection & Timing Parameters
+
+| Parameter | Recommended Value | Description |
+| :--- | :--- | :--- |
+| **Advertising Interval** | 250 ms | Balances good discoverability with moderate power consumption. Can be increased after a period of inactivity to save power. |
+| **Connection Interval** | Min: 15 ms, Max: 30 ms | Provides a responsive connection for data transfer during OTA or commissioning, without being overly power-intensive. |
+| **Slave Latency** | 0 | The peripheral should respond on every connection event during active data transfer to maximize throughput. |
+| **Supervision Timeout** | 5 seconds | A 5-second timeout is sufficient to detect a lost connection and allow the central to attempt a reconnect. |
+| **Default MTU Size** | 247 bytes | A safe default that is widely supported. The central should attempt to negotiate a larger MTU (e.g., 512 bytes) for faster data transfer, but be prepared to fall back to this value. |
+
+### Inactivity Timeout
+
+To prevent the BLE connection from being held open indefinitely, a two-stage inactivity timeout is implemented on the peripheral.
+
+1.  **Initial Timeout (30 seconds):** After a BLE connection is established, if no valid, framed packet (as defined in the service protocols) is received on any characteristic within 30 seconds, the peripheral should disconnect.
+2.  **Active Timeout (2 minutes):** Upon receiving the *first* valid framed packet, the inactivity timer is extended to 2 minutes. This timer is reset every time a subsequent valid packet is received. If 2 minutes pass without receiving any valid packet, the peripheral should disconnect.
+
+## Advertising and Scan Response
+
+To allow for efficient discovery, the device should use the following advertising and scan response payloads.
+
+### Advertising Payload
+
+The primary advertising payload is kept minimal to fit within the 31-byte limit and contains only the essential information for a client to identify the device's capabilities.
+
+| Octet Range | Size (Bytes) | Type ID | Value                                        | Description                                                                                             |
+| :---------- | :----------- | :------ | :------------------------------------------- | :------------------------------------------------------------------------------------------------------ |
+| 0-2         | 3            | `0x01`  | `0x06` (LE General Discoverable, BR/EDR Not Supported) | **Flags**: Standard BLE flags indicating the device is discoverable.                                    |
+| 3-4         | 2            | `0x03`  | `0xF0DE`                                     | **16-bit Service UUID List (Incomplete)**: A custom 16-bit UUID (`0xDEF0`) derived from the full 128-bit service UUIDs to signal the presence of the custom services. |
+| 5-21        | 17           | `0x07`  | `12345678-1234-5678-1234-56789ABCDEF0`       | **128-bit Service UUID List (Complete)**: The full UUID for the Device Update Service. This allows apps to scan specifically for devices offering this service. |
+
+### Scan Response Payload
+
+The scan response payload provides additional, human-readable information that a client can request after seeing the initial advertisement.
+
+| Octet Range | Size (Bytes) | Type ID | Value                | Description                                                                 |
+| :---------- | :----------- | :------ | :------------------- | :-------------------------------------------------------------------------- |
+| 0-14        | 15           | `0x09`  | `"MyDevice-XXXX"`    | **Complete Local Name**: A user-friendly name for the device, where `XXXX` could be the last 4 digits of the MAC address for easy identification. |
+
+## Services
+
+| Service Name                   | Service UUID                                 | Description                                              | Protocol Document                                                 |
+| :----------------------------- | :------------------------------------------- | :------------------------------------------------------- | :---------------------------------------------------------------- |
+| **Device Update Service** | `12345678-1234-5678-1234-56789ABCDEF0`       | Handles Over-the-Air (OTA) firmware and filesystem updates. | [DeviceUpdateService.md](./DeviceUpdateService.md)                |
+| **Device Commissioning Service** | `C441279A-8648-466A-875A-0125D81D76E0`       | Handles Wi-Fi provisioning and cloud connectivity setup. | [DeviceCommissioningService.md](./DeviceCommissioningService.md) |
+
+---
+---
+
+# BLE Device Update Service Protocol
+
+## Overview
+
+This document specifies the protocol for the **Device Update Service**, a robust, packet-validated service for performing Over-The-Air (OTA) firmware updates to an embedded device over BLE.
+
+While the peripheral device will implement a state machine to manage the update process (as shown in the diagrams below), this document's primary focus is on the **communication protocol** between the Central (e.g., a mobile app) and the Peripheral. It defines the BLE service structure, the packet framing, and the Protobuf messages used for the image transfer and update flow.
+
+* **Target Chip**: ESP32 (example)
+* **Update Type**: Full Application Firmware Update
+
+## BLE GATT Structure
+
+This service consists of a single primary service with three characteristics.
+
+### Service UUID
+
+* **Device Update Service UUID**: `12345678-1234-5678-1234-56789ABCDEF0` (Example UUID - replace with your own 128-bit UUID)
+
+### Characteristics
+
+| Characteristic      | UUID   | Properties             | Direction            | Description                        |
+| ------------------- | ------ | ---------------------- | -------------------- | ---------------------------------- |
+| **Control Point** | `0xFFF1` | Write With Response    | Central → Peripheral | Start, End, Abort, Info commands   |
+| **Data Transfer** | `0xFFF2` | Write Without Response | Central → Peripheral | Stream firmware chunks             |
+| **Status / Progress** | `0xFFF3` | Notify                 | Peripheral → Central | ACKs and Responses                 |
+
+## Packet Framing
+
+Each message is framed for integrity, synchronization, and type identification before protobuf parsing.
+
+| Start Byte (1B) | Message Type (1B) | Length (2B, LE) | Payload (Protobuf) | CRC32 (4B, LE) | End Byte (1B) |
+| --------------- | ----------------- | --------------- | ------------------ | -------------- | ------------- |
+| `0xAA`          | *Type* | *Length* | *Payload* | *CRC* | `0xDD`        |
+
+* **Start Byte (1B):** Constant `0xAA` for synchronization.
+* **Message Type (1B):** The value from the `MessageType` enum, defined in the `.proto` file.
+* **Length (2B, LE):** The length of the `Payload` field only, in Little-Endian byte order. A 2-byte length is sufficient as the max payload per packet is less than 65,535 bytes.
+* **Payload (Variable):** The protobuf-encoded message corresponding to the `Message Type`.
+* **CRC32 (4B, LE):** Computed on `Message Type` + `Length` + `Payload`, in Little-Endian byte order.
+* **End Byte (1B):** Constant `0xDD` for frame validation.
+* **Total Frame Overhead:** 9 bytes.
+
+## Protobuf Definition (nanopb Optimized)
+
+The `.proto` file now defines a `MessageType` enum to act as a single source of truth for the type identifier in the packet frame. This prevents synchronization issues between the client and peripheral.
+
+```proto
+syntax = "proto3";
+
+package local_ota;
+
+// Defines the message type identifier used in the packet frame.
+enum MessageType {
+    MSG_TYPE_RESERVED = 0;
+    MSG_TYPE_OTA_CONTROL = 1;
+    MSG_TYPE_OTA_DATA = 2;
+    MSG_TYPE_OTA_ACK = 3;
+    MSG_TYPE_OTA_INFO_RESPONSE = 4;
+}
+
+enum OtaStatus {
+    OK = 0;
+    ERROR = 1;
+    INVALID_HEADER = 2;
+    CRC_MISMATCH = 3;
+    UNSUPPORTED_COMMAND = 4;
+    TIMEOUT = 5;
+    INVALID_SEQUENCE = 6;
+    VALIDATION_FAILED = 7;
+    COMMIT_FAILED = 8;
+    INVALID_PAYLOAD = 9;
+    INCORRECT_PRODUCT = 10;
+    UNSUPPORTED_SCHEME = 11;
+    UNSUPPORTED_UPDATE_TYPE = 12;
+}
+
+// Defines the type of data being transferred.
+enum UpdateType {
+    FIRMWARE_APP = 0;   // Application firmware (default)
+    FILESYSTEM = 1;
+    CONFIG_DATA = 2;
+}
+
+// === Control Messages (Central -> Peripheral) ===
+message OtaStart {
+    UpdateType update_type = 1;       // The type of data being updated.
+    uint32 image_size = 2;
+    string fw_version = 3;            // e.g., "1.2.3" or a date for filesystem
+    string hw_version = 4;            // e.g., "1.1"
+    uint32 product_id = 5;            // Unique ID for the product type
+    uint32 ota_scheme_version = 6;    // Version of this OTA protocol itself
+    bytes signature = 7;              // For future use: cryptographic signature
+}
+
+message OtaEnd {
+    uint32 total_chunks = 1;
+    bytes image_hash = 2;             // e.g., SHA-256 hash of the full image
+}
+
+message OtaAbort {
+    OtaStatus reason_code = 1;
+    string message = 2;
+}
+
+message OtaRequestInfo {}
+
+// This message's type is identified by MSG_TYPE_OTA_CONTROL
+message OtaControl {
+    oneof control_msg {
+        OtaStart start_payload = 1;
+        OtaEnd end_payload = 2;
+        OtaAbort abort_payload = 3;
+        OtaRequestInfo request_info_payload = 4;
+    }
+}
+
+// === Data Transfer Message (Central -> Peripheral) ===
+// This message's type is identified by MSG_TYPE_OTA_DATA
+message OtaData {
+    uint32 chunk_num = 1;
+    bytes chunk = 2;
+}
+
+// === Response Messages (Peripheral -> Central) ===
+// This message's type is identified by MSG_TYPE_OTA_ACK
+message OtaAck {
+    OtaStatus status = 1;
+    string message = 2;
+    uint32 received_chunk_num = 3; // For DATA_ACK
+}
+
+// This message's type is identified by MSG_TYPE_OTA_INFO_RESPONSE
+message OtaInfoResponse {
+    string current_fw_version = 1;
+    string hw_version = 2;
+    uint32 product_id = 3;
+    uint32 supported_ota_scheme_version = 4;
+    repeated UpdateType supported_update_types = 5; // Lists the update types the device can handle.
+}
+```
+
+## Nanopb Implementation Note
+
+For a safe implementation with `nanopb`, it's highly recommended to specify a maximum size for all `bytes` and `string` fields.
+
+```
+# local_ota.options
+local_ota.OtaData.chunk max_size:494
+local_ota.OtaStart.signature max_size:64
+local_ota.OtaStart.fw_version max_size:16
+local_ota.OtaStart.hw_version max_size:16
+local_ota.OtaEnd.image_hash max_size:32
+local_ota.OtaAbort.message max_size:32
+local_ota.OtaInfoResponse.current_fw_version max_size:16
+local_ota.OtaInfoResponse.hw_version max_size:16
+local_ota.OtaInfoResponse.supported_update_types max_count:5
+local_ota.OtaAck.message max_size:32
+```
+
+## OTA State Machine (Peripheral)
+
+```mermaid
+stateDiagram-v2
+    [*] --> Idle
+    
+    Idle: Waiting for OTA initiation.
+    Starting: Processing START command. Validating metadata.
+    Receiving: Receiving firmware data chunks.
+    Validating: All data received. Validating full image integrity.
+    Committing: Writing firmware to flash and preparing for reboot.
+    Aborted: OTA process aborted due to error or explicit command.
+    Completed: OTA successful. Device reboots.
+
+    Idle --> Starting : Central writes OtaControl(start_payload)
+    Idle --> Idle : Central writes OtaControl(request_info_payload) / Sends OtaInfoResponse
+
+    Starting --> Receiving : Valid START / Send OtaAck(OK)
+    Starting --> Aborted : Invalid START (e.g., wrong product_id or unsupported update_type) / Send OtaAck(Error)
+    
+    Receiving --> Receiving : Central writes OtaData / Send OtaAck(OK)
+    Receiving --> Validating : Central writes OtaEnd / Send OtaAck(OK)
+    Receiving --> Aborted : Data Error or Timeout / Send OtaAck(Error)
+
+    Validating --> Committing : Validation OK (e.g., SHA-256 hash matches) / Send OtaAck(OK)
+    Validating --> Aborted : Validation Failed / Send OtaAck(VALIDATION_FAILED)
+
+    Committing --> Completed : Commit OK
+    Committing --> Aborted : Commit Failed / Send OtaAck(COMMIT_FAILED)
+
+    Aborted --> Idle : Reset OTA State
+
+    Completed --> [*] : Reboot Device
+```
+
+## Unified OTA Message Sequence
+
+```mermaid
+sequenceDiagram
+    participant Central
+    participant Peripheral
+
+    note over Central, Peripheral: App connects to device.
+    
+    Central->>Peripheral: OtaControl(request_info_payload)
+    Peripheral-->>Central: OtaInfoResponse {..., supported_update_types: [FIRMWARE_APP, FILESYSTEM]}
+    
+    note over Central: App sees that FILESYSTEM updates are supported and decides to proceed.
+
+    Central->>Peripheral: OtaControl(start_payload {update_type: FILESYSTEM, ...})
+    
+    alt Peripheral Accepts OTA Start
+        Peripheral-->>Central: OtaAck(OK)
+        
+        loop For each data chunk
+            Central->>Peripheral: OtaData(chunk_num, chunk)
+            
+            alt Chunk transfer successful
+                Peripheral-->>Central: OtaAck(OK, received_chunk_num=chunk_num)
+            else Chunk transfer failed (e.g., CRC error)
+                Peripheral-->>Central: OtaAck(CRC_MISMATCH, received_chunk_num=chunk_num)
+                note over Central: Central retries sending the failed chunk.
+            end
+        end
+        
+        Central->>Peripheral: OtaControl(end_payload)
+        Peripheral-->>Central: OtaAck(OK)
+        
+        note over Peripheral: Validates full filesystem image using SHA-256 hash.
+    
+        alt Validation & Commit Successful
+            Peripheral-->>Central: OtaAck(OK, "Validation OK, Committing")
+            note over Peripheral: Commits filesystem update and prepares for reboot.
+        else Validation or Commit Failed
+            Peripheral-->>Central: OtaAck(VALIDATION_FAILED)
+        end
+
+    else Peripheral Rejects OTA Start
+        Peripheral-->>Central: OtaAck(INCORRECT_PRODUCT or UNSUPPORTED_UPDATE_TYPE)
+        note over Central: Aborts OTA.
+    end
+```
+
+---
+---
+
+# BLE Device Commissioning Service Protocol
+
+## Overview
+
+This document specifies the protocol for the **Device Commissioning Service**, a BLE-based service for provisioning an embedded device with Wi-Fi credentials and verifying its connection to a cloud backend.
+
+The protocol defines the BLE service structure, the packet framing (re-using the established OTA standard for consistency), and the Protobuf messages used for the commissioning flow. Its primary goal is to provide a reliable way for a Central (e.g., a mobile app) to get the Peripheral device online.
+
+* **Target Chip**: ESP32 (example)
+* **Commissioning Goal**: Scan for Wi-Fi, set credentials, and confirm cloud connectivity.
+
+## BLE GATT Structure
+
+This service consists of a single primary service with two characteristics, designed for a simple command/response and status notification flow.
+
+### Service UUID
+
+* **Device Commissioning Service UUID**: `C441279A-8648-466A-875A-0125D81D76E0` (Example UUID - replace with your own 128-bit UUID)
+
+### Characteristics
+
+| Characteristic            | UUID   | Properties | Direction            | Description                                       |
+| ------------------------- | ------ | ---------- | -------------------- | ------------------------------------------------- |
+| **Commissioning Control** | `0xFFE1` | Write      | Central → Peripheral | Send commands like Scan, Connect, End.            |
+| **Commissioning Status** | `0xFFE2` | Notify     | Peripheral → Central | Send responses, scan results, and status updates. |
+
+## Packet Framing
+
+To ensure system-wide consistency and code re-use, the Commissioning Service **uses the exact same packet framing protocol** as the Device Update Service.
+
+| Start Byte (1B) | Message Type (1B) | Length (2B, LE) | Payload (Protobuf) | CRC32 (4B, LE) | End Byte (1B) |
+| --------------- | ----------------- | --------------- | ------------------ | -------------- | ------------- |
+| `0xAA`          | *Type* | *Length* | *Payload* | *CRC* | `0xDD`        |
+
+* **Message Type (1B):** The value from the `commissioning.MessageType` enum.
+* **Total Frame Overhead:** 9 bytes.
+
+## Protobuf Definition (Refined)
+
+This `.proto` file organizes messages into a more structured request/response pattern using `oneof` and clear top-level messages. This simplifies parsing logic on the peripheral.
+
+```proto
+syntax = "proto3";
+
+package commissioning;
+
+option optimize_for = CODE_SIZE;
+
+// Defines the message type identifier used in the packet frame.
+// One type for Central->Peripheral requests, one for Peripheral->Central responses.
+enum MessageType {
+    MSG_TYPE_RESERVED = 0;
+    MSG_TYPE_COMMISSIONING_REQUEST = 1;  // Encapsulates all requests from Central
+    MSG_TYPE_COMMISSIONING_RESPONSE = 2; // Encapsulates all responses from Peripheral
+}
+
+// === Enums used across messages ===
+
+enum AuthMode {
+    AUTH_MODE_OPEN = 0;
+    AUTH_MODE_WEP = 1;
+    AUTH_MODE_WPA_PSK = 2;
+    AUTH_MODE_WPA2_PSK = 3;
+    AUTH_MODE_WPA_WPA2_PSK = 4;
+    AUTH_MODE_WPA3_PSK = 6;
+    AUTH_MODE_WPA2_WPA3_PSK = 7;
+}
+
+enum Status {
+    SUCCESS = 0;
+    FAILURE = 1;
+    TIMEOUT = 2;
+    BAD_PASSWORD = 3;
+    NO_SSID_FOUND = 4;
+    CLOUD_CONNECTION_FAIL = 5;
+    INVALID_REQUEST = 6;
+}
+
+// === Central -> Peripheral Messages (via CommissioningRequest) ===
+
+message StartWifiScanRequest {
+    // Empty message to trigger a scan
+}
+
+message SetWifiCredentialsRequest {
+    string ssid = 1;
+    string password = 2;
+}
+
+message EndCommissioningRequest {
+    bool success = 1; // True if central considers the flow successful
+}
+
+// Top-level request message sent from Central to Peripheral
+message CommissioningRequest {
+    oneof request_payload {
+        StartWifiScanRequest scan_req = 1;
+        SetWifiCredentialsRequest creds_req = 2;
+        EndCommissioningRequest end_req = 3;
+    }
+}
+
+
+// === Peripheral -> Central Messages (via CommissioningResponse) ===
+
+message WifiNetwork {
+    string ssid = 1;
+    int32 rssi = 2;
+    AuthMode auth_mode = 3;
+}
+
+message WifiScanResult {
+    repeated WifiNetwork networks = 1;
+}
+
+message WifiConnectionResult {
+    Status status = 1;
+    string message = 2; // e.g., "Credentials saved, attempting connection."
+}
+
+enum ConnectivityState {
+    DISCONNECTED = 0;
+    WIFI_CONNECTED = 1;
+    CLOUD_CONNECTED = 2;
+}
+
+message ConnectivityStatusUpdate {
+    ConnectivityState state = 1;
+}
+
+message EndCommissioningResponse {
+    Status status = 1; // SUCCESS if ACK'd, FAILURE otherwise
+}
+
+// Top-level response message sent from Peripheral to Central
+message CommissioningResponse {
+    oneof response_payload {
+        WifiScanResult scan_res = 1;
+        WifiConnectionResult conn_res = 2;
+        ConnectivityStatusUpdate status_update = 3;
+        EndCommissioningResponse end_res = 4;
+    }
+}
+```
+
+### Nanopb Implementation Note
+
+For safe implementation on an embedded device, specify maximum sizes for all variable-length fields in a `.options` file.
+
+```
+# commissioning.options
+commissioning.SetWifiCredentialsRequest.ssid max_size:33
+commissioning.SetWifiCredentialsRequest.password max_size:64
+commissioning.WifiNetwork.ssid max_size:33
+commissioning.WifiScanResult.networks max_count:15
+commissioning.WifiConnectionResult.message max_size:48
+```
+
+## Commissioning State Machine (Peripheral)
+
+This state machine outlines the logic on the peripheral device during the commissioning process.
+
+```mermaid
+stateDiagram-v2
+    [*] --> Idle
+
+    Idle: Awaiting commissioning command.
+    Scanning: Actively scanning for Wi-Fi APs.
+    Connecting: Trying to connect to the selected Wi-Fi AP.
+    VerifyingCloud: Wi-Fi connected. Attempting to reach the cloud endpoint.
+    Commissioned: Wi-Fi and Cloud connection successful. Commissioning complete.
+    Failed: Process failed (e.g., bad password, timeout).
+
+    Idle --> Scanning : Rcvs StartWifiScanRequest
+    Scanning --> Idle : Scan complete / Sends WifiScanResult
+    Scanning --> Failed : Scan timeout or error / Sends WifiConnectionResult(FAILURE)
+
+    Idle --> Connecting : Rcvs SetWifiCredentialsRequest
+    Connecting --> VerifyingCloud : Wi-Fi link established / Sends ConnectivityStatusUpdate(WIFI_CONNECTED)
+    Connecting --> Failed : Auth failed (bad password) / Sends WifiConnectionResult(BAD_PASSWORD)
+
+    VerifyingCloud --> Commissioned : Cloud endpoint reached / Sends ConnectivityStatusUpdate(CLOUD_CONNECTED)
+    VerifyingCloud --> Failed : Cloud connection fails / Sends WifiConnectionResult(CLOUD_CONNECTION_FAIL)
+    
+    Commissioned --> Idle : Rcvs EndCommissioningRequest / Disconnects BLE
+    Failed --> Idle : Reset after failure report
+```
+
+## Unified Commissioning Message Sequence
+
+This diagram shows a typical, successful commissioning flow.
+
+```mermaid
+sequenceDiagram
+    participant Central
+    participant Peripheral
+
+    note over Central, Peripheral: App connects to device over BLE.
+
+    Central->>Peripheral: CommissioningRequest(scan_req)
+    Peripheral-->>Central: CommissioningResponse(scan_res {networks: [...]})
+
+    note over Central: User selects a network (e.g., "MyHomeWifi") and enters the password in the app.
+
+    Central->>Peripheral: CommissioningRequest(creds_req {ssid: "MyHomeWifi", ...})
+    Peripheral-->>Central: CommissioningResponse(conn_res {status: SUCCESS, msg: "Credentials accepted"})
+
+    note over Peripheral: Device attempts to connect to Wi-Fi...
+    
+    alt Wi-Fi Connection Successful
+        Peripheral-->>Central: CommissioningResponse(status_update {state: WIFI_CONNECTED})
+        
+        note over Peripheral: Device attempts to connect to the cloud...
+
+        alt Cloud Connection Successful
+             Peripheral-->>Central: CommissioningResponse(status_update {state: CLOUD_CONNECTED})
+             Central->>Peripheral: CommissioningRequest(end_req {success: true})
+             Peripheral-->>Central: CommissioningResponse(end_res {status: SUCCESS})
+             note over Peripheral, Central: Commissioning finished. BLE may disconnect.
+        else Cloud Connection Fails
+             Peripheral-->>Central: CommissioningResponse(conn_res {status: CLOUD_CONNECTION_FAIL})
+             note over Central: App displays a "Could not reach server" error.
+        end
+
+    else Wi-Fi Connection Fails (e.g., bad password)
+        Peripheral-->>Central: CommissioningResponse(conn_res {status: BAD_PASSWORD})
+        note over Central: App prompts user to re-enter password.
+    end
