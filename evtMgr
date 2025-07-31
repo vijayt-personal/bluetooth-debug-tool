@@ -1,0 +1,666 @@
+#pragma once
+
+#include <cstdint>
+
+namespace app_events {
+
+/**
+ * @file event_defs.h
+ * @brief Application-specific event type definitions.
+ *
+ * @note This file is intended to be modified by the application developer
+ * to define all possible event types used in the system.
+ */
+
+/// Defines the underlying type for all event identifiers.
+using EventType = uint32_t;
+
+// clang-format off
+/**
+ * @enum EventTypes
+ * @brief Enumerates all event types for the application.
+ */
+enum EventTypes : EventType {
+    // System Events
+    kSystemStarted = 0,
+    kSystemShutdown,
+
+    // Sensor Events (Example)
+    kTemperatureReading,
+    kHumidityReading,
+
+    // User Interface Events (Example)
+    kButtonPressed,
+    kScreenUpdate,
+
+    // Add other application-specific events here...
+    kMaxEvents // Keep this last for counting purposes
+};
+// clang-format on
+
+} // namespace app_events
+
+#pragma once
+
+#include <cstdint>
+
+namespace app_events {
+
+/**
+ * @file mailbox_defs.h
+ * @brief Application-specific mailbox (listener) definitions.
+ *
+ * @note This file should be modified by the application developer to define
+ * all modules/tasks that require an event queue (mailbox).
+ */
+
+/// Defines the unique identifier for a mailbox/listener.
+using MailboxId = uint32_t;
+
+// clang-format off
+/**
+ * @enum MailboxIds
+ * @brief Enumerates all mailboxes in the system.
+ */
+enum MailboxIds : MailboxId {
+    kLoggerTask = 0,
+    kSensorManagerTask,
+    kUserInterfaceTask,
+    // Add other tasks/modules here...
+
+    kMaxMailboxes  // Keep this last to define the array size
+};
+// clang-format on
+
+/**
+ * @struct MailboxConfig
+ * @brief Defines the configuration for a single mailbox.
+ */
+struct MailboxConfig {
+    MailboxId id;
+    uint32_t queue_depth;
+};
+
+/**
+ * @brief A compile-time configuration table for all mailboxes.
+ *
+ * This table is used by the EventManager to initialize all event queues
+ * at startup. The order is not important, but every ID from the MailboxIds
+ * enum (except kMaxMailboxes) should have an entry.
+ */
+constexpr MailboxConfig kMailboxConfigTable[] = {
+    {kLoggerTask, 16},
+    {kSensorManagerTask, 8},
+    {kUserInterfaceTask, 10}
+    // Add configuration for other tasks here
+};
+
+constexpr size_t kNumMailboxes = sizeof(kMailboxConfigTable) / sizeof(MailboxConfig);
+
+} // namespace app_events
+
+#pragma once
+
+#include <array>
+#include <cstdint>
+#include <memory>
+#include <mutex>
+#include <optional>
+#include <vector>
+
+namespace event_manager {
+
+/// The number of blocks in the large payload memory pool.
+constexpr size_t kNumLargePayloadBlocks = 10;
+/// The size (in bytes) of each block in the large payload memory pool.
+constexpr size_t kLargePayloadSize = 1024;
+
+/**
+ * @class LargeMemoryPool
+ * @brief Manages a fixed-size pool of large memory blocks for event payloads.
+ *
+ * This class is thread-safe and uses std::array for all storage to avoid
+ * dynamic memory allocation.
+ */
+class LargeMemoryPool {
+public:
+    LargeMemoryPool();
+    ~LargeMemoryPool() = default;
+
+    // Non-copyable and non-movable
+    LargeMemoryPool(const LargeMemoryPool&) = delete;
+    LargeMemoryPool& operator=(const LargeMemoryPool&) = delete;
+
+    /**
+     * @brief Allocates a block from the pool.
+     * @return A pair containing a pointer to the allocated block and its
+     * slot ID. Returns {nullptr, 0} if the pool is exhausted.
+     */
+    std::pair<void*, uint8_t> Allocate();
+
+    /**
+     * @brief Returns a memory block to the pool.
+     * @param slot_id The ID of the slot to release.
+     */
+    void Release(uint8_t slot_id);
+
+    /**
+     * @brief Gets a pointer to the memory of a specific slot.
+     * @param slot_id The ID of the slot.
+     * @return Pointer to the memory block, or nullptr if the ID is invalid.
+     */
+    void* GetSlotPointer(uint8_t slot_id);
+
+private:
+    std::mutex pool_mutex_;
+    std::array<std::array<uint8_t, kLargePayloadSize>, kNumLargePayloadBlocks> pool_storage_;
+    
+    // Manages the list of available slot indices as a stack
+    std::array<uint8_t, kNumLargePayloadBlocks> free_slot_indices_{};
+    size_t num_free_slots_ = 0;
+};
+
+} // namespace event_manager
+
+#pragma once
+
+#include <array>
+#include <cstdint>
+#include <memory>
+#include <mutex>
+#include <optional>
+#include <vector>
+
+namespace event_manager {
+
+/// The number of blocks in the large payload memory pool.
+constexpr size_t kNumLargePayloadBlocks = 10;
+/// The size (in bytes) of each block in the large payload memory pool.
+constexpr size_t kLargePayloadSize = 1024;
+
+/**
+ * @class LargeMemoryPool
+ * @brief Manages a fixed-size pool of large memory blocks for event payloads.
+ *
+ * This class is thread-safe and uses std::array for all storage to avoid
+ * dynamic memory allocation.
+ */
+class LargeMemoryPool {
+public:
+    LargeMemoryPool();
+    ~LargeMemoryPool() = default;
+
+    // Non-copyable and non-movable
+    LargeMemoryPool(const LargeMemoryPool&) = delete;
+    LargeMemoryPool& operator=(const LargeMemoryPool&) = delete;
+
+    /**
+     * @brief Allocates a block from the pool.
+     * @return A pair containing a pointer to the allocated block and its
+     * slot ID. Returns {nullptr, 0} if the pool is exhausted.
+     */
+    std::pair<void*, uint8_t> Allocate();
+
+    /**
+     * @brief Returns a memory block to the pool.
+     * @param slot_id The ID of the slot to release.
+     */
+    void Release(uint8_t slot_id);
+
+    /**
+     * @brief Gets a pointer to the memory of a specific slot.
+     * @param slot_id The ID of the slot.
+     * @return Pointer to the memory block, or nullptr if the ID is invalid.
+     */
+    void* GetSlotPointer(uint8_t slot_id);
+
+private:
+    std::mutex pool_mutex_;
+    std::array<std::array<uint8_t, kLargePayloadSize>, kNumLargePayloadBlocks> pool_storage_;
+    
+    // Manages the list of available slot indices as a stack
+    std::array<uint8_t, kNumLargePayloadBlocks> free_slot_indices_{};
+    size_t num_free_slots_ = 0;
+};
+
+} // namespace event_manager
+
+#include "large_memory_pool.h"
+#include <algorithm>
+#include <iostream>
+
+namespace event_manager {
+
+LargeMemoryPool::LargeMemoryPool() : num_free_slots_(kNumLargePayloadBlocks) {
+    // All slots are initially free. Populate the index list in reverse
+    // order so we can treat it as a stack.
+    for (uint8_t i = 0; i < kNumLargePayloadBlocks; ++i) {
+        free_slot_indices_[i] = (kNumLargePayloadBlocks - 1) - i;
+    }
+}
+
+std::pair<void*, uint8_t> LargeMemoryPool::Allocate() {
+    std::lock_guard<std::mutex> lock(pool_mutex_);
+    if (num_free_slots_ == 0) {
+        return {nullptr, 0}; // Pool is exhausted
+    }
+
+    // Get the next free slot ID from the top of our "stack"
+    uint8_t slot_id = free_slot_indices_[--num_free_slots_];
+    return {pool_storage_[slot_id].data(), slot_id};
+}
+
+void LargeMemoryPool::Release(uint8_t slot_id) {
+    if (slot_id >= kNumLargePayloadBlocks) {
+        return; // Invalid slot ID
+    }
+
+    std::lock_guard<std::mutex> lock(pool_mutex_);
+
+    // Prevent double-free by checking if it's already in the free list
+    for (size_t i = num_free_slots_; i < kNumLargePayloadBlocks; ++i) {
+        if (free_slot_indices_[i] == slot_id) {
+            std::cerr << "WARNING: Attempted to double-release large payload slot "
+                      << static_cast<int>(slot_id) << "." << std::endl;
+            return;
+        }
+    }
+    
+    if (num_free_slots_ >= kNumLargePayloadBlocks) {
+        // This should never happen if logic is correct
+        std::cerr << "ERROR: Attempted to release to a full pool." << std::endl;
+        return;
+    }
+
+    // Add the slot ID back to the top of the "stack"
+    free_slot_indices_[num_free_slots_++] = slot_id;
+}
+
+void* LargeMemoryPool::GetSlotPointer(uint8_t slot_id) {
+    if (slot_id >= kNumLargePayloadBlocks) {
+        return nullptr;
+    }
+    // No lock needed as we are just returning a pointer to static memory.
+    // The data integrity within is managed by the application logic.
+    return pool_storage_[slot_id].data();
+}
+
+} // namespace event_manager
+
+#pragma once
+
+#include <cstdint>
+#include <string>
+#include <variant>
+#include <array>
+
+namespace app_events {
+
+/**
+ * @file event_payloads.h
+ * @brief Defines the specific payload structures for different event types.
+ *
+ * Using std::variant for the payload ensures type safety. When a task receives
+ * an event, it can safely access the payload by checking the variant's active
+ * member, which should correspond to the event type.
+ */
+
+// --- Payload Struct Definitions ---
+
+/// An empty struct for events that carry no data.
+struct NoPayload {};
+
+/// Example payload for a sensor reading.
+struct SensorReading {
+    uint32_t sensor_id;
+    float value;
+};
+
+/// Example payload for a user button press.
+struct ButtonPress {
+    uint32_t button_id;
+    bool is_long_press;
+};
+
+/**
+ * @struct LargeDataDescriptor
+ * @brief A descriptor for data stored in the large memory pool.
+ *
+ * This struct doesn't hold the data itself, but provides the necessary
+ * metadata for the receiver to interpret the data located in the pool.
+ */
+struct LargeDataDescriptor {
+    enum class DataType {
+      JPEG_IMAGE,
+      AUDIO_CLIP,
+      LOG_FILE
+    } type;
+    size_t size; // The actual size of the data in the pool
+};
+
+
+// --- The Payload Variant ---
+
+/**
+ * @typedef EventPayload
+ * @brief A type-safe variant that can hold any of our defined payload structs.
+ *
+ * Add any new payload structs to this variant.
+ */
+using EventPayload = std::variant<
+    NoPayload,
+    SensorReading,
+    ButtonPress,
+    LargeDataDescriptor
+>;
+
+} // namespace app_events
+
+#pragma once
+
+#include "event_defs.h"
+#include "event_payloads.h"
+#include "large_memory_pool.h"
+#include "mailbox_defs.h"
+#include "osal_queue.h"
+#include <array>
+#include <cstdint>
+#include <memory>
+#include <mutex>
+#include <optional>
+
+namespace event_manager {
+
+using Duration = osal::Duration;
+constexpr Duration kMaxDuration = osal::kMaxDuration;
+
+struct Event {
+    app_events::MailboxId sender_id = app_events::kMaxMailboxes;
+    app_events::EventType type = 0;
+    app_events::EventPayload payload;
+    std::optional<uint8_t> large_payload_slot_id;
+};
+
+/**
+ * @class EventManager
+ * @brief Manages type-safe event passing between statically-defined mailboxes.
+ *
+ * This class is intended to be instantiated once at system startup and
+ * passed by reference (injected) into modules/tasks that need its services.
+ */
+class EventManager {
+public:
+    EventManager();
+    ~EventManager() = default;
+
+    // This class is now movable but not copyable.
+    EventManager(const EventManager&) = delete;
+    EventManager& operator=(const EventManager&) = delete;
+    EventManager(EventManager&&) = default;
+    EventManager& operator=(EventManager&&) = default;
+
+    bool Initialize();
+
+    bool SendEvent(app_events::MailboxId recipient_id,
+                   app_events::MailboxId sender_id,
+                   app_events::EventType type,
+                   const app_events::EventPayload& payload,
+                   Duration timeout = kMaxDuration);
+
+    bool SendLargeDataEvent(app_events::MailboxId recipient_id,
+                            app_events::MailboxId sender_id,
+                            app_events::EventType type,
+                            const app_events::LargeDataDescriptor& data_descriptor,
+                            const void* large_data_ptr,
+                            Duration timeout = kMaxDuration);
+
+    bool ReceiveEvent(app_events::MailboxId owner_id, Event& event, Duration timeout = kMaxDuration);
+    
+    void* GetLargePayloadData(const Event& event);
+    
+    void ReleaseLargePayload(const Event& event);
+    
+    uint64_t GetSendFailureCount() const;
+    uint64_t GetLargePoolExhaustedCount() const;
+
+private:
+    std::mutex manager_mutex_;
+    bool is_initialized_ = false;
+
+    std::array<std::unique_ptr<osal::Queue>, app_events::kMaxMailboxes> mailboxes_;
+    std::unique_ptr<LargeMemoryPool> large_payload_pool_;
+    
+    uint64_t send_failure_count_ = 0;
+    uint64_t large_pool_exhausted_count_ = 0;
+};
+
+} // namespace event_manager
+
+#include "event_manager.h"
+#include <cstring>
+#include <iostream>
+
+namespace event_manager {
+
+EventManager::EventManager() = default;
+
+bool EventManager::Initialize() {
+    std::lock_guard<std::mutex> lock(manager_mutex_);
+    if (is_initialized_) {
+        return true;
+    }
+
+    for (size_t i = 0; i < app_events::kNumMailboxes; ++i) {
+        const auto& config = app_events::kMailboxConfigTable[i];
+        if (config.id >= app_events::kMaxMailboxes) return false;
+        mailboxes_[config.id] = std::make_unique<osal::Queue>(config.queue_depth, sizeof(Event));
+    }
+
+    large_payload_pool_ = std::make_unique<LargeMemoryPool>();
+    is_initialized_ = true;
+    return true;
+}
+
+bool EventManager::SendEvent(app_events::MailboxId recipient_id,
+                             app_events::MailboxId sender_id,
+                             app_events::EventType type,
+                             const app_events::EventPayload& payload,
+                             Duration timeout) {
+    if (!is_initialized_ || recipient_id >= app_events::kMaxMailboxes || !mailboxes_[recipient_id]) {
+        send_failure_count_++;
+        return false;
+    }
+
+    Event event_to_send;
+    event_to_send.sender_id = sender_id;
+    event_to_send.type = type;
+    event_to_send.payload = payload;
+
+    if (!mailboxes_[recipient_id]->Send(&event_to_send, timeout)) {
+        send_failure_count_++;
+        return false;
+    }
+    return true;
+}
+
+bool EventManager::SendLargeDataEvent(app_events::MailboxId recipient_id,
+                                      app_events::MailboxId sender_id,
+                                      app_events::EventType type,
+                                      const app_events::LargeDataDescriptor& data_descriptor,
+                                      const void* large_data_ptr,
+                                      Duration timeout) {
+    if (!is_initialized_ || recipient_id >= app_events::kMaxMailboxes || !mailboxes_[recipient_id] ||
+        data_descriptor.size > kLargePayloadSize || large_data_ptr == nullptr) {
+        send_failure_count_++;
+        return false;
+    }
+
+    auto [pool_ptr, slot_id] = large_payload_pool_->Allocate();
+    if (pool_ptr == nullptr) {
+        large_pool_exhausted_count_++;
+        send_failure_count_++;
+        return false;
+    }
+
+    memcpy(pool_ptr, large_data_ptr, data_descriptor.size);
+
+    Event event_to_send;
+    event_to_send.sender_id = sender_id;
+    event_to_send.type = type;
+    event_to_send.payload = data_descriptor;
+    event_to_send.large_payload_slot_id = slot_id;
+
+    if (!mailboxes_[recipient_id]->Send(&event_to_send, timeout)) {
+        send_failure_count_++;
+        large_payload_pool_->Release(slot_id);
+        return false;
+    }
+    return true;
+}
+
+bool EventManager::ReceiveEvent(app_events::MailboxId owner_id, Event& event, Duration timeout) {
+    if (!is_initialized_ || owner_id >= app_events::kMaxMailboxes || !mailboxes_[owner_id]) {
+        return false;
+    }
+    return mailboxes_[owner_id]->Receive(&event, timeout);
+}
+
+void* EventManager::GetLargePayloadData(const Event& event) {
+    if (!event.large_payload_slot_id.has_value()) return nullptr;
+    return large_payload_pool_->GetSlotPointer(event.large_payload_slot_id.value());
+}
+
+void EventManager::ReleaseLargePayload(const Event& event) {
+    if (event.large_payload_slot_id.has_value()) {
+        large_payload_pool_->Release(event.large_payload_slot_id.value());
+    }
+}
+
+uint64_t EventManager::GetSendFailureCount() const {
+    std::lock_guard<std::mutex> lock(manager_mutex_);
+    return send_failure_count_;
+}
+
+uint64_t EventManager::GetLargePoolExhaustedCount() const {
+    std::lock_guard<std::mutex> lock(manager_mutex_);
+    return large_pool_exhausted_count_;
+}
+
+} // namespace event_manager
+
+#include "event_manager.h"
+#include <iostream>
+#include <thread> // For example purposes
+
+// --- Mock Task/Module Classes ---
+
+/**
+ * @class SensorTask
+ * @brief A mock task that reads sensors and sends events.
+ *
+ * It holds a reference to the EventManager, which is "injected"
+ * into its constructor.
+ */
+class SensorTask {
+public:
+    // The dependency is injected here.
+    SensorTask(event_manager::EventManager& manager)
+        : event_manager_(manager),
+          mailbox_id_(app_events::kSensorManagerTask) {}
+
+    void run() {
+        std::cout << "[SensorTask] Running..." << std::endl;
+        // In a real system, this would be the main task loop.
+        // Here, we just send one event for demonstration.
+        app_events::SensorReading reading_payload;
+        reading_payload.sensor_id = 0x1234;
+        reading_payload.value = 25.5f;
+
+        std::cout << "[SensorTask] Sending temperature reading to UI Task." << std::endl;
+        event_manager_.SendEvent(
+            app_events::kUserInterfaceTask, // recipient
+            mailbox_id_,                    // sender
+            app_events::kTemperatureReading,
+            reading_payload
+        );
+    }
+
+private:
+    event_manager::EventManager& event_manager_;
+    const app_events::MailboxId mailbox_id_;
+};
+
+/**
+ * @class UITask
+ * @brief A mock task that receives events and updates a UI.
+ */
+class UITask {
+public:
+    UITask(event_manager::EventManager& manager)
+        : event_manager_(manager),
+          mailbox_id_(app_events::kUserInterfaceTask) {}
+
+    void run() {
+        std::cout << "[UITask] Running and waiting for events..." << std::endl;
+        event_manager::Event event;
+        // Wait for one event for demonstration.
+        if (event_manager_.ReceiveEvent(mailbox_id_, event, event_manager::kMaxDuration)) {
+            handle_event(event);
+        }
+    }
+
+private:
+    void handle_event(const event_manager::Event& event) {
+        std::cout << "[UITask] Received event type " << event.type << " from sender " << event.sender_id << std::endl;
+
+        // Use std::visit for type-safe access to the payload
+        std::visit([this](auto&& arg) {
+            using T = std::decay_t<decltype(arg)>;
+            if constexpr (std::is_same_v<T, app_events::SensorReading>) {
+                std::cout << "  -> Payload is SensorReading: ID=" << arg.sensor_id << ", Value=" << arg.value << std::endl;
+            } else if constexpr (std::is_same_v<T, app_events::NoPayload>) {
+                std::cout << "  -> Event has no payload." << std::endl;
+            } else {
+                std::cout << "  -> Received an unhandled payload type." << std::endl;
+            }
+        }, event.payload);
+    }
+
+    event_manager::EventManager& event_manager_;
+    const app_events::MailboxId mailbox_id_;
+};
+
+
+// --- System Startup ---
+
+int main() {
+    std::cout << "--- System Startup ---" << std::endl;
+
+    // 1. Create the single EventManager instance on the stack.
+    event_manager::EventManager manager;
+
+    // 2. Initialize it. This creates all the OSAL queues.
+    if (!manager.Initialize()) {
+        std::cerr << "Failed to initialize EventManager!" << std::endl;
+        return -1;
+    }
+    std::cout << "EventManager initialized successfully." << std::endl;
+
+    // 3. Create the task/module objects, injecting the manager instance.
+    SensorTask sensor_task(manager);
+    UITask ui_task(manager);
+
+    // 4. In a real embedded system, you would now create and start the RTOS tasks.
+    //    For this example, we'll simulate them with threads.
+    std::thread ui_thread(&UITask::run, &ui_task);
+    std::this_thread::sleep_for(std::chrono::milliseconds(100)); // Give UI task time to block
+    std::thread sensor_thread(&SensorTask::run, &sensor_task);
+
+    // Wait for tasks to complete.
+    sensor_thread.join();
+    ui_thread.join();
+
+    std::cout << "--- System Shutdown ---" << std::endl;
+
+    return 0;
+}
