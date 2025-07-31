@@ -1,0 +1,502 @@
+/*
+ * flash_tool.c
+ *
+ * A simple command-line interface (CLI) application for an NXP i.MX8 board
+ * running Yocto Zeus. This application provides commands to read, write, erase,
+ * and verify flash memory over a serial port.
+ *
+ * To cross-compile for the i.MX8 (ARM64 architecture):
+ * aarch64-linux-gnu-gcc -o flash_tool flash_tool.c
+ *
+ * Author: Gemini
+ * Date: July 31, 2025
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <termios.h>
+#include <errno.h>
+#include <sys/stat.h>
+
+#define SERIAL_PORT_DEFAULT "/dev/ttymxc0"
+#define BAUD_RATE B115200
+#define MAX_COMMAND_LENGTH 256
+#define MTD_DEVICE_DEFAULT "/dev/mtd0"
+#define READ_BUFFER_SIZE 1024
+
+// Function prototypes
+void print_help(int serial_fd);
+int open_serial_port(const char *port_name);
+void handle_flash_read(int serial_fd, char *args);
+void handle_flash_write(int serial_fd, char *args);
+void handle_flash_writedata(int serial_fd, char *args);
+void handle_flash_erase(int serial_fd, char *args);
+void handle_flash_verify(int serial_fd, char *args);
+
+
+/**
+ * @brief Main function of the flash tool application.
+ *
+ * @param argc Argument count.
+ * @param argv Argument vector.
+ * @return 0 on success, 1 on failure.
+ */
+int main(int argc, char *argv[]) {
+    char *serial_port_name = SERIAL_PORT_DEFAULT;
+    if (argc > 1) {
+        serial_port_name = argv[1];
+    }
+
+    int serial_fd = open_serial_port(serial_port_name);
+    if (serial_fd < 0) {
+        return 1;
+    }
+
+    char command[MAX_COMMAND_LENGTH];
+    char welcome_msg[] = "\n\rNXP i.MX8 Flash Tool\n\rType 'help' for a list of commands.\n\r> ";
+
+    write(serial_fd, welcome_msg, sizeof(welcome_msg));
+
+    while (1) {
+        int len = read(serial_fd, command, sizeof(command) - 1);
+        if (len > 0) {
+            command[len] = '\0';
+
+            // Echo the command back
+            write(serial_fd, command, len);
+            write(serial_fd, "\r\n", 2);
+
+            // Remove trailing newline or carriage return characters
+            command[strcspn(command, "\r\n")] = 0;
+
+            char *cmd = strtok(command, " ");
+            char *args = strtok(NULL, "");
+
+            if (cmd != NULL) {
+                if (strcmp(cmd, "help") == 0) {
+                    print_help(serial_fd);
+                } else if (strcmp(cmd, "flash") == 0) {
+                    char *sub_cmd = strtok(args, " ");
+                    args = strtok(NULL, "");
+                    if (sub_cmd != NULL) {
+                        if (strcmp(sub_cmd, "read") == 0) {
+                            handle_flash_read(serial_fd, args);
+                        } else if (strcmp(sub_cmd, "write") == 0) {
+                            handle_flash_write(serial_fd, args);
+                        } else if (strcmp(sub_cmd, "writedata") == 0) {
+                            handle_flash_writedata(serial_fd, args);
+                        } else if (strcmp(sub_cmd, "erase") == 0) {
+                            handle_flash_erase(serial_fd, args);
+                        } else if (strcmp(sub_cmd, "verify") == 0) {
+                            handle_flash_verify(serial_fd, args);
+                        } else {
+                            char error_msg[] = "Invalid flash command. Type 'help'.\r\n";
+                            write(serial_fd, error_msg, sizeof(error_msg));
+                        }
+                    } else {
+                        char error_msg[] = "Missing flash subcommand. Type 'help'.\r\n";
+                        write(serial_fd, error_msg, sizeof(error_msg));
+                    }
+                } else {
+                    char error_msg[] = "Unknown command. Type 'help'.\r\n";
+                    write(serial_fd, error_msg, sizeof(error_msg));
+                }
+            }
+            write(serial_fd, "> ", 2);
+        }
+    }
+
+    close(serial_fd);
+    return 0;
+}
+
+/**
+ * @brief Prints the help message to the serial port.
+ *
+ * @param serial_fd File descriptor for the serial port.
+ */
+void print_help(int serial_fd) {
+    char help_msg[] =
+        "Available commands:\r\n"
+        "  help                                     - Show this help message.\r\n"
+        "  flash read <offset> <size> <file>        - Read from flash to a file.\r\n"
+        "  flash write <offset> <file>              - Write a file to flash.\r\n"
+        "  flash writedata <offset> <size>          - Write <size> raw bytes from serial to flash.\r\n"
+        "  flash erase <offset> <blocks>            - Erase a number of blocks on the flash.\r\n"
+        "  flash verify <offset> <file>             - Verify flash content against a file.\r\n";
+    write(serial_fd, help_msg, sizeof(help_msg));
+}
+
+/**
+ * @brief Opens and configures the serial port.
+ *
+ * @param port_name The name of the serial port device (e.g., "/dev/ttymxc0").
+ * @return The file descriptor for the serial port, or -1 on failure.
+ */
+int open_serial_port(const char *port_name) {
+    int fd = open(port_name, O_RDWR | O_NOCTTY);
+    if (fd == -1) {
+        perror("open_serial_port: Unable to open port");
+        return -1;
+    }
+
+    struct termios options;
+    tcgetattr(fd, &options);
+
+    cfsetispeed(&options, BAUD_RATE);
+    cfsetospeed(&options, BAUD_RATE);
+
+    options.c_cflag |= (CLOCAL | CREAD);
+    options.c_cflag &= ~PARENB;
+    options.c_cflag &= ~CSTOPB;
+    options.c_cflag &= ~CSIZE;
+    options.c_cflag |= CS8;
+    options.c_lflag &= ~(ICANON | ECHO | ECHOE | ISIG);
+    options.c_iflag &= ~(IXON | IXOFF | IXANY);
+    options.c_oflag &= ~OPOST;
+
+    options.c_cc[VMIN] = 1;
+    options.c_cc[VTIME] = 10;
+
+    if (tcsetattr(fd, TCSANOW, &options) < 0) {
+        perror("open_serial_port: Couldn't set termios attributes");
+        return -1;
+    }
+
+    fcntl(fd, F_SETFL, 0);
+    return fd;
+}
+
+/**
+ * @brief Handles the 'flash read' command using 'dd'.
+ *
+ * @param serial_fd File descriptor for the serial port.
+ * @param args Command arguments.
+ */
+void handle_flash_read(int serial_fd, char *args) {
+    char *offset_str = strtok(args, " ");
+    char *size_str = strtok(NULL, " ");
+    char *filename = strtok(NULL, " ");
+
+    if (offset_str == NULL || size_str == NULL || filename == NULL) {
+        char error_msg[] = "Usage: flash read <offset> <size> <file>\r\n";
+        write(serial_fd, error_msg, sizeof(error_msg));
+        return;
+    }
+
+    char command[MAX_COMMAND_LENGTH];
+    snprintf(command, sizeof(command), "dd if=%s of=%s bs=1 skip=%s count=%s > /tmp/flash_tool.log 2>&1",
+             MTD_DEVICE_DEFAULT, filename, offset_str, size_str);
+
+    int ret = system(command);
+
+    if (ret == 0) {
+        char success_msg[MAX_COMMAND_LENGTH];
+        snprintf(success_msg, sizeof(success_msg), "Flash read successful. Data saved to %s\r\n", filename);
+        write(serial_fd, success_msg, strlen(success_msg));
+    } else {
+        char error_msg[] = "Flash read failed. Check /tmp/flash_tool.log for details.\r\n";
+        write(serial_fd, error_msg, sizeof(error_msg));
+    }
+}
+
+/**
+ * @brief Handles the 'flash write' command using 'dd'.
+ *
+ * @param serial_fd File descriptor for the serial port.
+ * @param args Command arguments.
+ */
+void handle_flash_write(int serial_fd, char *args) {
+    char *offset_str = strtok(args, " ");
+    char *filename = strtok(NULL, " ");
+
+    if (offset_str == NULL || filename == NULL) {
+        char error_msg[] = "Usage: flash write <offset> <file>\r\n";
+        write(serial_fd, error_msg, sizeof(error_msg));
+        return;
+    }
+
+    char command[MAX_COMMAND_LENGTH];
+    snprintf(command, sizeof(command), "dd if=%s of=%s bs=1 seek=%s conv=notrunc > /tmp/flash_tool.log 2>&1",
+             filename, MTD_DEVICE_DEFAULT, offset_str);
+
+    int ret = system(command);
+
+    if (ret == 0) {
+        char success_msg[] = "Flash write successful.\r\n";
+        write(serial_fd, success_msg, sizeof(success_msg));
+    } else {
+        char error_msg[] = "Flash write failed. Check /tmp/flash_tool.log for details.\r\n";
+        write(serial_fd, error_msg, sizeof(error_msg));
+    }
+}
+
+/**
+ * @brief Handles the 'flash writedata' command by streaming from serial.
+ *
+ * @param serial_fd File descriptor for the serial port.
+ * @param args Command arguments.
+ */
+void handle_flash_writedata(int serial_fd, char *args) {
+    char *offset_str = strtok(args, " ");
+    char *size_str = strtok(NULL, " ");
+
+    if (offset_str == NULL || size_str == NULL) {
+        char error_msg[] = "Usage: flash writedata <offset> <size>\r\n";
+        write(serial_fd, error_msg, sizeof(error_msg));
+        return;
+    }
+
+    long size_to_read = strtol(size_str, NULL, 0);
+    if (size_to_read <= 0) {
+        char error_msg[] = "Error: Invalid size.\r\n";
+        write(serial_fd, error_msg, sizeof(error_msg));
+        return;
+    }
+
+    const char *temp_filename = "/tmp/flash_data.tmp";
+    FILE *temp_file = fopen(temp_filename, "wb");
+    if (temp_file == NULL) {
+        char error_msg[] = "Error: Could not create temporary file.\r\n";
+        write(serial_fd, error_msg, sizeof(error_msg));
+        return;
+    }
+
+    char prompt_msg[128];
+    snprintf(prompt_msg, sizeof(prompt_msg), "Ready to receive %ld bytes. Send data now...\r\n", size_to_read);
+    write(serial_fd, prompt_msg, strlen(prompt_msg));
+
+    char buffer[READ_BUFFER_SIZE];
+    long bytes_received = 0;
+    while (bytes_received < size_to_read) {
+        long bytes_to_read_now = size_to_read - bytes_received;
+        if (bytes_to_read_now > READ_BUFFER_SIZE) {
+            bytes_to_read_now = READ_BUFFER_SIZE;
+        }
+        
+        int len = read(serial_fd, buffer, bytes_to_read_now);
+        if (len > 0) {
+            fwrite(buffer, 1, len, temp_file);
+            bytes_received += len;
+        } else if (len < 0) {
+            char error_msg[] = "Error reading from serial port.\r\n";
+            write(serial_fd, error_msg, sizeof(error_msg));
+            fclose(temp_file);
+            remove(temp_filename);
+            return;
+        }
+    }
+    fclose(temp_file);
+    
+    char received_msg[128];
+    snprintf(received_msg, sizeof(received_msg), "Received %ld bytes. Writing to flash...\r\n", bytes_received);
+    write(serial_fd, received_msg, strlen(received_msg));
+
+    char command[MAX_COMMAND_LENGTH];
+    snprintf(command, sizeof(command), "dd if=%s of=%s bs=1 seek=%s conv=notrunc > /tmp/flash_tool.log 2>&1",
+             temp_filename, MTD_DEVICE_DEFAULT, offset_str);
+
+    int ret = system(command);
+    remove(temp_filename); // Clean up the temporary file
+
+    if (ret == 0) {
+        char success_msg[] = "Flash write (data) successful.\r\n";
+        write(serial_fd, success_msg, sizeof(success_msg));
+    } else {
+        char error_msg[] = "Flash write (data) failed. Check /tmp/flash_tool.log for details.\r\n";
+        write(serial_fd, error_msg, sizeof(error_msg));
+    }
+}
+
+
+/**
+ * @brief Handles the 'flash erase' command.
+ *
+ * @param serial_fd File descriptor for the serial port.
+ * @param args Command arguments.
+ */
+void handle_flash_erase(int serial_fd, char *args) {
+    char *offset_str = strtok(args, " ");
+    char *count_str = strtok(NULL, " ");
+
+    if (offset_str == NULL || count_str == NULL) {
+        char error_msg[] = "Usage: flash erase <offset> <number of blocks>\r\n";
+        write(serial_fd, error_msg, sizeof(error_msg));
+        return;
+    }
+
+    char command[MAX_COMMAND_LENGTH];
+    snprintf(command, sizeof(command), "flash_erase %s %s %s > /tmp/flash_tool.log 2>&1", MTD_DEVICE_DEFAULT, offset_str, count_str);
+
+    int ret = system(command);
+
+    if (ret == 0) {
+        char success_msg[] = "Flash erase successful.\r\n";
+        write(serial_fd, success_msg, sizeof(success_msg));
+    } else {
+        char error_msg[] = "Flash erase failed. Check /tmp/flash_tool.log for details.\r\n";
+        write(serial_fd, error_msg, sizeof(error_msg));
+    }
+}
+
+/**
+ * @brief Handles the 'flash verify' command.
+ *
+ * @param serial_fd File descriptor for the serial port.
+ * @param args Command arguments.
+ */
+void handle_flash_verify(int serial_fd, char *args) {
+    char *offset_str = strtok(args, " ");
+    char *filename = strtok(NULL, " ");
+
+    if (offset_str == NULL || filename == NULL) {
+        char error_msg[] = "Usage: flash verify <offset> <file>\r\n";
+        write(serial_fd, error_msg, sizeof(error_msg));
+        return;
+    }
+
+    struct stat file_stat;
+    if (stat(filename, &file_stat) != 0) {
+        char error_msg[MAX_COMMAND_LENGTH];
+        snprintf(error_msg, sizeof(error_msg), "Error: Cannot open file %s\r\n", filename);
+        write(serial_fd, error_msg, strlen(error_msg));
+        return;
+    }
+    long file_size = file_stat.st_size;
+
+    if (file_size <= 0) {
+        char error_msg[] = "Error: Cannot verify an empty or non-existent file.\r\n";
+        write(serial_fd, error_msg, sizeof(error_msg));
+        return;
+    }
+
+    const char *temp_filename = "/tmp/flash_verify.tmp";
+    char command[MAX_COMMAND_LENGTH * 2];
+
+    snprintf(command, sizeof(command), "dd if=%s of=%s bs=1 skip=%s count=%ld > /tmp/flash_tool.log 2>&1",
+             MTD_DEVICE_DEFAULT, temp_filename, offset_str, file_size);
+
+    int ret = system(command);
+    if (ret != 0) {
+        char error_msg[] = "Verification failed: could not read from flash. Check /tmp/flash_tool.log\r\n";
+        write(serial_fd, error_msg, sizeof(error_msg));
+        remove(temp_filename);
+        return;
+    }
+
+    snprintf(command, sizeof(command), "cmp %s %s >> /tmp/flash_tool.log 2>&1", filename, temp_filename);
+    ret = system(command);
+    remove(temp_filename);
+
+    if (ret == 0) {
+        char success_msg[] = "Flash verification successful: Contents match.\r\n";
+        write(serial_fd, success_msg, sizeof(success_msg));
+    } else {
+        char error_msg[] = "Flash verification failed: Contents do NOT match. Check /tmp/flash_tool.log\r\n";
+        write(serial_fd, error_msg, sizeof(error_msg));
+    }
+}
+```makefile
+# Makefile for flash_tool
+
+# Cross-compiler prefix
+CC=aarch64-linux-gnu-gcc
+
+# Target executable
+TARGET=flash_tool
+
+# Source file
+SRCS=flash_tool.c
+
+# C flags
+CFLAGS=-Wall -Wextra -O2
+
+.PHONY: all clean
+
+all: $(TARGET)
+
+$(TARGET): $(SRCS)
+	$(CC) $(CFLAGS) -o $(TARGET) $(SRCS)
+
+clean:
+	rm -f $(TARGET)
+```markdown
+# NXP i.MX8 Flash Tool
+
+This document provides instructions on how to build, deploy, and use the `flash_tool` CLI application on an NXP i.MX8 board running a Yocto Zeus-based Linux distribution.
+
+## 1. Prerequisites
+
+* **Cross-compilation Toolchain:** You need a working `aarch64-linux-gnu-` toolchain to build the application for the i.MX8 processor. If you have built your Yocto image, the toolchain should be available in your build environment.
+* **Serial Port Access:** You need to have physical access to the serial port of your i.MX8 board and a serial terminal program (e.g., `minicom`, `putty`, `screen`) on your host machine.
+* **`mtd-utils` and `coreutils`:** The `flash_tool` application relies on the `mtd-utils` package (for `flash_erase`) and `coreutils` (for `dd`, `cmp`) being installed on your target i.MX8 board. You can ensure these are in your Yocto image by adding the following to your `local.conf` file:
+    ```
+    IMAGE_INSTALL_append = " mtd-utils coreutils"
+    ```
+    Then, rebuild your image.
+
+## 2. Building the Application
+
+1.  **Save the files:** Save the C code as `flash_tool.c` and the Makefile as `Makefile` in the same directory on your host machine.
+2.  **Source the environment script:** Before you can cross-compile, you need to source the environment setup script from your Yocto build directory. This will set up the `PATH` and other environment variables needed for the cross-compiler.
+    ```bash
+    source <path-to-your-yocto-build-dir>/environment-setup-aarch64-poky-linux
+    ```
+3.  **Compile:** Open a terminal in the directory where you saved the files and run the `make` command:
+    ```bash
+    make
+    ```
+    This will create an executable file named `flash_tool`.
+
+## 3. Deploying the Application
+
+You need to transfer the compiled `flash_tool` executable to your i.MX8 board. You can do this using various methods:
+
+* **SD Card:** Copy the `flash_tool` executable to an SD card and then mount the SD card on your i.MX8 board.
+* **SCP:** If your board is connected to the network, you can use the `scp` command to copy the file over SSH.
+    ```bash
+    scp flash_tool root@<your-board-ip>:/usr/local/bin/
+    ```
+
+## 4. Running the Application
+
+1.  **Connect to the serial port:** Connect your host machine to the serial port of your i.MX8 board and start your serial terminal program. Configure the serial port settings to match the application's settings (115200 baud, 8N1).
+2.  **Run the application:** On the i.MX8 board's console, navigate to the directory where you copied the `flash_tool` executable and run it:
+    ```bash
+    ./flash_tool
+    ```
+    You can optionally specify a different serial port as a command-line argument:
+    ```bash
+    ./flash_tool /dev/ttymxc1
+    ```
+3.  **Use the CLI:** You should see a welcome message and a command prompt (`> `) in your serial terminal. You can now use the available commands.
+
+## 5. Commands
+
+* **`help`**: Displays the help message with a list of available commands.
+* **`flash read <offset> <size> <file>`**: Reads `<size>` bytes of data from the flash memory starting at `<offset>` and saves it to `<file>` on the board's filesystem.
+* **`flash write <offset> <file>`**: Writes the contents of `<file>` to the flash memory starting at `<offset>`.
+* **`flash writedata <offset> <size>`**: Prompts to receive `<size>` raw bytes from the serial terminal and writes them to flash at the specified `<offset>`.
+* **`flash erase <offset> <blocks>`**: Erases `<blocks>` number of blocks on the flash memory starting at `<offset>`.
+* **`flash verify <offset> <file>`**: Verifies that the content of the flash memory starting at `<offset>` matches the content of `<file>`.
+
+**Example Usage for `writedata`:**
+
+1.  Type the command with the desired offset and size (e.g., 4096 bytes for 4KB).
+    ```
+    > flash writedata 0x200000 4096
+    ```
+2.  The tool will respond with a prompt:
+    ```
+    Ready to receive 4096 bytes. Send data now...
+    ```
+3.  Now, use your serial terminal's "Send File" feature to send your binary data file, or simply paste the raw data into the terminal.
+4.  After 4096 bytes have been received, the tool will automatically proceed to write the data to flash and confirm completion.
+    ```
+    Received 4096 bytes. Writing to flash...
+    Flash write (data) successful.
+    > 
+    
