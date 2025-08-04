@@ -383,3 +383,76 @@ This sequence demonstrates how temporary locked states work for user feedback.
     * Sets a temporary "locked" state that reverts after the duration.
 -   `void SetPanicMode(bool enable)`
     * Forces the LED to a solid error color, overriding all other logic.
+
+
+# AWS IoT Core Simulator (Python Edition)
+
+This is a modular desktop application built with Python and PySide6 that functions as a powerful MQTT test client. It can simulate both an individual IoT device and a backend service interacting with multiple devices.
+
+The application can be run in two modes:
+1.  **GUI Mode**: A rich graphical user interface.
+2.  **CLI Mode**: A powerful, interactive command-line interface designed for developers.
+
+## Features
+
+* **Backend Simulation**: Target specific devices for shadow and job updates in both the GUI and CLI.
+* **Dual Broker Support**: Connect to a real AWS IoT Core endpoint or a public simulation broker for easy testing.
+* **Publish with Retain**: The `publish` command supports a `--retain` flag.
+* **Advanced Logging**:
+    * `logs/packets.log`: A clean, structured log of all MQTT packet data.
+    * `logs/app.log`: A general application log for connection status, errors, and debug information.
+* **Packet Log Filtering**: Dynamically filter the `packets.log` based on topic and payload content to isolate traffic.
+* **Configurable Log Levels**: Control application log verbosity via the CLI.
+* **Improved Error Feedback**: The CLI now provides immediate, clear error messages for failed operations.
+* **Configuration Driven**: All settings (endpoints, certs, topics) are managed in a `config.json` file.
+* **Modular & Extendable**: Code is structured into UI, MQTT, and Core logic packages for easy enhancement.
+
+## Project Structure
+
+```
+aws-iot-simulator-python/
+├── main.py             # Entry point for GUI mode
+├── cli.py              # Entry point for CLI mode
+├── config.json         # All configuration
+├── requirements.txt    # Project dependencies
+├── README.md           # This file
+├── logs/               # Directory for log files
+└── ... (other modules)
+```
+
+## Setup and Installation
+
+1.  **Create Project**: Set up the project directory and all the files as described in the artifacts.
+
+2.  **Create a Virtual Environment** (Recommended):
+    ```bash
+    python -m venv venv
+    source venv/bin/activate  # On Windows: venv\Scripts\activate
+    ```
+
+3.  **Install Dependencies**:
+    ```bash
+    pip install -r requirements.txt
+    ```
+
+4.  **Configure the Application**:
+    * Open `config.json`.
+    * To connect to a **real AWS IoT endpoint**, fill in the `endpoint` and the correct paths to your `ca_path`, `cert_path`, and `key_path`.
+    * To use **simulation mode**, you can leave the configuration as is. The application will automatically fall back to the public `simulation_broker`.
+
+## How to Run
+
+### GUI Mode
+
+To run the graphical application, execute the `main.py` script:
+```bash
+python main.py
+```
+
+### CLI Mode
+
+To run the interactive command-line interface, execute the `cli.py` script:
+```bash
+python cli.py
+```
+Type `help` in the CLI to see a list of available commands.
