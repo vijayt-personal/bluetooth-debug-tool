@@ -1,0 +1,385 @@
+#pragma once
+
+#include <atomic>
+#include <array>
+#include <optional>
+#include "osal_timer.h"
+#include "rgb_led_controller.h"
+
+/**
+ * @class LEDUI
+ * @brief Manages the state and patterns of a status indication LED.
+ *
+ * This class provides a state machine to control an RGB LED for user feedback.
+ * It supports setting persistent ("soft") states that can be overridden by
+ * priority, as well as temporary ("locked") states for feedback.
+ */
+class LEDUI {
+public:
+    /**
+     * @brief Defines the semantic state of the system being indicated by the LED.
+     */
+    enum class State : uint8_t {
+        kClear,
+        kPowerOn,
+        kBleConnected,
+        kOnline,
+        kOffline,
+        kNoWifi,
+        kOtaInProgress,
+        // Add specific feedback states
+        kSuccess,
+        kFailure,
+        kStateCount // Keep this last for array sizing
+    };
+
+    LEDUI();
+
+    /**
+     * @brief Initializes the underlying LED controller hardware.
+     * @param pin The GPIO pin connected to the LED data line.
+     * @param count The number of LEDs in the strip.
+     */
+    void Init(uint32_t pin, uint16_t count = 1);
+
+    /**
+     * @brief Sets a persistent ("soft") state that can be overridden.
+     * @details This state remains active until another state with a higher
+     * or equal priority is set. This call will be ignored if a temporary
+     * lock is currently active.
+     * @param state The persistent state to display.
+     */
+    void SetState(State state);
+
+    /**
+     * @brief Sets a temporary ("locked") state that reverts after a duration.
+     * @details This is used for showing immediate, high-priority feedback. During
+     * the lock duration, calls to the other `SetState` method are ignored.
+     * After the duration, the LED reverts to its previous state.
+     * @param state The temporary state to display.
+     * @param lock_duration The amount of time to keep the state locked.
+     */
+    void SetState(State state, osal::Duration lock_duration);
+
+    /**
+     * @brief Enables or disables a panic mode, which overrides all other states.
+     * @param enable If true, sets the LED to a solid panic color.
+     */
+    void SetPanicMode(bool enable);
+
+private:
+    /// @brief Defines the visual pattern for a given state.
+    enum class StatusType { kSolid, kBlink };
+
+    /// @brief Holds the configuration for a single LED state's visual appearance.
+    struct LEDStateConfig {
+        platform::peripheral::RGBLedController::Color color;
+        osal::Duration on_duration;
+        osal::Duration off_duration;
+        StatusType status_type;
+        int priority;
+    };
+
+    // --- Private Methods ---
+    void OnLockExpired();
+    void OnEffectTick();
+    void InitStateMap();
+    void ApplyState(State state);
+    void SetLedColor(const platform::peripheral::RGBLedController::Color& color);
+
+    // --- Timers ---
+    osal::Timer effect_timer_;
+    osal::Timer lock_timer_;
+
+    // --- State Management ---
+    platform::peripheral::RGBLedController pixel_;
+    State persistent_state_;
+    State state_before_lock_;
+    std::optional<State> locked_state_;
+    std::atomic<bool> in_panic_mode_{false};
+    bool is_led_on_{false};
+
+    std::array<LEDStateConfig, static_cast<size_t>(State::kStateCount)> state_map_;
+
+    // --- Constants ---
+    static constexpr uint8_t kMaxBrightness_ = 70;
+};
+
+
+#include "led_ui.h"
+#include "log_print.h" // Assumed for logging
+
+namespace {
+    // Define colors in an anonymous namespace to limit their scope.
+    constexpr platform::peripheral::RGBLedController::Color kRed = {150, 0, 0};
+    constexpr platform::peripheral::RGBLedController::Color kGreen = {45, 201, 0};
+    constexpr platform::peripheral::RGBLedController::Color kBlue = {0, 0, 100};
+    constexpr platform::peripheral::RGBLedController::Color kWhite = {255, 255, 255};
+    constexpr platform::peripheral::RGBLedController::Color kTurquoise = {100, 204, 255};
+    constexpr platform::peripheral::RGBLedController::Color kOff = {0, 0, 0};
+} // namespace
+
+LEDUI::LEDUI()
+    : effect_timer_("led_effect_tm", [this]() { this->OnEffectTick(); }, osal::Duration(500), true),
+      lock_timer_("led_lock_tm", [this]() { this->OnLockExpired(); }, osal::Duration(1000), false),
+      persistent_state_(State::kClear),
+      state_before_lock_(State::kClear) {}
+
+void LEDUI::Init(uint32_t pin, uint16_t count) {
+    platform::peripheral::RGBLedController::LedConfig led_config{pin, 10'000'000, count};
+    pixel_.Init(led_config);
+    pixel_.SetBrightness(kMaxBrightness_);
+    InitStateMap();
+    LOG_PRINT(platform::log_print::kVERBOSE, "LEDUI initialized");
+}
+
+void LEDUI::InitStateMap() {
+    using osal::Duration;
+    state_map_[static_cast<int>(State::kClear)] = {kOff, Duration(0), Duration(0), StatusType::kSolid, 0};
+    state_map_[static_cast<int>(State::kPowerOn)] = {kWhite, Duration(0), Duration(0), StatusType::kSolid, 0};
+    state_map_[static_cast<int>(State::kBleConnected)] = {kBlue, Duration(500), Duration(500), StatusType::kBlink, 1};
+    state_map_[static_cast<int>(State::kOnline)] = {kGreen, Duration(0), Duration(0), StatusType::kSolid, 1};
+    state_map_[static_cast<int>(State::kOffline)] = {kRed, Duration(0), Duration(0), StatusType::kSolid, 1};
+    state_map_[static_cast<int>(State::kNoWifi)] = {kBlue, Duration(250), Duration(2000), StatusType::kBlink, 1};
+    state_map_[static_cast<int>(State::kOtaInProgress)] = {kTurquoise, Duration(250), Duration(250), StatusType::kBlink, 5};
+    // Feedback states should have the highest priority to ensure they are shown.
+    state_map_[static_cast<int>(State::kSuccess)] = {kGreen, Duration(0), Duration(0), StatusType::kSolid, 10};
+    state_map_[static_cast<int>(State::kFailure)] = {kRed, Duration(0), Duration(0), StatusType::kSolid, 10};
+}
+
+void LEDUI::SetState(State state) {
+    if (locked_state_.has_value()) {
+        return; // Ignore soft state changes while a lock is active.
+    }
+
+    const auto& new_config = state_map_[static_cast<int>(state)];
+    const auto& current_config = state_map_[static_cast<int>(persistent_state_)];
+
+    if (persistent_state_ != state && new_config.priority >= current_config.priority) {
+        persistent_state_ = state;
+        ApplyState(persistent_state_);
+    }
+}
+
+void LEDUI::SetState(State state, osal::Duration lock_duration) {
+    lock_timer_.Stop();
+
+    // If we are not already locked, save the current state to revert to later.
+    if (!locked_state_.has_value()) {
+        state_before_lock_ = persistent_state_;
+    }
+
+    locked_state_ = state;
+    ApplyState(state);
+
+    lock_timer_.ChangePeriod(lock_duration);
+    lock_timer_.Start();
+}
+
+void LEDUI::SetPanicMode(bool enable) {
+    in_panic_mode_.store(enable);
+    if (enable) {
+        effect_timer_.Stop();
+        lock_timer_.Stop();
+        SetLedColor(kRed);
+    } else {
+        // Re-apply the correct state now that panic is over.
+        ApplyState(locked_state_.value_or(persistent_state_));
+    }
+}
+
+void LEDUI::OnLockExpired() {
+    // The lock duration is over, so unlock and revert to the previous state.
+    locked_state_.reset();
+    ApplyState(state_before_lock_);
+}
+
+void LEDUI::OnEffectTick() {
+    State current_display_state = locked_state_.value_or(persistent_state_);
+    const auto& config = state_map_[static_cast<int>(current_display_state)];
+
+    // This callback should only be running for blink states.
+    if (config.status_type == StatusType::kBlink) {
+        is_led_on_ = !is_led_on_;
+        SetLedColor(is_led_on_ ? config.color : kOff);
+        // Set the timer for the next phase of the blink cycle.
+        effect_timer_.ChangePeriod(is_led_on_ ? config.on_duration : config.off_duration);
+    }
+}
+
+void LEDUI::ApplyState(State state) {
+    effect_timer_.Stop(); // Always stop old effects before applying a new state.
+
+    if (in_panic_mode_.load()) {
+        SetLedColor(kRed);
+        return;
+    }
+
+    const auto& config = state_map_[static_cast<int>(state)];
+    SetLedColor(config.color); // Set the initial color.
+
+    if (config.status_type == StatusType::kBlink) {
+        is_led_on_ = true; // Start in the "on" phase.
+        effect_timer_.ChangePeriod(config.on_duration);
+        effect_timer_.Start();
+    }
+}
+
+void LEDUI::SetLedColor(const platform::peripheral::RGBLedController::Color& color) {
+    pixel_.SetAll(color);
+    pixel_.Show();
+}
+
+#include "led_ui.h"
+#include "osal_timer.h" // For osal::Duration
+
+// For this example, we assume an OSAL provides a sleep function.
+// In a real application, this would come from your OS wrapper (e.g., vTaskDelay).
+namespace osal {
+    void SleepFor(osal::Duration duration) {
+        // Platform-specific implementation of sleep/delay
+    }
+}
+
+// Create a single instance of the LEDUI controller.
+// It can be global, a singleton, or part of a larger device management class.
+LEDUI g_led_ui;
+
+// This would be your application's main entry point.
+void app_main() {
+    // 1. Initialize the LED controller once at startup.
+    // Let's assume the LED is connected to GPIO pin 5.
+    g_led_ui.Init(5);
+
+    // 2. Set the initial power-on state.
+    g_led_ui.SetState(LEDUI::State::kPowerOn);
+    osal::SleepFor(osal::Duration(2000)); // Stay solid white for 2 seconds.
+
+    // 3. Transition to a normal operating state, e.g., connecting to WiFi.
+    g_led_ui.SetState(LEDUI::State::kNoWifi); // Blinking blue
+    osal::SleepFor(osal::Duration(5000)); // Pretend we are connecting for 5 seconds.
+
+    // 4. The device is now online. Set the persistent "Online" state.
+    g_led_ui.SetState(LEDUI::State::kOnline); // Solid green
+    LOG_PRINT(platform::log_print::kINFO, "Device is online. LED is solid green.");
+    osal::SleepFor(osal::Duration(10000));
+
+    // 5. A user performs an action that succeeds. Show temporary feedback.
+    LOG_PRINT(platform::log_print::kINFO, "Action succeeded. Showing feedback for 2s.");
+    g_led_ui.SetState(LEDUI::State::kSuccess, osal::Duration(2000));
+
+    // 6. While the success feedback is locked, try to set a different state.
+    // This call will be ignored because the temporary state has priority.
+    g_led_ui.SetState(LEDUI::State::kOffline);
+    LOG_PRINT(platform::log_print::kINFO, "Tried to set state to Offline, but it should be ignored.");
+
+    // Wait for the lock to expire.
+    // The LED is solid green (from kSuccess) for 2s, then reverts back to
+    // solid green (from kOnline).
+    osal::SleepFor(osal::Duration(3000));
+
+    // 7. Now that the lock is gone, we can set a new state.
+    LOG_PRINT(platform::log_print::kINFO, "Lock expired. Setting state to Offline.");
+    g_led_ui.SetState(LEDUI::State::kOffline); // Solid red
+    osal::SleepFor(osal::Duration(5000));
+
+    // 8. Put the device into panic mode.
+    LOG_PRINT(platform::log_print::kINFO, "Entering PANIC MODE.");
+    g_led_ui.SetPanicMode(true); // Overrides everything to solid red.
+    osal::SleepFor(osal::Duration(5000));
+
+    // 9. Exit panic mode. The previous state (Offline) should be restored.
+    LOG_PRINT(platform::log_print::kINFO, "Exiting panic mode.");
+    g_led_ui.SetPanicMode(false);
+}
+
+# LEDUI - State-Driven LED Controller
+
+`LEDUI` is a C++ component for managing a status LED. It provides a clean, state-driven interface to control visual patterns like solid colors and blinking, abstracting away the underlying timer and state management logic.
+
+***
+
+## Core Concepts
+
+The controller's behavior is based on three main concepts:
+
+1.  **Persistent vs. Temporary States**
+    * A **persistent** state is a "soft" baseline status, like showing solid green when the device is online. You set it with `SetState(State)`. It remains active until another state with a suitable priority replaces it.
+    * A **temporary** state is a "locked" status used for immediate feedback, like a 2-second notification for a successful save. You set it with `SetState(State, osal::Duration)`. It overrides any other state for its duration and then automatically reverts.
+
+2.  **Priority System**
+    * Every state has a `priority` level. A new persistent state can only override the current one if its priority is equal to or higher than the current state's priority.
+    * Temporary (locked) states ignore the priority system and will always be displayed.
+
+3.  **LED Patterns**
+    * **Solid**: The LED is set to a single, constant color.
+    * **Blink**: The LED alternates between a specific color and being off. The `on` and `off` durations for each phase are fully configurable per state.
+
+***
+
+## State Configuration Table
+
+This table shows the default configuration for each state, as defined in `InitStateMap()`.
+
+| State Enum | Default Color | Default Pattern | Priority |
+| :--- | :--- | :--- | :---: |
+| `kClear` | Off | Solid | 0 |
+| `kPowerOn` | White | Solid | 0 |
+| `kBleConnected` | Blue | Blink (500ms on, 500ms off) | 1 |
+| `kOnline` | Green | Solid | 1 |
+| `kOffline` | Red | Solid | 1 |
+| `kNoWifi` | Blue | Blink (250ms on, 2s off) | 1 |
+| `kOtaInProgress` | Turquoise | Blink (250ms on, 250ms off) | 5 |
+| `kSuccess` | Green | Solid | 10 |
+| `kFailure` | Red | Solid | 10 |
+
+***
+
+## Key Scenarios Explained
+
+### Scenario 1: Setting a Persistent State
+
+This is the standard operation for showing the device's long-term status.
+
+1.  **Initial State**: LED is `kPowerOn` (Solid White, priority 0).
+2.  **Action**: `SetState(LEDUI::State::kOnline)` is called.
+3.  **Result**: Because `kOnline` (priority 1) has a higher priority than `kPowerOn` (priority 0), the state changes. The LED is now **Solid Green**. This state will persist indefinitely.
+
+### Scenario 2: Showing Temporary Feedback (Locking & Unlocking)
+
+This sequence demonstrates how temporary locked states work for user feedback.
+
+1.  **Initial State**: The LED is in the persistent `kOnline` state (**Solid Green**).
+2.  **Action**: The user saves a setting, and we want to show feedback. The code calls `SetState(LEDUI::State::kSuccess, osal::Duration(2000))`.
+3.  **Immediate Effect (Locking)**:
+    * The controller saves the previous state (`kOnline`).
+    * The state becomes **locked**. The LED's visual appearance is now dictated by `kSuccess` (**Solid Green**).
+    * A 2000ms one-shot timer is started.
+4.  **During the Lock**:
+    * Another part of the system tries to change the state by calling `SetState(LEDUI::State::kOffline)`.
+    * Because the state is locked, this call is **ignored**. The LED remains **Solid Green**.
+5.  **Lock Expiration (Unlocking)**:
+    * After 2000ms, the lock timer expires.
+    * The controller automatically **reverts** to the saved state, `kOnline`.
+6.  **Final State**: The LED is now back to **Solid Green** in its persistent `kOnline` state. It is no longer locked and can be changed by other calls to `SetState`.
+
+***
+
+## Dependencies
+
+-   **`osal_timer.h`**: An OS Abstraction Layer providing `osal::Timer` and `osal::Duration`.
+-   **`rgb_led_controller.h`**: A hardware driver for the physical RGB LED.
+-   **`log_print.h`**: A logging utility.
+
+***
+
+## Quick API Reference
+
+-   `void Init(uint32_t pin, uint16_t count = 1)`
+    * Initializes the LED hardware driver.
+-   `void SetState(State state)`
+    * Sets a persistent "soft" state.
+-   `void SetState(State state, osal::Duration lock_duration)`
+    * Sets a temporary "locked" state that reverts after the duration.
+-   `void SetPanicMode(bool enable)`
+    * Forces the LED to a solid error color, overriding all other logic.
