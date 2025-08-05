@@ -456,3 +456,82 @@ To run the interactive command-line interface, execute the `cli.py` script:
 python cli.py
 ```
 Type `help` in the CLI to see a list of available commands.
+
+// Copyright 2025 [Your Name or Company]
+
+#include "occupancy_detection.h"
+
+#include "log_print.h"      // Assumed third-party header
+#include "system_uptime.h"  // Assumed third-party header
+
+namespace application {
+
+OccupancyDetection::OccupancyDetection() {
+  Reset();
+}
+
+OccupancyDetection::OccupancyDetection(const Config& config) : config_(config) {
+  Reset();
+}
+
+void OccupancyDetection::Attach(EventCallback callback) {
+  callback_ = std::move(callback);
+  LOG_PRINT(log_print::kINFO, "Listener attached.");
+}
+
+void OccupancyDetection::Detach() {
+  callback_ = nullptr;
+  LOG_PRINT(log_print::kINFO, "Listener detached.");
+}
+
+void OccupancyDetection::SetConfig(const Config& config) {
+  config_ = config;
+}
+
+void OccupancyDetection::Reset() {
+  last_motion_time_ = 0;
+  current_state_ = State::kUnoccupied;
+  prev_state_ = State::kInit;
+}
+
+void OccupancyDetection::SetMotionDetected() {
+  last_motion_time_ = system_uptime::GetMs();
+  LOG_PRINT(log_print::kDEBUG1, "Motion detected.");
+
+  // **NEW LOGIC HERE**
+  // If we are already occupied, fire an "Activity" event to serve as a
+  // keep-alive signal for the consumer.
+  if (current_state_ == State::kOccupied) {
+    if (callback_) {
+      callback_(EventType::kActivity, current_state_);
+    }
+  } else {
+    // Otherwise, this is the first motion, so change the state to Occupied.
+    current_state_ = State::kOccupied;
+  }
+}
+
+void OccupancyDetection::Update() {
+  // Run the state logic to update the current_state_.
+  if (current_state_ == State::kOccupied) {
+    if (system_uptime::ExceedsMs(last_motion_time_,
+                                 config_.grace_period_ms)) {
+      LOG_PRINT(log_print::kINFO, "Occupied state timed out -> Unoccupied.");
+      current_state_ = State::kUnoccupied;
+    }
+  }
+
+  // Check if the state has changed from the last time we notified.
+  if (prev_state_ != current_state_) {
+    // This handles the first notification (Init -> Unoccupied) and all
+    // subsequent state changes.
+    if (callback_) {
+      LOG_PRINT(log_print::kINFO, "Notifying listener of state change: -> %d",
+                static_cast<int>(current_state_));
+      callback_(EventType::kStateChange, current_state_);
+    }
+    prev_state_ = current_state_;  // Update the last notified state.
+  }
+}
+
+}  // namespace application
