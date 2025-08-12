@@ -1,0 +1,325 @@
+======================================
+i.MX8QX Firmware Build Documentation
+======================================
+
+This document contains instructions to automate the build process for the i.MX8QX flash.bin firmware image. This workflow is confirmed to be compatible with Ubuntu 18.04.
+
+IMPORTANT: This script does not download dependencies. You must manually download all required files as described in Step 1.
+
+
+--- Prerequisites (for Ubuntu 18.04) ---
+
+You must have the following tools installed on your Ubuntu 18.04 system.
+
+    sudo apt-get update
+    sudo apt-get install -y build-essential tar git bc python3
+
+
+--- Directory Structure ---
+
+Before running the script, you must create the following directories in your project root:
+
+./
+├── downloads/      <-- Place all manually downloaded files here
+├── script/
+│   └── build_firmware.sh
+└── uboot/          <-- Place your pre-built u-boot.bin here
+
+
+--- How to Build ---
+
+Step 1: Manually Download All Dependencies
+--------------------------------------------
+Create the 'downloads' directory. Download the following files and place them inside it.
+
+1. GNU ARM Embedded Toolchain
+   - File:   gcc-arm-none-eabi-9-2019-q4-major-x86_64-linux.tar.bz2
+   - URL:    https://developer.arm.com/tools-and-software/open-source-software/developer-tools/gnu-toolchain/gnu-rm/downloads (Select the 9-2019-q4-major release)
+
+2. AArch64 Linaro Toolchain
+   - File:   gcc-linaro-7.5.0-2019.12-x86_64_aarch64-linux-gnu.tar.xz
+   - URL:    https://releases.linaro.org/components/toolchain/binaries/7.5-2019.12/aarch64-linux-gnu/
+
+3. SCFW Porting Kit (for Linux 5.4.24_2.1.0)
+   - File:   imx-scfw-porting-kit-1.5.0.tar.gz
+   - URL:    https://www.nxp.com/webapp/Download?colCode=L5.4.24_2.1.0_SCFWKIT-1.5.0 (NXP Account Required)
+
+4. SECO Firmware
+   - File:   imx-seco-3.6.3.bin
+   - URL:    https://www.nxp.com/lgfiles/NMG/MAD/YOCTO/imx-seco-3.6.3.bin
+
+
+Step 2: Place the U-Boot Binary
+---------------------------------
+This script does NOT build U-Boot. You must build it separately. Once you have 'u-boot.bin', place it inside the 'uboot' directory.
+
+
+Step 3: Run the Build Script
+------------------------------
+1. Make the script executable:
+   chmod +x script/build_firmware.sh
+
+2. To run a standard build:
+   ./script/build_firmware.sh
+
+3. For a completely clean build (removes all previous build artifacts):
+   ./script/build_firmware.sh clean
+
+4. The script will pause for you to provide a custom DCD config file. Follow the on-screen instructions.
+
+
+--- Git Repositories ---
+
+The script will automatically clone the following repositories from their official NXP GitHub location.
+- IMX ATF: https://github.com/nxp-imx/imx-atf.git
+- IMX MKIMAGE: https://github.com/nxp-imx/imx-mkimage.git
+
+
+--- Output ---
+
+If the build is successful, the final 'flash.bin' will be in your project's root directory.
+
+
+#!/bin/bash
+
+# Exit immediately if a command exits with a non-zero status.
+set -e
+
+# --- Configuration ---
+readonly ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+readonly BUILD_DIR="${ROOT_DIR}/build"
+readonly DOWNLOAD_DIR="${ROOT_DIR}/downloads"
+readonly UBOOT_DIR="${ROOT_DIR}/uboot"
+
+# Versioning & Filenames
+readonly KERNEL_VERSION="5.4.24_2.1.0"
+readonly SCFW_VERSION="1.5.0"
+readonly SECO_VERSION="3.6.3"
+readonly IMX_ATF_BRANCH="imx_${KERNEL_VERSION}"
+readonly IMX_MKIMAGE_BRANCH="imx_${KERNEL_VERSION}"
+
+# Source URLs (Updated to official NXP GitHub)
+readonly IMX_ATF_URL="https://github.com/nxp-imx/imx-atf.git"
+readonly IMX_MKIMAGE_URL="https://github.com/nxp-imx/imx-mkimage.git"
+
+readonly ARM_GCC_FILE="gcc-arm-none-eabi-9-2019-q4-major-x86_64-linux.tar.bz2"
+readonly AARCH64_GCC_FILE="gcc-linaro-7.5.0-2019.12-x86_64_aarch64-linux-gnu.tar.xz"
+readonly SCFW_KIT_FILE="imx-scfw-porting-kit-${SCFW_VERSION}.tar.gz"
+readonly SECO_FILE="imx-seco-${SECO_VERSION}.bin"
+
+# Artifact locations (will be populated by build functions)
+readonly UBOOT_SRC_FILE="${UBOOT_DIR}/u-boot.bin"
+SCFW_TCM_BIN_PATH=""
+SECO_CONTAINER_PATH=""
+BL31_BIN_PATH=""
+
+# --- Helper Functions ---
+log_info() {
+    echo -e "\n\e[32m[INFO] ==> $1\e[0m"
+}
+
+log_warn() {
+    echo -e "\e[33m[WARN] ==> $1\e[0m"
+}
+
+log_error() {
+    echo -e "\e[31m[ERROR] ==> $1\e[0m" >&2
+}
+
+# --- Build Functions ---
+
+handle_clean_build() {
+    if [[ "$1" == "clean" ]]; then
+        log_warn "Performing a clean build: Removing '${BUILD_DIR}'..."
+        rm -rf "${BUILD_DIR}"
+        log_info "Clean build setup complete."
+    fi
+}
+
+setup_environment() {
+    log_info "Setting up build environment..."
+    mkdir -p "${BUILD_DIR}"
+    if [ ! -d "${DOWNLOAD_DIR}" ] || [ ! -d "${UBOOT_DIR}" ]; then
+        log_error "Missing directories."
+        echo "Please create 'downloads' and 'uboot' directories in the project root."
+        exit 1
+    fi
+    cd "${ROOT_DIR}"
+}
+
+verify_dependencies() {
+    log_info "Verifying all required files are present in '${DOWNLOAD_DIR}'..."
+    local required_files=(
+        "${ARM_GCC_FILE}" "${AARCH64_GCC_FILE}" "${SCFW_KIT_FILE}" "${SECO_FILE}"
+    )
+    local all_files_found=true
+    for file in "${required_files[@]}"; do
+        if [ ! -f "${DOWNLOAD_DIR}/${file}" ]; then
+            log_warn "Required file not found: ${file}"
+            all_files_found=false
+        fi
+    done
+    if [ "$all_files_found" = false ]; then
+        log_error "One or more required files are missing from '${DOWNLOAD_DIR}'."
+        echo "Please see documentation.txt for the list of files to download."
+        exit 1
+    fi
+    log_info "All dependency files found."
+}
+
+build_scfw() {
+    log_info "Building SCFW (scfw_tcm.bin)..."
+    local scfw_build_root="${BUILD_DIR}/scfw_build"
+    mkdir -p "${scfw_build_root}"
+    cd "${scfw_build_root}"
+
+    log_info "Extracting ARM Embedded Toolchain..."
+    tar -xf "${DOWNLOAD_DIR}/${ARM_GCC_FILE}"
+    local toolchain_dir="${scfw_build_root}/gcc-arm-none-eabi-9-2019-q4-major"
+
+    log_info "Extracting SCFW Porting Kit..."
+    tar -xzf "${DOWNLOAD_DIR}/${SCFW_KIT_FILE}"
+    cd "packages"
+    chmod a+x "imx-scfw-porting-kit-${SCFW_VERSION}.bin"
+    yes | ./"imx-scfw-porting-kit-${SCFW_VERSION}.bin" # Auto-accept EULA
+
+    cd "imx-scfw-porting-kit-${SCFW_VERSION}/src"
+    tar -xzf "scfw_export_mx8qx_b0.tar.gz"
+    cd "scfw_export_mx8qx_b0"
+    
+    log_info "Preparing board-specific files..."
+    cd "platform/board"
+    cp -r mx8qx_mek mx8qx_issi
+    
+    local dcd_config_path="mx8qx_issi/dcd/imx8qx_dcd_1.2GHz.cfg"
+    log_warn "ACTION REQUIRED: Please provide the custom DCD config file for your ISSI board."
+    echo "Copy your custom 'imx8qx_dcd_1.2GHz.cfg' to the following location:"
+    echo "${PWD}/${dcd_config_path}"
+    read -p "Press [Enter] to continue once the file is in place..."
+    if [ ! -f "${dcd_config_path}" ]; then
+        log_error "DCD config file not found at the specified location."
+        exit 1
+    fi
+
+    cd ../..
+    
+    log_info "Compiling SCFW..."
+    export TOOLS="${toolchain_dir}/"
+    make qx R=B0 B=issi
+
+    SCFW_TCM_BIN_PATH="${PWD}/build_mx8qx_b0/scfw_tcm.bin"
+    if [ ! -f "${SCFW_TCM_BIN_PATH}" ]; then
+        log_error "SCFW build failed. scfw_tcm.bin not found."
+        exit 1
+    fi
+    log_info "SCFW build complete. Output: ${SCFW_TCM_BIN_PATH}"
+    cd "${ROOT_DIR}"
+}
+
+get_seco_firmware() {
+    log_info "Extracting SECO Firmware (mx8qxc0-ahab-container.img)..."
+    local seco_build_root="${BUILD_DIR}/seco_build"
+    mkdir -p "${seco_build_root}"
+    cd "${seco_build_root}"
+
+    chmod +x "${DOWNLOAD_DIR}/${SECO_FILE}"
+    yes | "${DOWNLOAD_DIR}/${SECO_FILE}" # Auto-accept EULA
+
+    SECO_CONTAINER_PATH="${seco_build_root}/imx-seco-${SECO_VERSION}/firmware/seco/mx8qxc0-ahab-container.img"
+    if [ ! -f "${SECO_CONTAINER_PATH}" ]; then
+        log_error "SECO firmware extraction failed. Container image not found."
+        exit 1
+    fi
+    log_info "SECO firmware located: ${SECO_CONTAINER_PATH}"
+    cd "${ROOT_DIR}"
+}
+
+build_bl31() {
+    log_info "Building BL31 (bl31.bin)..."
+    local bl31_build_root="${BUILD_DIR}/bl31_build"
+    mkdir -p "${bl31_build_root}"
+    cd "${bl31_build_root}"
+
+    log_info "Extracting AArch64 Toolchain..."
+    tar -xf "${DOWNLOAD_DIR}/${AARCH64_GCC_FILE}"
+    local toolchain_dir="${bl31_build_root}/gcc-linaro-7.5.0-2019.12-x86_64_aarch64-linux-gnu"
+
+    log_info "Cloning Arm Trusted Firmware (imx-atf) from GitHub..."
+    if [ ! -d "imx-atf" ]; then
+        git clone "${IMX_ATF_URL}" imx-atf
+    fi
+    cd imx-atf
+    git checkout "${IMX_ATF_BRANCH}"
+
+    log_info "Compiling BL31..."
+    export ARCH=arm64
+    export CROSS_COMPILE=aarch64-linux-gnu-
+    export PATH="${toolchain_dir}/bin:${PATH}"
+    make PLAT=imx8qx bl31
+
+    BL31_BIN_PATH="${PWD}/build/imx8qx/release/bl31.bin"
+    if [ ! -f "${BL31_BIN_PATH}" ]; then
+        log_error "BL31 build failed. bl31.bin not found."
+        exit 1
+    fi
+    log_info "BL31 build complete. Output: ${BL31_BIN_PATH}"
+    cd "${ROOT_DIR}"
+}
+
+check_for_uboot() {
+    log_info "Checking for pre-built u-boot.bin..."
+    if [ ! -f "${UBOOT_SRC_FILE}" ]; then
+        log_error "u-boot.bin not found in ${UBOOT_DIR}/"
+        echo "Please build it and place it in the '${UBOOT_DIR}' directory, then re-run this script."
+        exit 1
+    fi
+    log_info "u-boot.bin found."
+}
+
+build_container_image() {
+    log_info "Building final container image (flash.bin)..."
+    local mkimage_root="${BUILD_DIR}/imx-mkimage"
+    
+    log_info "Cloning imx-mkimage from GitHub..."
+    if [ ! -d "${mkimage_root}" ]; then
+        git clone "${IMX_MKIMAGE_URL}" "${mkimage_root}"
+    fi
+    cd "${mkimage_root}"
+    git checkout "${IMX_MKIMAGE_BRANCH}"
+
+    local image_dir="${mkimage_root}/iMX8QX"
+    log_info "Copying artifacts to ${image_dir}..."
+    cp "${SCFW_TCM_BIN_PATH}" "${image_dir}/"
+    cp "${SECO_CONTAINER_PATH}" "${image_dir}/"
+    cp "${BL31_BIN_PATH}" "${image_dir}/"
+    cp "${UBOOT_SRC_FILE}" "${image_dir}/"
+
+    log_info "Modifying soc.mak for REV C0..."
+    sed -i 's/REV ?= B0/REV ?= C0/' "${image_dir}/soc.mak"
+    
+    log_info "Making flash target..."
+    make SOC=iMX8QX REV=C0 flash
+
+    local final_image="${image_dir}/flash.bin"
+    if [ ! -f "${final_image}" ]; then
+        log_error "Final image creation failed. flash.bin not found."
+        exit 1
+    fi
+
+    cp "${final_image}" "${ROOT_DIR}/"
+    log_info "SUCCESS! Final image 'flash.bin' created in ${ROOT_DIR}"
+}
+
+# --- Main Execution ---
+main() {
+    handle_clean_build "$1"
+    setup_environment
+    verify_dependencies
+    check_for_uboot
+    build_scfw
+    get_seco_firmware
+    build_bl31
+    build_container_image
+}
+
+main "$@"
