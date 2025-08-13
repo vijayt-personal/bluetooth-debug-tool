@@ -1,0 +1,399 @@
+#ifndef LAMP_CONTROLLER_LAMP_CONTROLLER_H_
+#define LAMP_CONTROLLER_LAMP_CONTROLLER_H_
+
+#include <cstdint>
+#include <cstddef>
+#include <vector>
+
+#include "lamp_events.h"
+
+// Forward-declare platform-specific types to avoid including platform headers here.
+namespace platform {
+enum class PullMode { kNone, kUp, kDown };
+uint32_t GetSystemUptimeMs(); // Default time source
+}
+
+namespace lamp_controller {
+
+/**
+ * @brief Unified status codes for LampController methods.
+ */
+enum class Status : uint8_t {
+  kSuccess = 0,
+  kErrorNotInitialized,
+  kErrorInvalidPin,
+  kErrorInvalidEvent,
+  kErrorCallbackNull,
+  kErrorRegistryFull,
+  kErrorNotFound,
+  kErrorInvalidHandle,
+};
+
+/**
+ * @brief Opaque handle returned upon successful callback registration.
+ * Use this handle to unregister the callback.
+ */
+using RegistrationHandle = uint32_t;
+constexpr RegistrationHandle kInvalidRegistrationHandle = 0;
+
+class LampController {
+ public:
+  LampController();
+  ~LampController();
+
+  LampController(const LampController&) = delete;
+  LampController& operator=(const LampController&) = delete;
+  LampController(LampController&&) = delete;
+  LampController& operator=(LampController&&) = delete;
+
+  using NowMsFn = uint32_t (*)();
+
+  Status Init(uint8_t control_pin, uint8_t status_pin,
+              bool status_pin_active_low = true,
+              platform::PullMode pull_mode = platform::PullMode::kDown,
+              NowMsFn now_fn = &platform::GetSystemUptimeMs);
+
+  void SetState(bool state, bool force_write = false);
+  bool IsLampOn() const;
+  void Update();
+  uint32_t GetTotalOnTime() const;
+  void SetTotalOnTime(uint32_t minutes);
+  
+  RegistrationHandle RegisterEventCallback(LampEventType event, LampEventCallback cb);
+  Status UnregisterEventCallback(RegistrationHandle handle);
+
+  void StartCooldown(uint32_t duration_ms);
+
+ private:
+  struct Listener {
+    LampEventCallback cb;
+    RegistrationHandle handle;
+    LampEventType event_type;
+  };
+
+  bool initialized_;
+  bool intended_state_;
+  bool prev_lamp_state_;
+  bool sent_initial_lamp_state_;
+
+  uint8_t control_pin_;
+  uint8_t status_pin_;
+  bool status_pin_on_level_;
+
+  bool is_in_cooldown_;
+  uint32_t cooldown_start_time_ms_;
+  uint32_t cooldown_duration_ms_;
+  
+  bool is_in_startup_delay_; // New flag for startup delay
+
+  uint8_t on_time_increment_tracker_;
+  uint32_t total_on_time_min_;
+
+  uint32_t last_update_tick_ms_;
+  uint32_t init_time_ms_;
+  bool initial_report_sent_;
+  uint32_t last_lamp_life_send_time_ms_;
+
+  NowMsFn now_fn_;
+  RegistrationHandle next_handle_;
+  std::vector<Listener> listeners_;
+
+  static constexpr std::size_t kMaxListeners = 16;
+  static constexpr uint32_t kInitialPowerOnDelayMs = 500; // New constant for the delay
+  static constexpr uint32_t kSendLampLifeIntervalMs = 60 * 60 * 1000;
+  static constexpr uint32_t kStartupLampLifeDelayMs = 5 * 1000;
+  static constexpr uint32_t kUpdateIntervalMs = 1000;
+  static constexpr uint8_t kSecondsPerMinute = 60;
+
+  void CheckAndSendLampLifeReport(uint32_t current_time, bool force = false);
+  void EmitEvent(LampEventType event, const LampEventPayload& payload);
+  void HandleTimeTracking(uint32_t current_time, bool measured_state);
+  void HandleStateChange(bool measured_state);
+  void HandleCooldown(uint32_t current_time);
+  void HandleStartupDelay(uint32_t current_time); // New private helper
+  static bool HasIntervalElapsed(uint32_t start_ms, uint32_t interval_ms, uint32_t current_ms);
+};
+
+}  // namespace lamp_controller
+
+#endif  // LAMP_CONTROLLER_LAMP_CONTROLLER_H_
+
+#include "lamp_controller.h"
+
+#include "digital_pio.h"
+#include "log_print.h"
+#include <algorithm>
+
+// Define a default time source if one isn't provided by the user.
+// This would typically live in a platform-specific file.
+namespace platform {
+    uint32_t GetSystemUptimeMs() {
+        // Placeholder for the actual platform implementation.
+        return 0;
+    }
+}
+
+namespace lamp_controller {
+
+using namespace platform;
+
+LampController::LampController()
+    : initialized_(false),
+      intended_state_(false),
+      prev_lamp_state_(false),
+      sent_initial_lamp_state_(false),
+      control_pin_(0),
+      status_pin_(0),
+      status_pin_on_level_(false),
+      is_in_cooldown_(false),
+      cooldown_start_time_ms_(0),
+      cooldown_duration_ms_(0),
+      is_in_startup_delay_(false), // Initialize new flag
+      on_time_increment_tracker_(0),
+      total_on_time_min_(0),
+      last_update_tick_ms_(0),
+      init_time_ms_(0),
+      initial_report_sent_(false),
+      last_lamp_life_send_time_ms_(0),
+      now_fn_(&platform::GetSystemUptimeMs),
+      next_handle_(1) {}
+
+LampController::~LampController() {
+  if (initialized_) {
+    SetState(false, true); // Force write on shutdown
+  }
+}
+
+Status LampController::Init(uint8_t control_pin, uint8_t status_pin, bool status_pin_active_low,
+                          platform::PullMode pull_mode, NowMsFn now_fn) {
+  if (now_fn) {
+    now_fn_ = now_fn;
+  }
+  
+  control_pin_ = control_pin;
+  status_pin_ = status_pin;
+  status_pin_on_level_ = !status_pin_active_low;
+
+  driver::digital_pio::Configure(control_pin_, driver::digital_pio::Mode::kOutput);
+  driver::digital_pio::Configure(status_pin_, driver::digital_pio::Mode::kInput, pull_mode);
+
+  const uint32_t now = now_fn_();
+  last_update_tick_ms_ = now;
+  init_time_ms_ = now;
+  
+  is_in_startup_delay_ = true; // Activate the startup delay
+  initialized_ = true;
+  SetState(false);
+  return Status::kSuccess;
+}
+
+void LampController::SetState(bool state, bool force_write) {
+  if (!initialized_) {
+    LOG_PRINT(log_print::kERROR, "LampController not initialized!");
+    return;
+  }
+  
+  intended_state_ = state;
+
+  // The lamp must remain off if either in cooldown OR in the initial startup delay.
+  bool effective_state = (is_in_cooldown_ || is_in_startup_delay_) ? false : intended_state_;
+
+  if (force_write || (effective_state != IsLampOn())) {
+    driver::digital_pio::Write(control_pin_, effective_state);
+  }
+}
+
+bool LampController::IsLampOn() const {
+  if (!initialized_) return false;
+  return (driver::digital_pio::Read(status_pin_) == status_pin_on_level_);
+}
+
+void LampController::Update() {
+  if (!initialized_) return;
+  
+  const uint32_t current_time = now_fn_();
+  
+  // Handle time-based state transitions first.
+  HandleStartupDelay(current_time);
+  HandleCooldown(current_time);
+  
+  const bool measured_state = IsLampOn();
+  HandleTimeTracking(current_time, measured_state);
+  HandleStateChange(measured_state);
+  CheckAndSendLampLifeReport(current_time);
+}
+
+uint32_t LampController::GetTotalOnTime() const { return total_on_time_min_; }
+void LampController::SetTotalOnTime(uint32_t minutes) { total_on_time_min_ = minutes; }
+
+void LampController::StartCooldown(uint32_t duration_ms) {
+  if (!initialized_) return;
+  is_in_cooldown_ = true;
+  cooldown_start_time_ms_ = now_fn_();
+  cooldown_duration_ms_ = duration_ms;
+  if (IsLampOn()) {
+    driver::digital_pio::Write(control_pin_, false);
+  }
+  LOG_PRINT(log_print::kINFO, "Lamp cooldown started for %lu ms.", duration_ms);
+}
+
+RegistrationHandle LampController::RegisterEventCallback(LampEventType event, LampEventCallback cb) {
+  if (!cb) return kInvalidRegistrationHandle;
+  if (listeners_.size() >= kMaxListeners) return kInvalidRegistrationHandle;
+
+  RegistrationHandle handle = next_handle_++;
+  listeners_.push_back({std::move(cb), handle, event});
+  return handle;
+}
+
+Status LampController::UnregisterEventCallback(RegistrationHandle handle) {
+  if (handle == kInvalidRegistrationHandle) return Status::kErrorInvalidHandle;
+
+  auto it = std::remove_if(listeners_.begin(), listeners_.end(),
+                           [handle](const Listener& l) { return l.handle == handle; });
+
+  if (it != listeners_.end()) {
+    listeners_.erase(it, listeners_.end());
+    return Status::kSuccess;
+  }
+  return Status::kErrorNotFound;
+}
+
+void LampController::EmitEvent(LampEventType event, const LampEventPayload& payload) {
+  // To protect against callbacks unregistering others, we copy the relevant listeners.
+  std::vector<LampEventCallback> callbacks_to_run;
+  for (const auto& listener : listeners_) {
+    if (listener.event_type == event && listener.cb) {
+      callbacks_to_run.push_back(listener.cb);
+    }
+  }
+
+  for (const auto& cb : callbacks_to_run) {
+    cb(event, payload);
+  }
+}
+
+void LampController::CheckAndSendLampLifeReport(uint32_t current_time, bool force) {
+  bool should_send = force;
+  
+  if (!should_send) {
+    if (!initial_report_sent_ && HasIntervalElapsed(init_time_ms_, kStartupLampLifeDelayMs, current_time)) {
+      should_send = true;
+      initial_report_sent_ = true;
+    } else if (initial_report_sent_ && HasIntervalElapsed(last_lamp_life_send_time_ms_, kSendLampLifeIntervalMs, current_time)) {
+      should_send = true;
+    }
+  }
+
+  if (should_send) {
+    last_lamp_life_send_time_ms_ = current_time;
+    LampLifePayload payload_value{total_on_time_min_};
+    EmitEvent(LampEventType::kLampLifeReported, payload_value);
+  }
+}
+
+void LampController::HandleTimeTracking(uint32_t current_time, bool measured_state) {
+  if (HasIntervalElapsed(last_update_tick_ms_, kUpdateIntervalMs, current_time)) {
+    last_update_tick_ms_ = current_time;
+    if (measured_state) {
+      ++on_time_increment_tracker_;
+      if (on_time_increment_tracker_ >= kSecondsPerMinute) {
+        ++total_on_time_min_;
+        on_time_increment_tracker_ = 0;
+      }
+    }
+  }
+}
+
+void LampController::HandleStateChange(bool measured_state) {
+  if ((measured_state != prev_lamp_state_) || !sent_initial_lamp_state_) {
+    sent_initial_lamp_state_ = true;
+    prev_lamp_state_ = measured_state;
+    LampStatusPayload payload_value{measured_state};
+    EmitEvent(LampEventType::kStatusChanged, payload_value);
+  }
+}
+
+void LampController::HandleCooldown(uint32_t current_time) {
+  if (!is_in_cooldown_) return;
+
+  if (HasIntervalElapsed(cooldown_start_time_ms_, cooldown_duration_ms_, current_time)) {
+    LOG_PRINT(log_print::kINFO, "Lamp cooldown finished. Restoring intended state.");
+    is_in_cooldown_ = false;
+    cooldown_start_time_ms_ = 0;
+    cooldown_duration_ms_ = 0;
+    SetState(intended_state_);
+  }
+}
+
+// New handler function for the startup delay
+void LampController::HandleStartupDelay(uint32_t current_time) {
+    if (!is_in_startup_delay_) return;
+
+    if (HasIntervalElapsed(init_time_ms_, kInitialPowerOnDelayMs, current_time)) {
+        LOG_PRINT(log_print::kINFO, "Initial power-on delay finished.");
+        is_in_startup_delay_ = false;
+        
+        // After the delay, we must re-apply the last intended state.
+        // This ensures that if SetState(true) was called during the delay,
+        // it will be honored now.
+        SetState(intended_state_);
+    }
+}
+
+bool LampController::HasIntervalElapsed(uint32_t start_ms, uint32_t interval_ms, uint32_t current_ms) {
+  return static_cast<uint32_t>(current_ms - start_ms) >= interval_ms;
+}
+
+}  // namespace lamp_controller
+#ifndef LAMP_CONTROLLER_LAMP_EVENTS_H_
+#define LAMP_CONTROLLER_LAMP_EVENTS_H_
+
+#include <cstdint>
+#include <variant>
+#include <functional>
+
+namespace lamp_controller {
+
+/**
+ * @brief Event types emitted by the lamp controller.
+ */
+enum class LampEventType : uint8_t {
+  kStatusChanged = 0,
+  kLampLifeReported = 1,
+  kCount
+};
+
+/**
+ * @brief Payload for status-changed event.
+ */
+struct LampStatusPayload {
+  bool is_on = false;
+};
+
+/**
+ * @brief Payload for lamp-life event.
+ */
+struct LampLifePayload {
+  uint32_t total_on_minutes = 0;
+};
+
+/**
+ * @brief Variant wrapper for event payloads.
+ */
+using LampEventPayload = std::variant<std::monostate, LampStatusPayload, LampLifePayload>;
+
+/**
+ * @brief Modern, flexible event callback signature using std::function.
+ *
+ * This can wrap free functions, lambdas, and member functions, eliminating
+ * the need for a separate context pointer.
+ *
+ * @param event The type of event that was triggered.
+ * @param payload A std::variant containing the event-specific data.
+ */
+using LampEventCallback = std::function<void(LampEventType event, const LampEventPayload& payload)>;
+
+}  // namespace lamp_controller
+
+#endif  // LAMP_CONTROLLER_LAMP_EVENTS_H_
