@@ -1,0 +1,518 @@
+meta-custom/
+├── conf/
+│   └── layer.conf
+└── recipes-flash-tool/
+    └── flash-tool/
+        ├── files/
+        │   ├── flash_tool.c
+        │   ├── Makefile
+        │   ├── README.txt
+        │   └── SAMPLE_OUTPUT.txt
+        └── flash-tool_0.1.bb
+
+// meta-custom/conf/layer.conf
+# We have a conf and classes directory, add to BBPATH
+BBPATH .= ":${LAYERDIR}"
+
+# We have recipes-* directories, add to BBFILES
+BBFILES += "${LAYERDIR}/recipes-*/*/*.bb \
+            ${LAYERDIR}/recipes-*/*/*.bbappend"
+
+BBFILE_COLLECTIONS += "meta-custom"
+BBFILE_PATTERN_meta-custom = "^${LAYERDIR}/"
+BBFILE_PRIORITY_meta-custom = "6"
+
+LAYERDEPENDS_meta-custom = "core"
+# Added "zeus" for compatibility with older Yocto versions.
+LAYERSERIES_COMPAT_meta-custom = "zeus kirkstone nanbield"
+
+
+//meta-custom/recipes-flash-tool/flash-tool/flash-tool_0.1.bbSUMMARY = "An advanced CLI tool for safe flash operations via the MTD subsystem"
+DESCRIPTION = "A non-interactive command-line utility that uses the native MTD subsystem to read, write, erase, and stress-test flash memory safely."
+LICENSE = "CLOSED"
+
+DEPENDS = "mtd-utils-native"
+
+SRC_URI = "file://flash_tool.c \
+           file://Makefile \
+           file://README.txt \
+           file://SAMPLE_OUTPUT.txt \
+          "
+
+S = "${WORKDIR}"
+
+do_compile() {
+	oe_runmake
+}
+
+do_install() {
+	install -d ${D}${bindir}
+	install -m 0755 ${S}/flash_tool ${D}${bindir}/flash_tool
+
+    install -d ${D}${docdir}/${PN}
+    install -m 0644 ${S}/README.txt ${D}${docdir}/${PN}/
+    install -m 0644 ${S}/SAMPLE_OUTPUT.txt ${D}${docdir}/${PN}/
+}
+
+//meta-custom/recipes-flash-tool/flash-tool/files/Makefile
+# Makefile for flash_tool
+TARGET=flash_tool
+SRCS=flash_tool.c
+
+.PHONY: all clean
+
+all: $(TARGET)
+
+$(TARGET): $(SRCS)
+	$(CC) $(CFLAGS) -o $(TARGET) $(SRCS)
+
+clean:
+	rm -f $(TARGET)
+
+ // meta-custom/recipes-flash-tool/flash-tool/files/README.txt
+NXP i.MX8 Flash Tool (Advanced MTD Version)
+============================================
+Version: 3.0 (August 22, 2025)
+
+This document provides instructions for the flash_tool CLI. This version uses the standard
+Linux MTD subsystem for all flash operations, ensuring safety and compatibility.
+
+1. GLOBAL OPTIONS
+-------------------
+  --mtd-dev <path>      (Default: /dev/mtd0)
+  --warn-addr <hex>     (Default: 0x200000)
+
+2. COMMAND REFERENCE & USAGE EXAMPLES
+-------------------------------------
+
+  **flash write [--no-erase] <type> <pattern> <sector> <size>**
+    - Writes data to flash. The <type> parameter is for syntax compatibility
+      but is not used to select a hardware mode, as the MTD driver handles this.
+    - <size> must be between 1 and 256.
+    - --no-erase: Optional flag to skip the safe pre-erase step.
+
+    *Example: Write an ascending pattern to the first 64 bytes of sector 32*
+    # flash-tool --mtd-dev /dev/mtd4 flash write P + 32 64
+
+  ---
+  **flash read <type> <sector> <size>**
+    - Reads data from flash. The <type> parameter is for syntax compatibility;
+      the MTD driver selects the hardware read mode.
+    - <size> must be between 1 and 256.
+
+    *Example: Read 32 bytes from sector 32*
+    # flash-tool --mtd-dev /dev/mtd4 flash read P 32 32
+
+  ---
+  **flash erase <type> <start_sector> <end_sector>**
+    - Erases a region of flash. This command VALIDATES the erase type.
+    - <type>: Z (4KB), Y (32KB), O (128KB). The tool will check if the MTD
+      device's physical erase block size matches the requested type.
+
+    *Example 1 (Success): The flash chip's erase size is 128KB.*
+    # flash-tool --mtd-dev /dev/mtd4 flash erase O 20 23
+
+    *Example 2 (Failure): The flash chip's erase size is 128KB, but user requests 4KB.*
+    # flash-tool --mtd-dev /dev/mtd4 flash erase Z 20 23
+    (This will fail with an "Unsupported erase size" error).
+
+  ---
+  **flash write-verify <type> <sector> <iter> <fail_count> <log> <full_util>**
+    - Performs a continuous write-read-verify stress test. The <type> parameter
+      is for syntax compatibility only.
+
+    *Example: Run an infinite test on sector 40, stopping after 1 failure*
+    # flash-tool --mtd-dev /dev/mtd4 flash write-verify P 40 0 1 1 0
+
+  ---
+  **clr / help**
+    - Clears the screen or displays the help message.
+
+
+//meta-custom/recipes-flash-tool/flash-tool/files/SAMPLE_OUTPUT.txt
+This file shows sample output for various flash-tool commands.
+(Assuming the target MTD device has a physical erase size of 128KB)
+
+----------------------------------------------------------------------
+1. Erase Command (Successful Match)
+   # flash-tool --mtd-dev /dev/mtd4 flash erase O 20 20
+----------------------------------------------------------------------
+>> Using MTD device: /dev/mtd4
+Requested erase size 131072 bytes (Type O) is supported by device.
+Erasing from sector 20 to 20 (Offset 0x1400000, Length 0x20000)...
+Issuing MEMERASE: start=0x1400000, length=0x20000
+Erase successful.
+
+----------------------------------------------------------------------
+2. Erase Command (Unsupported Type)
+   # flash-tool --mtd-dev /dev/mtd4 flash erase Z 20 20
+----------------------------------------------------------------------
+>> Using MTD device: /dev/mtd4
+Error: Unsupported erase size. Requested 4096 bytes (Type Z), but device requires 131072 bytes.
+
+----------------------------------------------------------------------
+3. Write Command
+   # flash-tool --mtd-dev /dev/mtd4 flash write P + 32 16
+----------------------------------------------------------------------
+>> Using MTD device: /dev/mtd4
+Note: <type> parameter is for syntax compatibility; MTD driver selects hardware mode.
+Writing 16 bytes to sector 32 (Offset 0x2000000)...
+Pre-erasing alignment block at 0x2000000...
+Issuing MEMERASE: start=0x2000000, length=0x20000
+Write successful.
+
+----------------------------------------------------------------------
+4. Read Command
+   # flash-tool --mtd-dev /dev/mtd4 flash read P 32 16
+----------------------------------------------------------------------
+>> Using MTD device: /dev/mtd4
+Note: <type> parameter is for syntax compatibility; MTD driver selects hardware mode.
+sector=0x2000000 size=16
+Data read followed by sector 0x2000000
+offset 0x02000000 : 00 01 02 03 04 05 06 07
+offset 0x02000008 : 08 09 0A 0B 0C 0D 0E 0F
+
+//meta-custom/recipes-flash-tool/flash-tool/files/flash_tool.c
+/*
+ * flash_tool.c
+ *
+ * An advanced, non-interactive command-line utility for an NXP i.MX8 board.
+ * This version uses the native MTD subsystem for safe flash interaction.
+ *
+ * This version includes:
+ * - Configurable MTD device path and warning address.
+ * - Optional no-erase flag for the write command.
+ * - The proper MEMUNLOCK/MEMLOCK ioctl sequence for robust erasing.
+ * - Intelligent validation of erase type against hardware capabilities.
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <sys/ioctl.h>
+#include <errno.h>
+#include <ctype.h>
+#include <mtd/mtd-user.h>
+
+#define BOOTLOADER_WARN_ADDR_DEFAULT 0x200000
+#define SECTOR_SIZE (128 * 1024)
+#define WRITE_SIZE_MAX 256
+
+// Global variables for configuration
+unsigned long g_warn_addr = BOOTLOADER_WARN_ADDR_DEFAULT;
+const char *g_mtd_device = "/dev/mtd0";
+
+// Prototypes
+void print_help(const char *app_name);
+int generate_pattern_data(const char* pattern, unsigned char* buffer, long size);
+int mtd_erase_region(int fd, long offset, long len, const mtd_info_t *mtd_info);
+int get_mtd_info(mtd_info_t *mtd_info);
+int validate_sector(long sector, const mtd_info_t *mtd_info);
+
+// Command handlers
+void handle_flash_write(int argc, char *argv[]);
+void handle_flash_read(int argc, char *argv[]);
+void handle_flash_erase(int argc, char *argv[]);
+void handle_flash_write_verify(int argc, char *argv[]);
+
+int main(int argc, char *argv[]) {
+    char *exec_name = argv[0];
+    int arg_offset = 1;
+    while (arg_offset < argc) {
+        if (strcmp(argv[arg_offset], "--warn-addr") == 0) {
+            if (arg_offset + 1 >= argc) { fprintf(stderr, "Error: --warn-addr requires a value.\n"); return 1; }
+            g_warn_addr = strtoul(argv[arg_offset + 1], NULL, 16);
+            printf(">> Custom Warning Address set to 0x%lX\n", g_warn_addr);
+            arg_offset += 2;
+        } else if (strcmp(argv[arg_offset], "--mtd-dev") == 0) {
+            if (arg_offset + 1 >= argc) { fprintf(stderr, "Error: --mtd-dev requires a path.\n"); return 1; }
+            g_mtd_device = argv[arg_offset + 1];
+            printf(">> Using MTD device: %s\n", g_mtd_device);
+            arg_offset += 2;
+        } else { break; }
+    }
+    
+    argc -= arg_offset;
+    argv += arg_offset;
+
+    if (argc < 1) { print_help(exec_name); return 1; }
+    
+    if (strcmp(argv[0], "flash") == 0) {
+        if (argc < 2) { fprintf(stderr, "Error: Missing flash subcommand.\n"); print_help(exec_name); return 1; }
+        char *sub_cmd = argv[1];
+        if (strcmp(sub_cmd, "write") == 0) handle_flash_write(argc-2, argv+2);
+        else if (strcmp(sub_cmd, "read") == 0) handle_flash_read(argc-2, argv+2);
+        else if (strcmp(sub_cmd, "erase") == 0) handle_flash_erase(argc-2, argv+2);
+        else if (strcmp(sub_cmd, "write-verify") == 0) handle_flash_write_verify(argc-2, argv+2);
+        else { fprintf(stderr, "Error: Unknown flash command '%s'.\n", sub_cmd); print_help(exec_name); return 1; }
+    } else if (strcmp(argv[0], "clr") == 0) { printf("\033[H\033[J");
+    } else if (strcmp(argv[0], "help") == 0) { print_help(exec_name);
+    } else { fprintf(stderr, "Error: Unknown command '%s'.\n", argv[0]); print_help(exec_name); return 1; }
+    
+    return 0;
+}
+
+void print_help(const char *app_name) {
+    printf("NXP i.MX8 Flash Tool (Advanced MTD Version)\n\n");
+    printf("Usage: %s [--mtd-dev <path>] [--warn-addr <hex>] <command> [options]\n\n", app_name);
+    printf("Commands:\n");
+    printf("  flash write [--no-erase] <type> <pattern> <sector> <size> - Write pattern.\n");
+    printf("  flash read <type> <sector> <size>                   - Read data from flash.\n");
+    printf("  flash erase <type> <start_sector> <end_sector>      - Erase flash region.\n");
+    printf("  flash write-verify <t> <sec> <iter> <fail> <log> <full> - Stress test flash.\n");
+    printf("  clr                                                 - Clear terminal screen.\n");
+    printf("  help                                                - Show this help message.\n\n");
+}
+
+int generate_pattern_data(const char* pattern, unsigned char* buffer, long size) {
+    if (strcmp(pattern, "+") == 0) { for (long i = 0; i < size; i++) buffer[i] = (unsigned char)(i & 0xFF);
+    } else if (strcmp(pattern, "-") == 0) { for (long i = 0; i < size; i++) buffer[i] = (unsigned char)((0xFF - i) & 0xFF);
+    } else {
+        char *endptr;
+        long val = strtol(pattern, &endptr, 16);
+        if (*endptr != '\0' || val < 0 || val > 255) { fprintf(stderr, "Error: Invalid hex pattern.\n"); return -1; }
+        memset(buffer, (unsigned char)val, size);
+    }
+    return 0;
+}
+
+int get_mtd_info(mtd_info_t *mtd_info) {
+    int fd = open(g_mtd_device, O_RDONLY);
+    if (fd < 0) { perror("open(MEMGETINFO)"); return -1; }
+    if (ioctl(fd, MEMGETINFO, mtd_info) != 0) { perror("ioctl(MEMGETINFO)"); close(fd); return -1; }
+    close(fd);
+    return 0;
+}
+
+int validate_sector(long sector, const mtd_info_t *mtd_info) {
+    long max_sector = mtd_info->size / SECTOR_SIZE - 1;
+    if (sector < 0 || sector > max_sector) {
+        fprintf(stderr, "Error: Sector %ld is out of range. Valid range for this device is 0-%ld.\n", sector, max_sector);
+        return -1;
+    }
+    return 0;
+}
+
+int mtd_erase_region(int fd, long offset, long len, const mtd_info_t *mtd_info) {
+    struct erase_info_user lock_info = { .start = (uint32_t)offset, .length = (uint32_t)len };
+    if (ioctl(fd, MEMUNLOCK, &lock_info) != 0) {
+        perror("ioctl(MEMUNLOCK)");
+        fprintf(stderr, "Warning: Could not unlock region. Continuing erase anyway.\n");
+    }
+
+    struct erase_info_user erase_info = { .start = (uint32_t)offset, .length = (uint32_t)len };
+    printf("Issuing MEMERASE: start=0x%x, length=0x%x\n", erase_info.start, erase_info.length);
+    if (ioctl(fd, MEMERASE, &erase_info) != 0) {
+        perror("ioctl(MEMERASE)");
+        ioctl(fd, MEMLOCK, &lock_info);
+        return -1;
+    }
+
+    if (ioctl(fd, MEMLOCK, &lock_info) != 0) {
+        perror("ioctl(MEMLOCK)");
+        fprintf(stderr, "Warning: Could not re-lock region after erase.\n");
+    }
+    return 0;
+}
+
+void handle_flash_write(int argc, char *argv[]) {
+    int perform_erase = 1;
+    int arg_offset = 0;
+    if (argc > 0 && strcmp(argv[0], "--no-erase") == 0) {
+        perform_erase = 0;
+        arg_offset = 1;
+        printf(">> --no-erase flag set. Skipping pre-erase.\n");
+    }
+
+    if (argc - arg_offset != 4) { fprintf(stderr, "Usage: flash write [--no-erase] <type> <pattern> <sector> <size>\n"); exit(1); }
+    
+    printf("Note: <type> parameter is for syntax compatibility; MTD driver selects hardware mode.\n");
+    char *pattern = argv[arg_offset + 1];
+    long sector = strtol(argv[arg_offset + 2], NULL, 0);
+    long size = strtol(argv[arg_offset + 3], NULL, 0);
+    long offset = sector * SECTOR_SIZE;
+
+    mtd_info_t mtd_info;
+    if (get_mtd_info(&mtd_info) != 0 || validate_sector(sector, &mtd_info) != 0) exit(1);
+
+    if (offset < g_warn_addr) { fprintf(stderr, "!! DANGER: Address 0x%lX is below warning address 0x%lX. Aborting.\n", offset, g_warn_addr); exit(1); }
+    if (size <= 0 || size > WRITE_SIZE_MAX) { fprintf(stderr, "Error: Size must be between 1 and %d bytes.\n", WRITE_SIZE_MAX); exit(1); }
+
+    unsigned char *data_buffer = malloc(size);
+    if (!data_buffer || generate_pattern_data(pattern, data_buffer, size) != 0) {
+        fprintf(stderr, "Error allocating or generating pattern data.\n");
+        if(data_buffer) free(data_buffer);
+        exit(1);
+    }
+
+    int fd = open(g_mtd_device, O_RDWR);
+    if (fd < 0) { perror("open"); free(data_buffer); exit(1); }
+
+    printf("Writing %ld bytes to sector %ld (Offset 0x%lX)...\n", size, sector, offset);
+    
+    if (perform_erase) {
+        long erase_offset = (offset / mtd_info.erasesize) * mtd_info.erasesize;
+        printf("Pre-erasing alignment block at 0x%lX...\n", erase_offset);
+        if (mtd_erase_region(fd, erase_offset, mtd_info.erasesize, &mtd_info) != 0) {
+            free(data_buffer); close(fd); exit(1);
+        }
+    }
+
+    if (lseek(fd, offset, SEEK_SET) == (off_t)-1) { perror("lseek"); free(data_buffer); close(fd); exit(1); }
+    
+    ssize_t written = write(fd, data_buffer, size);
+    
+    free(data_buffer);
+    close(fd);
+
+    if (written != size) { fprintf(stderr, "Error: Wrote %ld of %ld bytes.\n", written, size); perror("write"); exit(1); }
+    printf("Write successful.\n");
+}
+
+void handle_flash_read(int argc, char *argv[]) {
+    if (argc != 3) { fprintf(stderr, "Usage: flash read <type> <sector> <size>\n"); exit(1); }
+    printf("Note: <type> parameter is for syntax compatibility; MTD driver selects hardware mode.\n");
+    long sector = strtol(argv[1], NULL, 0);
+    long size = strtol(argv[2], NULL, 0);
+    long offset = sector * SECTOR_SIZE;
+
+    mtd_info_t mtd_info;
+    if (get_mtd_info(&mtd_info) != 0 || validate_sector(sector, &mtd_info) != 0) exit(1);
+    if (size <= 0 || size > WRITE_SIZE_MAX) { fprintf(stderr, "Error: Size must be between 1 and %d bytes.\n", WRITE_SIZE_MAX); exit(1); }
+
+    unsigned char *data_buffer = malloc(size);
+    if (!data_buffer) { fprintf(stderr, "Error: malloc failed.\n"); exit(1); }
+    
+    int fd = open(g_mtd_device, O_RDONLY);
+    if (fd < 0) { perror("open"); free(data_buffer); exit(1); }
+    
+    lseek(fd, offset, SEEK_SET);
+    ssize_t bytes_read = read(fd, data_buffer, size);
+    close(fd);
+
+    if (bytes_read < 0) { perror("read"); free(data_buffer); exit(1); }
+    
+    printf("sector=0x%lX size=%ld\n", offset, bytes_read);
+    printf("Data read followed by sector 0x%lX\n", offset);
+    for (long i = 0; i < bytes_read; i++) {
+        if (i % 8 == 0) {
+            if (i > 0) printf("\n");
+            printf("offset 0x%08lX : ", offset + i);
+        }
+        printf("%02X ", data_buffer[i]);
+    }
+    printf("\n");
+    free(data_buffer);
+}
+
+void handle_flash_erase(int argc, char *argv[]) {
+    if (argc != 3) { fprintf(stderr, "Usage: flash erase <type> <start_sector> <end_sector>\n"); exit(1); }
+    char type = argv[0][0];
+    long start_sector = strtol(argv[1], NULL, 0);
+    long end_sector = strtol(argv[2], NULL, 0);
+
+    mtd_info_t mtd_info;
+    if (get_mtd_info(&mtd_info) != 0) exit(1);
+
+    long requested_erase_size = 0;
+    switch(type) {
+        case 'Z': requested_erase_size = 4096; break;
+        case 'Y': requested_erase_size = 32768; break;
+        case 'O': requested_erase_size = 131072; break;
+        default: fprintf(stderr, "Error: Invalid erase type '%c'. Use Z, Y, or O.\n", type); exit(1);
+    }
+    
+    if (requested_erase_size != mtd_info.erasesize) {
+        fprintf(stderr, "Error: Unsupported erase size. Requested %ld bytes (Type %c), but device requires %u bytes.\n",
+                requested_erase_size, type, mtd_info.erasesize);
+        exit(1);
+    }
+    printf("Requested erase size %ld bytes (Type %c) is supported by device.\n", requested_erase_size, type);
+
+    if (validate_sector(start_sector, &mtd_info) != 0 || validate_sector(end_sector, &mtd_info) != 0) exit(1);
+    if (start_sector > end_sector) { fprintf(stderr, "Error: Start sector cannot be greater than end sector.\n"); exit(1); }
+
+    long offset = start_sector * SECTOR_SIZE;
+    long len = (end_sector - start_sector + 1) * SECTOR_SIZE;
+
+    if (offset < g_warn_addr) { fprintf(stderr, "!! DANGER: Address 0x%lX is below warning address 0x%lX. Aborting.\n", offset, g_warn_addr); exit(1); }
+    
+    int fd = open(g_mtd_device, O_RDWR);
+    if (fd < 0) { perror("open"); exit(1); }
+
+    printf("Erasing from sector %ld to %ld (Offset 0x%lX, Length 0x%lX)...\n", start_sector, end_sector, offset, len);
+
+    if (mtd_erase_region(fd, offset, len, &mtd_info) != 0) { close(fd); exit(1); }
+    
+    close(fd);
+    printf("Erase successful.\n");
+}
+
+void handle_flash_write_verify(int argc, char *argv[]) {
+    if (argc != 6) { fprintf(stderr, "Usage: flash write-verify <t> <sec> <iter> <fail> <log> <full>\n"); exit(1); }
+    printf("Note: <type> parameter is for syntax compatibility; MTD driver selects hardware mode.\n");
+    long start_sector = strtol(argv[1], NULL, 0);
+    long iterations = strtol(argv[2], NULL, 0);
+    long fail_stop_count = strtol(argv[3], NULL, 0);
+    int log_enable = atoi(argv[4]);
+    int full_sector_util = atoi(argv[5]);
+
+    unsigned long long iter_count = 0, fail_count = 0, total_pass = 0;
+    
+    printf("--- Starting MTD Write-Verify Stress Test ---\n");
+    printf("Start Sector: %ld | Iterations: %s | Stop on Fails: %s\n", 
+            start_sector, (iterations == 0) ? "Infinite" : argv[2], (fail_stop_count == 0) ? "No" : argv[3]);
+
+    mtd_info_t mtd_info;
+    if (get_mtd_info(&mtd_info) != 0) exit(1);
+    if (validate_sector(start_sector, &mtd_info) != 0) exit(1);
+
+    int fd = open(g_mtd_device, O_RDWR);
+    if (fd < 0) { perror("open"); exit(1); }
+    
+    long max_sectors = mtd_info.size / SECTOR_SIZE;
+    unsigned char *write_buf = malloc(SECTOR_SIZE);
+    unsigned char *read_buf = malloc(SECTOR_SIZE);
+    if (!write_buf || !read_buf) { fprintf(stderr, "Malloc failed for test buffers\n"); close(fd); exit(1); }
+
+    while (iterations == 0 || iter_count < iterations) {
+        iter_count++;
+        long current_sector = start_sector;
+        if (full_sector_util) {
+            long safe_sector_start = (g_warn_addr + SECTOR_SIZE - 1) / SECTOR_SIZE;
+            long num_safe_sectors = max_sectors - safe_sector_start;
+            if (num_safe_sectors <= 0) { fprintf(stderr, "\nError: No safe sectors available for full utilization test.\n"); break; }
+            current_sector = safe_sector_start + (iter_count % num_safe_sectors);
+        }
+        
+        if (validate_sector(current_sector, &mtd_info) != 0) { fprintf(stderr, "\nError: Calculated sector %ld is invalid. Stopping.\n", current_sector); break; }
+        
+        long offset = current_sector * SECTOR_SIZE;
+        generate_pattern_data("+", write_buf, SECTOR_SIZE);
+        write_buf[0] = iter_count & 0xFF;
+
+        if (mtd_erase_region(fd, offset, SECTOR_SIZE, &mtd_info) != 0) { fail_count++; if(log_enable) fprintf(stderr, "\nErase fail on sector %ld\n", current_sector); continue; }
+        lseek(fd, offset, SEEK_SET);
+        if (write(fd, write_buf, SECTOR_SIZE) != SECTOR_SIZE) { fail_count++; if(log_enable) fprintf(stderr, "\nWrite fail on sector %ld\n", current_sector); continue; }
+        lseek(fd, offset, SEEK_SET);
+        if (read(fd, read_buf, SECTOR_SIZE) != SECTOR_SIZE) { fail_count++; if(log_enable) fprintf(stderr, "\nRead fail on sector %ld\n", current_sector); continue; }
+
+        if (memcmp(write_buf, read_buf, SECTOR_SIZE) == 0) {
+            total_pass++;
+        } else {
+            fail_count++;
+            if (log_enable) { fprintf(stderr, "\n[ITER %llu] VERIFY FAILED on Sector %ld! (Total fails: %llu)\n", iter_count, current_sector, fail_count); }
+            if (fail_stop_count > 0 && fail_count >= fail_stop_count) { fprintf(stderr, "\nStopping test: Maximum fail count reached.\n"); break; }
+        }
+        
+        printf("\rTest Progress: Iter %llu | Sector %ld | Pass: %llu | Fail: %llu ", iter_count, current_sector, total_pass, fail_count);
+        fflush(stdout);
+    }
+    
+    free(write_buf); free(read_buf);
+    close(fd);
+    printf("\n--- Test Complete ---\n");
+}
