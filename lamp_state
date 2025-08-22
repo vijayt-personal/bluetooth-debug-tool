@@ -1,0 +1,713 @@
+#ifndef LAMP_CONTROLLER_LAMP_CONTROLLER_H_
+#define LAMP_CONTROLLER_LAMP_CONTROLLER_H_
+
+#include <cstdint>
+#include <cstddef>
+#include <vector>
+#include <array>
+
+#include "lamp_events.h"
+
+// Forward-declare platform-specific types to avoid including platform headers here.
+namespace platform {
+enum class PullMode { kNone, kUp, kDown };
+uint32_t GetSystemUptimeMs(); // Default time source
+}
+
+namespace lamp_controller {
+
+enum class Status : uint8_t {
+  kSuccess = 0,
+  kErrorNotInitialized,
+  kErrorInvalidPin,
+  kErrorInvalidEvent,
+  kErrorCallbackNull,
+  kErrorRegistryFull,
+  kErrorNotFound,
+  kErrorInvalidHandle,
+};
+
+using RegistrationHandle = uint32_t;
+constexpr RegistrationHandle kInvalidRegistrationHandle = 0;
+
+enum class OperatingMode { kContinuous, kPulsed };
+
+class LampController {
+ public:
+  using NowMsFn = uint32_t (*)();
+  
+  struct Config {
+    uint8_t control_pin;
+    uint8_t status_pin;
+    bool status_pin_active_low = true;
+    platform::PullMode pull_mode = platform::PullMode::kDown;
+    NowMsFn now_fn = &platform::GetSystemUptimeMs;
+    uint32_t thermal_cooldown_ms = 3 * 60 * 1000;
+  };
+  
+  LampController();
+  ~LampController();
+
+  LampController(const LampController&) = delete;
+  LampController& operator=(const LampController&) = delete;
+  LampController(LampController&&) = delete;
+  LampController& operator=(LampController&&) = delete;
+
+  Status Init(const Config& config);
+
+  void SetActive(bool active);
+  bool IsLampOn() const;
+  void Update();
+  uint32_t GetTotalOnTime() const;
+  void SetTotalOnTime(uint32_t minutes);
+  
+  RegistrationHandle RegisterEventCallback(LampEventType event, LampEventCallback cb);
+  Status UnregisterEventCallback(RegistrationHandle handle);
+
+  void SetPulseMode(uint32_t on_ms, uint32_t off_ms);
+  void SetContinuousMode();
+
+  // Getters for external state monitoring
+  OperatingMode GetOperatingMode() const;
+  bool IsActiveRequested() const;
+
+ private:
+  enum class State {
+    kUninitialized,
+    kStartingUp,
+    kOff,
+    kIgniting,
+    kRetryDelay,
+    kForcedOff, // Cooldown for thermal or switching
+    kContinuousOn,
+    kPulsedOn,
+    kPulsedOff,
+    kStateCount // Helper for array sizing
+  };
+
+  struct Listener {
+    LampEventCallback cb;
+    RegistrationHandle handle;
+    LampEventType event_type;
+  };
+
+  // Configuration
+  Config config_;
+  OperatingMode mode_;
+  uint32_t pulse_on_ms_;
+  uint32_t pulse_off_ms_;
+
+  // State
+  State state_;
+  bool is_active_requested_; // User's desired state (on/off)
+  bool prev_lamp_measured_state_;
+  bool sent_initial_status_event_;
+  uint8_t unexpected_off_counter_;
+  uint8_t ignition_retry_counter_;
+  bool initial_report_sent_;
+  
+  // Timers
+  uint32_t state_transition_time_ms_;
+  uint32_t forced_off_duration_ms_;
+  
+  // Lifetime tracking
+  uint8_t on_time_increment_tracker_;
+  uint32_t total_on_time_min_;
+  uint32_t last_update_tick_ms_;
+  uint32_t last_lamp_life_send_time_ms_;
+  uint32_t init_time_ms_;
+
+  // System
+  NowMsFn now_fn_;
+  RegistrationHandle next_handle_;
+  
+  static constexpr std::size_t kMaxListeners = 16;
+  std::array<Listener, kMaxListeners> listeners_;
+  std::size_t listener_count_;
+
+  // State Handler Function Table
+  using StateHandler = void (LampController::*)(uint32_t now, bool measured_state);
+  static const std::array<StateHandler, static_cast<size_t>(State::kStateCount)> kStateHandlers;
+
+  static constexpr uint8_t kMaxIgnitionRetries = 3;
+  static constexpr uint8_t kThermalTripThreshold = 5;
+  static constexpr uint32_t kIgnitionTimeoutMs = 10000;
+  static constexpr uint32_t kRetryDelayMs = 10000;
+  static constexpr uint32_t kInitialPowerOnDelayMs = 500;
+  static constexpr uint32_t kSwitchingDelayMs = 10000;
+  static constexpr uint32_t kSendLampLifeIntervalMs = 60 * 60 * 1000;
+  static constexpr uint32_t kStartupReportDelayMs = 5000;
+  static constexpr uint32_t kUpdateIntervalMs = 1000;
+  static constexpr uint8_t kSecondsPerMinute = 60;
+
+  void TransitionTo(State new_state);
+  void CheckAndSendLampLifeReport(uint32_t current_time);
+  void EmitEvent(LampEventType event, const LampEventPayload& payload);
+  void HandleTimeTracking(uint32_t current_time, bool measured_state);
+  void HandleMeasuredStateChange(bool measured_state);
+  void CheckForThermalTrip(bool measured_state);
+
+  // State Handler Functions
+  void OnStateUninitialized(uint32_t now, bool measured_state);
+  void OnStateStartingUp(uint32_t now, bool measured_state);
+  void OnStateOff(uint32_t now, bool measured_state);
+  void OnStateIgniting(uint32_t now, bool measured_state);
+  void OnStateRetryDelay(uint32_t now, bool measured_state);
+  void OnStateForcedOff(uint32_t now, bool measured_state);
+  void OnStateContinuousOn(uint32_t now, bool measured_state);
+  void OnStatePulsedOn(uint32_t now, bool measured_state);
+  void OnStatePulsedOff(uint32_t now, bool measured_state);
+
+  static bool HasIntervalElapsed(uint32_t start_ms, uint32_t interval_ms, uint32_t current_ms);
+};
+
+}  // namespace lamp_controller
+
+#endif  // LAMP_CONTROLLER_LAMP_CONTROLLER_H_
+
+#include "lamp_controller.h"
+
+#include "digital_pio.h"
+#include "log_print.h"
+#include <algorithm>
+
+namespace platform {
+    uint32_t GetSystemUptimeMs() { return 0; }
+}
+
+namespace lamp_controller {
+
+using namespace platform;
+
+// Define the static state handler function table
+const std::array<LampController::StateHandler, static_cast<size_t>(LampController::State::kStateCount)> LampController::kStateHandlers = {
+    &LampController::OnStateUninitialized,
+    &LampController::OnStateStartingUp,
+    &LampController::OnStateOff,
+    &LampController::OnStateIgniting,
+    &LampController::OnStateRetryDelay,
+    &LampController::OnStateForcedOff,
+    &LampController::OnStateContinuousOn,
+    &LampController::OnStatePulsedOn,
+    &LampController::OnStatePulsedOff,
+};
+
+LampController::LampController()
+    : config_{},
+      mode_(OperatingMode::kContinuous),
+      pulse_on_ms_(0),
+      pulse_off_ms_(0),
+      state_(State::kUninitialized),
+      is_active_requested_(false),
+      prev_lamp_measured_state_(false),
+      sent_initial_status_event_(false),
+      unexpected_off_counter_(0),
+      ignition_retry_counter_(0),
+      initial_report_sent_(false),
+      state_transition_time_ms_(0),
+      forced_off_duration_ms_(0),
+      on_time_increment_tracker_(0),
+      total_on_time_min_(0),
+      last_update_tick_ms_(0),
+      last_lamp_life_send_time_ms_(0),
+      init_time_ms_(0),
+      now_fn_(&platform::GetSystemUptimeMs),
+      next_handle_(1),
+      listener_count_(0) {}
+
+LampController::~LampController() {
+  if (state_ != State::kUninitialized) {
+    driver::digital_pio::Write(config_.control_pin, false);
+  }
+}
+
+Status LampController::Init(const Config& config) {
+  config_ = config;
+  if (config_.now_fn) {
+    now_fn_ = config_.now_fn;
+  }
+  
+  driver::digital_pio::Configure(config_.control_pin, driver::digital_pio::Mode::kOutput);
+  driver::digital_pio::Configure(config_.status_pin, driver::digital_pio::Mode::kInput, config_.pull_mode);
+
+  init_time_ms_ = now_fn_();
+  TransitionTo(State::kStartingUp);
+  return Status::kSuccess;
+}
+
+void LampController::SetActive(bool active) {
+  if (state_ == State::kUninitialized) return;
+  is_active_requested_ = active;
+}
+
+bool LampController::IsLampOn() const {
+  if (state_ == State::kUninitialized) return false;
+  return (driver::digital_pio::Read(config_.status_pin) == !config_.status_pin_active_low);
+}
+
+void LampController::Update() {
+  const uint32_t now = now_fn_();
+  const bool measured_state = IsLampOn();
+  
+  // Execute the handler for the current state from the function table.
+  (this->*kStateHandlers[static_cast<size_t>(state_)])(now, measured_state);
+
+  // --- Other Periodic Tasks ---
+  HandleTimeTracking(now, measured_state);
+  HandleMeasuredStateChange(measured_state);
+  CheckAndSendLampLifeReport(now);
+}
+
+// --- State Handler Implementations ---
+
+void LampController::OnStateUninitialized(uint32_t now, bool measured_state) {
+    // Do nothing until initialized.
+}
+
+void LampController::OnStateStartingUp(uint32_t now, bool measured_state) {
+    if (HasIntervalElapsed(state_transition_time_ms_, kInitialPowerOnDelayMs, now)) {
+        TransitionTo(State::kOff);
+    }
+}
+
+void LampController::OnStateOff(uint32_t now, bool measured_state) {
+    if (is_active_requested_) {
+        TransitionTo(State::kIgniting);
+    }
+}
+
+void LampController::OnStateIgniting(uint32_t now, bool measured_state) {
+    if (measured_state) {
+        TransitionTo(mode_ == OperatingMode::kContinuous ? State::kContinuousOn : State::kPulsedOn);
+    } else if (HasIntervalElapsed(state_transition_time_ms_, kIgnitionTimeoutMs, now)) {
+        if (ignition_retry_counter_ >= kMaxIgnitionRetries) {
+            LOG_PRINT(log_print::kERROR, "Ignition failed after max retries. Entering thermal cooldown.");
+            forced_off_duration_ms_ = config_.thermal_cooldown_ms;
+            TransitionTo(State::kForcedOff);
+        } else {
+            TransitionTo(State::kRetryDelay);
+        }
+    }
+}
+
+void LampController::OnStateRetryDelay(uint32_t now, bool measured_state) {
+    if (HasIntervalElapsed(state_transition_time_ms_, kRetryDelayMs, now)) {
+        TransitionTo(State::kIgniting);
+    }
+}
+
+void LampController::OnStateForcedOff(uint32_t now, bool measured_state) {
+    if (HasIntervalElapsed(state_transition_time_ms_, forced_off_duration_ms_, now)) {
+        TransitionTo(State::kOff);
+    }
+}
+
+void LampController::OnStateContinuousOn(uint32_t now, bool measured_state) {
+    if (!is_active_requested_) {
+        forced_off_duration_ms_ = kSwitchingDelayMs;
+        TransitionTo(State::kForcedOff);
+    }
+    CheckForThermalTrip(measured_state);
+}
+
+void LampController::OnStatePulsedOn(uint32_t now, bool measured_state) {
+    if (!is_active_requested_) {
+        forced_off_duration_ms_ = kSwitchingDelayMs;
+        TransitionTo(State::kForcedOff);
+    } else if (HasIntervalElapsed(state_transition_time_ms_, pulse_on_ms_, now)) {
+        TransitionTo(State::kPulsedOff);
+    }
+    CheckForThermalTrip(measured_state);
+}
+
+void LampController::OnStatePulsedOff(uint32_t now, bool measured_state) {
+    if (!is_active_requested_) {
+        forced_off_duration_ms_ = kSwitchingDelayMs;
+        TransitionTo(State::kForcedOff);
+    } else if (HasIntervalElapsed(state_transition_time_ms_, pulse_off_ms_, now)) {
+        TransitionTo(State::kPulsedOn);
+    }
+}
+
+// --- Helper and Core Logic Functions ---
+
+void LampController::CheckForThermalTrip(bool measured_state) {
+    if (!measured_state) {
+        unexpected_off_counter_++;
+        if (unexpected_off_counter_ >= kThermalTripThreshold) {
+            LOG_PRINT(log_print::kWARNING, "Thermal trip detected after %u consecutive failures!", kThermalTripThreshold);
+            EmitEvent(LampEventType::kThermalTrip, LampThermalPayload{unexpected_off_counter_});
+            forced_off_duration_ms_ = config_.thermal_cooldown_ms;
+            TransitionTo(State::kForcedOff);
+        }
+    } else {
+        unexpected_off_counter_ = 0;
+    }
+}
+
+void LampController::TransitionTo(State new_state) {
+  if (state_ == new_state) return;
+
+  const uint32_t now = now_fn_();
+  LOG_PRINT(log_print::kDEBUG1, "State transition: %d -> %d", static_cast<int>(state_), static_cast<int>(new_state));
+  
+  State old_state = state_;
+  state_ = new_state;
+  state_transition_time_ms_ = now;
+  unexpected_off_counter_ = 0;
+
+  if (old_state == State::kIgniting && new_state != State::kRetryDelay) {
+      ignition_retry_counter_ = 0;
+  }
+
+  switch (new_state) {
+    case State::kUninitialized:
+      break;
+    case State::kStartingUp:
+    case State::kOff:
+    case State::kPulsedOff:
+    case State::kForcedOff:
+    case State::kRetryDelay:
+      driver::digital_pio::Write(config_.control_pin, false);
+      break;
+    case State::kIgniting:
+      ignition_retry_counter_++;
+      LOG_PRINT(log_print::kINFO, "Ignition attempt %u...", ignition_retry_counter_);
+      driver::digital_pio::Write(config_.control_pin, true);
+      break;
+    case State::kContinuousOn:
+    case State::kPulsedOn:
+      driver::digital_pio::Write(config_.control_pin, true);
+      break;
+    case State::kStateCount: // Should not happen
+      break;
+  }
+}
+
+uint32_t LampController::GetTotalOnTime() const { return total_on_time_min_; }
+void LampController::SetTotalOnTime(uint32_t minutes) { total_on_time_min_ = minutes; }
+
+void LampController::SetPulseMode(uint32_t on_ms, uint32_t off_ms) {
+    if (mode_ != OperatingMode::kPulsed) {
+        mode_ = OperatingMode::kPulsed;
+        EmitEvent(LampEventType::kModeChanged, LampModePayload{OperatingMode::kPulsed});
+    }
+    pulse_on_ms_ = on_ms;
+    pulse_off_ms_ = off_ms;
+}
+
+void LampController::SetContinuousMode() {
+    if (mode_ != OperatingMode::kContinuous) {
+        mode_ = OperatingMode::kContinuous;
+        EmitEvent(LampEventType::kModeChanged, LampModePayload{OperatingMode::kContinuous});
+    }
+}
+
+OperatingMode LampController::GetOperatingMode() const {
+    return mode_;
+}
+
+bool LampController::IsActiveRequested() const {
+    return is_active_requested_;
+}
+
+RegistrationHandle LampController::RegisterEventCallback(LampEventType event, LampEventCallback cb) {
+  if (!cb) return kInvalidRegistrationHandle;
+  if (listener_count_ >= kMaxListeners) return kInvalidRegistrationHandle;
+
+  RegistrationHandle handle = next_handle_++;
+  listeners_[listener_count_] = {std::move(cb), handle, event};
+  listener_count_++;
+  return handle;
+}
+
+Status LampController::UnregisterEventCallback(RegistrationHandle handle) {
+  if (handle == kInvalidRegistrationHandle) return Status::kErrorInvalidHandle;
+
+  for (std::size_t i = 0; i < listener_count_; ++i) {
+    if (listeners_[i].handle == handle) {
+      listeners_[i] = listeners_[listener_count_ - 1];
+      listener_count_--;
+      return Status::kSuccess;
+    }
+  }
+
+  return Status::kErrorNotFound;
+}
+
+void LampController::EmitEvent(LampEventType event, const LampEventPayload& payload) {
+  std::vector<LampEventCallback> callbacks_to_run;
+  for (std::size_t i = 0; i < listener_count_; ++i) {
+    if (listeners_[i].event_type == event && listeners_[i].cb) {
+      callbacks_to_run.push_back(listeners_[i].cb);
+    }
+  }
+
+  for (const auto& cb : callbacks_to_run) {
+    cb(event, payload);
+  }
+}
+
+void LampController::CheckAndSendLampLifeReport(uint32_t current_time) {
+  bool should_send = false;
+  if (!initial_report_sent_) {
+    if (HasIntervalElapsed(init_time_ms_, kStartupReportDelayMs, current_time)) {
+      should_send = true;
+      initial_report_sent_ = true;
+    }
+  } else {
+    if (HasIntervalElapsed(last_lamp_life_send_time_ms_, kSendLampLifeIntervalMs, current_time)) {
+      should_send = true;
+    }
+  }
+
+  if (should_send) {
+    last_lamp_life_send_time_ms_ = current_time;
+    EmitEvent(LampEventType::kLampLifeReported, LampLifePayload{total_on_time_min_});
+  }
+}
+
+void LampController::HandleTimeTracking(uint32_t current_time, bool measured_state) {
+  if (HasIntervalElapsed(last_update_tick_ms_, kUpdateIntervalMs, current_time)) {
+    last_update_tick_ms_ = current_time;
+    if (measured_state) {
+      ++on_time_increment_tracker_;
+      if (on_time_increment_tracker_ >= kSecondsPerMinute) {
+        ++total_on_time_min_;
+        on_time_increment_tracker_ = 0;
+      }
+    }
+  }
+}
+
+void LampController::HandleMeasuredStateChange(bool measured_state) {
+  if ((measured_state != prev_lamp_measured_state_) || !sent_initial_status_event_) {
+    sent_initial_status_event_ = true;
+    prev_lamp_measured_state_ = measured_state;
+    EmitEvent(LampEventType::kStatusChanged, LampStatusPayload{measured_state});
+  }
+}
+
+bool LampController::HasIntervalElapsed(uint32_t start_ms, uint32_t interval_ms, uint32_t current_ms) {
+  return static_cast<uint32_t>(current_ms - start_ms) >= interval_ms;
+}
+
+}  // namespace lamp_controller
+
+
+#include "lamp_controller.h"
+#include "log_print.h"
+#include <iostream> // For demonstration purposes
+
+// --- Faux Platform Code ---
+// These would be your actual platform-specific implementations.
+namespace platform {
+    // A simple, incrementing time source for the example.
+    uint32_t g_mock_time_ms = 0;
+    uint32_t GetSystemUptimeMs() {
+        g_mock_time_ms += 100; // Simulate time passing faster for demo
+        return g_mock_time_ms;
+    }
+
+    namespace digital_pio {
+        bool g_lamp_status_pin_state = false; // false = OFF
+        void Configure(uint8_t pin, Mode mode, PullMode pull) { /* ... */ }
+        void Write(uint8_t pin, bool state) {
+            LOG_PRINT(log_print::kDEBUG2, "Control Pin -> %s", state ? "ON" : "OFF");
+            // In our simulation, the status pin follows the control pin unless we are
+            // actively simulating a fault.
+            g_lamp_status_pin_state = state;
+        }
+        bool Read(uint8_t pin) { return g_lamp_status_pin_state; }
+    }
+}
+// --- End Faux Platform Code ---
+
+
+/**
+ * @class SystemManager
+ * @brief An example class that owns and manages the LampController.
+ */
+class SystemManager {
+public:
+    SystemManager() = default;
+
+    void Init() {
+        LOG_PRINT(log_print::kINFO, "SystemManager: Initializing...");
+
+        // 1. Configure the lamp controller for our specific hardware.
+        lamp_controller::LampController::Config lamp_config{};
+        lamp_config.control_pin = 10;
+        lamp_config.status_pin = 11;
+        lamp_config.status_pin_active_low = false; // Our status pin is active-high
+        lamp_config.now_fn = &platform::GetSystemUptimeMs;
+        lamp_config.thermal_cooldown_ms = 5000; // 5-second thermal cooldown for demo
+
+        lamp_controller_.Init(lamp_config);
+
+        // 2. Register member functions as callbacks using std::bind.
+        using namespace std::placeholders; // for _1, _2
+        lamp_controller_.RegisterEventCallback(
+            lamp_controller::LampEventType::kStatusChanged,
+            std::bind(&SystemManager::OnLampStatusChanged, this, _1, _2)
+        );
+        lamp_controller_.RegisterEventCallback(
+            lamp_controller::LampEventType::kThermalTrip,
+            std::bind(&SystemManager::OnLampThermalTrip, this, _1, _2)
+        );
+        lamp_controller_.RegisterEventCallback(
+            lamp_controller::LampEventType::kModeChanged,
+            std::bind(&SystemManager::OnModeChanged, this, _1, _2)
+        );
+    }
+
+    void RunTask() {
+        LOG_PRINT(log_print::kINFO, "SystemManager: Starting main task loop.");
+        while (true) {
+            lamp_controller_.Update();
+            SimulateExternalEvents();
+
+            if (platform::g_mock_time_ms > 80000) {
+                break; // End demo after 80 seconds
+            }
+        }
+    }
+
+private:
+    // --- Event Handlers ---
+    void OnLampStatusChanged(lamp_controller::LampEventType event, const lamp_controller::LampEventPayload& payload) {
+        const auto& status = std::get<lamp_controller::LampStatusPayload>(payload);
+        LOG_PRINT(log_print::kINFO, "[CALLBACK] Lamp status changed. Measured ON: %s", status.is_on ? "true" : "false");
+    }
+
+    void OnLampThermalTrip(lamp_controller::LampEventType event, const lamp_controller::LampEventPayload& payload) {
+        const auto& thermal = std::get<lamp_controller::LampThermalPayload>(payload);
+        LOG_PRINT(log_print::kCRITICAL, "[CALLBACK] Thermal Trip! Failures: %u. System taking action.", thermal.consecutive_failures);
+    }
+
+    void OnModeChanged(lamp_controller::LampEventType event, const lamp_controller::LampEventPayload& payload) {
+        const auto& mode = std::get<lamp_controller::LampModePayload>(payload);
+        const char* mode_str = (mode.new_mode == lamp_controller::OperatingMode::kPulsed) ? "Pulsed" : "Continuous";
+        LOG_PRINT(log_print::kINFO, "[CALLBACK] Operating mode changed to: %s", mode_str);
+    }
+
+    // --- Example Simulation Logic ---
+    void SimulateExternalEvents() {
+        uint32_t now = platform::g_mock_time_ms;
+        static bool requested_on = false;
+        static bool requested_pulse = false;
+        static bool tripped_thermal = false;
+
+        // At 2 seconds, user turns the lamp ON. This will trigger the ignition sequence.
+        if (now > 2000 && !requested_on) {
+            LOG_PRINT(log_print::kUSER, "--> User requests lamp ON.");
+            lamp_controller_.SetActive(true);
+            requested_on = true;
+        }
+
+        // At 15 seconds, simulate a persistent thermal fault by forcing the status pin OFF.
+        if (now > 15000 && !tripped_thermal) {
+            LOG_PRINT(log_print::kUSER, "--> Simulating persistent thermal fault condition...");
+            platform::digital_pio::g_lamp_status_pin_state = false;
+            tripped_thermal = true; // Only trip once
+        }
+        // After the fault is cleared by the cooldown, let the pin recover.
+        if (now > 25000 && tripped_thermal) {
+             platform::digital_pio::g_lamp_status_pin_state = lamp_controller_.IsActiveRequested();
+        }
+
+        // At 40 seconds, user requests pulse mode.
+        if (now > 40000 && !requested_pulse) {
+            LOG_PRINT(log_print::kUSER, "--> User switches to PULSE mode.");
+            lamp_controller_.SetPulseMode(2000, 1000); // 2s ON, 1s OFF
+            requested_pulse = true;
+        }
+
+        // Periodically log the different states
+        if (now % 5000 < 100) { // Log roughly every 5 seconds
+            LOG_PRINT(log_print::kDEBUG1, "--- Status Check --- Requested: %s, Measured: %s, Mode: %s",
+                lamp_controller_.IsActiveRequested() ? "ON" : "OFF",
+                lamp_controller_.IsLampOn() ? "ON" : "OFF",
+                lamp_controller_.GetOperatingMode() == lamp_controller::OperatingMode::kPulsed ? "PULSED" : "CONTINUOUS"
+            );
+        }
+    }
+
+    // --- Member Variables ---
+    lamp_controller::LampController lamp_controller_;
+};
+
+
+int main() {
+    SystemManager system;
+    system.Init();
+    system.RunTask();
+    return 0;
+}
+
+
+#ifndef LAMP_CONTROLLER_LAMP_EVENTS_H_
+#define LAMP_CONTROLLER_LAMP_EVENTS_H_
+
+#include <cstdint>
+#include <variant>
+#include <functional>
+
+namespace lamp_controller {
+
+// Forward-declare for use in payload
+enum class OperatingMode;
+
+/**
+ * @brief Event types emitted by the lamp controller.
+ */
+enum class LampEventType : uint8_t {
+  kStatusChanged = 0,
+  kLampLifeReported = 1,
+  kThermalTrip = 2,
+  kModeChanged = 3,
+  kCount
+};
+
+/**
+ * @brief Payload for status-changed event.
+ */
+struct LampStatusPayload {
+  bool is_on = false;
+};
+
+/**
+ * @brief Payload for lamp-life event.
+ */
+struct LampLifePayload {
+  uint32_t total_on_minutes = 0;
+};
+
+/**
+ * @brief Payload for thermal-trip event.
+ */
+struct LampThermalPayload {
+  uint8_t consecutive_failures = 0;
+};
+
+/**
+ * @brief Payload for mode-changed event.
+ */
+struct LampModePayload {
+  OperatingMode new_mode;
+};
+
+/**
+ * @brief Variant wrapper for event payloads.
+ */
+using LampEventPayload = std::variant<std::monostate, LampStatusPayload, LampLifePayload, LampThermalPayload, LampModePayload>;
+
+/**
+ * @brief Modern, flexible event callback signature using std::function.
+ */
+using LampEventCallback = std::function<void(LampEventType event, const LampEventPayload& payload)>;
+
+}  // namespace lamp_controller
+
+#endif  // LAMP_CONTROLLER_LAMP_EVENTS_H_
+
