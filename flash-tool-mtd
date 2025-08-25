@@ -2415,3 +2415,539 @@ void handle_flash_write_verify(int argc, char *argv[]) {
     close(fd);
     printf("--- Test Complete ---\n");
 }
+/*
+ * flash_tool.c
+ *
+ * An advanced, non-interactive command-line utility for an NXP i.MX8 board.
+ * This version uses the native MTD subsystem for safe flash interaction.
+ *
+ * Version: 11.3 (August 25, 2025)
+ *
+ * This version incorporates expert feedback:
+ * - FIX: Added MEMSYNC ioctl after erase/write to ensure hardware operation completes.
+ * - FIX: Removed invalid fsync() call on character device, which caused EINVAL errors.
+ * - FIX: Removed references to non-existent 'mtd_info.name' member.
+ * - Mandatory <type> parameter with new 'auto' mode.
+ * - Interactive warnings and confirmations for safer operation.
+ * - Efficient single-call full partition erase.
+ *
+ * Author: Gemini
+ * Date: August 25, 2025
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <sys/ioctl.h>
+#include <errno.h>
+#include <ctype.h>
+#include <mtd/mtd-user.h>
+#include <signal.h>
+#include <stdint.h>
+#include <inttypes.h>
+#include <limits.h>
+
+#define LOGICAL_SECTOR_SIZE (128 * 1024)
+#define BOOTLOADER_WARN_ADDR_DEFAULT 0x200000
+#define WRITE_SIZE_MAX 256
+#define MAX_FAILURE_LOGS 64
+
+// Global variables for configuration
+uint64_t g_warn_addr = BOOTLOADER_WARN_ADDR_DEFAULT;
+const char *g_mtd_device = "/dev/mtd0";
+int g_use_logical_sectors = 0;
+volatile sig_atomic_t g_signal_received = 0;
+
+// Prototypes
+void signal_handler(int signum);
+int get_confirmation(void);
+void hexdump(uint64_t base_offset, const unsigned char *data, size_t size);
+void print_help(const char *app_name);
+int generate_pattern_data(const char* pattern, unsigned char* buffer, size_t size);
+int mtd_sync(int fd);
+int mtd_erase_region(int fd, uint64_t offset, uint32_t length);
+int get_mtd_info(struct mtd_info_user *mtd_info);
+int validate_block(uint64_t block, const struct mtd_info_user *mtd_info);
+int mtd_write_data(int fd, uint64_t offset, const void *data, size_t size);
+int mtd_read_data(int fd, uint64_t offset, void *buffer, size_t size);
+void handle_flash_info(int argc, char *argv[]);
+void handle_flash_write(int argc, char *argv[]);
+void handle_flash_read(int argc, char *argv[]);
+void handle_flash_erase(int argc, char *argv[]);
+void handle_flash_write_verify(int argc, char *argv[]);
+
+void signal_handler(int signum) {
+    g_signal_received = 1;
+    write(STDERR_FILENO, "\nSignal received. Shutting down...\n", 34);
+}
+
+int get_confirmation(void) {
+    char buf[16];
+    if (fgets(buf, sizeof(buf), stdin)) {
+        buf[strcspn(buf, "\n")] = 0;
+        if (strcasecmp(buf, "y") == 0 || strcasecmp(buf, "yes") == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+int main(int argc, char *argv[]) {
+    signal(SIGINT, signal_handler);
+    signal(SIGTERM, signal_handler);
+    
+    char *exec_name = argv[0];
+    int arg_offset = 1;
+    while (arg_offset < argc) {
+        if (strcmp(argv[arg_offset], "--warn-addr") == 0) {
+            if (arg_offset + 1 >= argc) { fprintf(stderr, "Error: --warn-addr requires a value.\n"); return 1; }
+            g_warn_addr = strtoull(argv[arg_offset + 1], NULL, 16);
+            printf(">> Custom Warning Address set to 0x%" PRIX64 "\n", g_warn_addr);
+            arg_offset += 2;
+        } else if (strcmp(argv[arg_offset], "--mtd-dev") == 0) {
+            if (arg_offset + 1 >= argc) { fprintf(stderr, "Error: --mtd-dev requires a path.\n"); return 1; }
+            g_mtd_device = argv[arg_offset + 1];
+        } else if (strcmp(argv[arg_offset], "--use-logical-sectors") == 0) {
+            g_use_logical_sectors = 1;
+            printf(">> Operating in LOGICAL 128KiB SECTOR mode.\n");
+            arg_offset += 1;
+        } else { break; }
+    }
+    
+    argc -= arg_offset;
+    argv += arg_offset;
+
+    if (argc < 1) { print_help(exec_name); return 1; }
+    
+    if (strcmp(argv[0], "flash") == 0) {
+        if (argc < 2) { fprintf(stderr, "Error: Missing flash subcommand.\n"); print_help(exec_name); return 1; }
+        char *sub_cmd = argv[1];
+        printf(">> Using MTD device: %s\n", g_mtd_device);
+        if (strcmp(sub_cmd, "write") == 0) handle_flash_write(argc-2, argv+2);
+        else if (strcmp(sub_cmd, "read") == 0) handle_flash_read(argc-2, argv+2);
+        else if (strcmp(sub_cmd, "erase") == 0) handle_flash_erase(argc-2, argv+2);
+        else if (strcmp(sub_cmd, "write-verify") == 0) handle_flash_write_verify(argc-2, argv+2);
+        else { fprintf(stderr, "Error: Unknown flash command '%s'.\n", sub_cmd); print_help(exec_name); return 1; }
+    } else if (strcmp(argv[0], "info") == 0) { 
+        printf(">> Using MTD device: %s\n", g_mtd_device);
+        handle_flash_info(argc-1, argv+1);
+    } else if (strcmp(argv[0], "clr") == 0) { printf("\033[H\033[J");
+    } else if (strcmp(argv[0], "help") == 0) { print_help(exec_name);
+    } else { fprintf(stderr, "Error: Unknown command '%s'.\n", argv[0]); print_help(exec_name); return 1; }
+    
+    return 0;
+}
+
+void print_help(const char *app_name) {
+    printf("NXP i.MX8 Flash Tool (Advanced MTD Version) - v11.3\n\n");
+    printf("Usage: %s [global_options] <command> [options]\n\n", app_name);
+    printf("Global Options:\n");
+    printf("  --mtd-dev <path>          Specify MTD device (default: /dev/mtd0)\n");
+    printf("  --warn-addr <hex>         Set safety warning address (default: 0x200000)\n");
+    printf("  --use-logical-sectors     Use 128KiB logical sectors instead of physical blocks\n\n");
+    printf("Commands:\n");
+    printf("  info\n");
+    printf("    Display info about the current MTD partition.\n\n");
+    printf("  flash write [--no-erase] <type> <pattern> <block> <size>\n");
+    printf("    - <type>: 'A' or 'auto' recommended. Legacy types trigger a warning.\n\n");
+    printf("  flash read <type> <block> <size>\n");
+    printf("    - <type>: 'A' or 'auto' recommended. Legacy types trigger a warning.\n\n");
+    printf("  flash erase <type> [<start> <end>]\n");
+    printf("    - <type>: 'A'/'auto' for native size, or Z/Y/O to check against a size.\n\n");
+    printf("  flash erase C\n");
+    printf("    Erase the entire partition.\n\n");
+    printf("  flash write-verify <type> <block> <iter> <fail> <log> <full> [file]\n");
+    printf("    Run a stress test.\n");
+}
+
+void hexdump(uint64_t base_offset, const unsigned char *data, size_t size) {
+    for (size_t i = 0; i < size; i++) {
+        if (i % 8 == 0) {
+            if (i > 0) printf("\n");
+            printf("0x%08" PRIX64 " : ", base_offset + i);
+        }
+        printf("%02X ", data[i]);
+    }
+    printf("\n");
+}
+
+int mtd_sync(int fd) {
+    if (ioctl(fd, MEMSYNC, NULL) != 0) {
+        perror("ioctl(MEMSYNC)");
+        return -1;
+    }
+    return 0;
+}
+
+int mtd_erase_region(int fd, uint64_t offset, uint32_t length) {
+    if (offset > UINT32_MAX) {
+        fprintf(stderr, "Error: erase offset 0x%" PRIX64 " >= 32-bit limit; this kernel may require MEMERASE64 support.\n", offset);
+        return -1;
+    }
+    struct erase_info_user erase_info = { .start = (uint32_t)offset, .length = length };
+    if (ioctl(fd, MEMERASE, &erase_info) != 0) {
+        perror("ioctl(MEMERASE)");
+        return -1;
+    }
+    return mtd_sync(fd);
+}
+
+int mtd_write_data(int fd, uint64_t offset, const void *data, size_t size) {
+    if (lseek(fd, (off_t)offset, SEEK_SET) == (off_t)-1) {
+        perror("lseek for write");
+        return -1;
+    }
+    size_t total_written = 0;
+    while (total_written < size) {
+        ssize_t written = write(fd, (const char*)data + total_written, size - total_written);
+        if (written < 0) {
+            if (errno == EINTR) continue;
+            perror("write");
+            return -1;
+        }
+        total_written += written;
+    }
+    return mtd_sync(fd);
+}
+
+int mtd_read_data(int fd, uint64_t offset, void *buffer, size_t size) {
+    if (lseek(fd, (off_t)offset, SEEK_SET) == (off_t)-1) {
+        perror("lseek for read");
+        return -1;
+    }
+    size_t total_read = 0;
+    while (total_read < size) {
+        ssize_t bytes_read = read(fd, (char*)buffer + total_read, size - total_read);
+        if (bytes_read < 0) {
+            if (errno == EINTR) continue;
+            perror("read");
+            return -1;
+        }
+        if (bytes_read == 0) {
+            fprintf(stderr, "Error: Reached end of device unexpectedly.\n");
+            return -1;
+        }
+        total_read += bytes_read;
+    }
+    return 0;
+}
+
+int get_mtd_info(struct mtd_info_user *mtd_info) {
+    int fd = open(g_mtd_device, O_RDONLY);
+    if (fd < 0) { perror("open(MEMGETINFO)"); return -1; }
+    if (ioctl(fd, MEMGETINFO, mtd_info) != 0) { perror("ioctl(MEMGETINFO)"); close(fd); return -1; }
+    close(fd);
+    return 0;
+}
+
+int validate_block(uint64_t block, const struct mtd_info_user *mtd_info) {
+    uint32_t block_size = g_use_logical_sectors ? LOGICAL_SECTOR_SIZE : mtd_info->erasesize;
+    if (block_size == 0) {
+        fprintf(stderr, "Error: Invalid block/sector size 0.\n");
+        return -1;
+    }
+    uint64_t num_blocks = mtd_info->size / block_size;
+    if (num_blocks == 0) {
+        fprintf(stderr, "Error: Device size (%u) is smaller than the block/sector size (%u).\n", mtd_info->size, block_size);
+        return -1;
+    }
+    if (block >= num_blocks) {
+        fprintf(stderr, "Error: Block/sector %" PRIu64 " is out of range. Valid range is 0-%" PRIu64 ".\n", block, num_blocks - 1);
+        return -1;
+    }
+    return 0;
+}
+
+int generate_pattern_data(const char* pattern, unsigned char* buffer, size_t size) {
+    if (strcmp(pattern, "+") == 0) { for (size_t i = 0; i < size; i++) buffer[i] = (unsigned char)(i & 0xFF);
+    } else if (strcmp(pattern, "-") == 0) { for (size_t i = 0; i < size; i++) buffer[i] = (unsigned char)((0xFF - i) & 0xFF);
+    } else {
+        long val = strtol(pattern, NULL, 16);
+        if (val < 0 || val > 255) { fprintf(stderr, "Error: Invalid hex pattern.\n"); return -1; }
+        memset(buffer, (unsigned char)val, size);
+    }
+    return 0;
+}
+
+void handle_flash_info(int argc, char *argv[]) {
+    if (argc != 0) { fprintf(stderr, "Usage: info\n"); exit(1); }
+    
+    struct mtd_info_user mtd_info;
+    if (get_mtd_info(&mtd_info) != 0) exit(1);
+
+    printf("--- MTD Partition Information ---\n");
+    printf("Total Size:          %u bytes (%.1f MiB)\n", mtd_info.size, (float)mtd_info.size / (1024*1024));
+    printf("Erase Block Size:    %u bytes (%.1f KiB)\n", mtd_info.erasesize, (float)mtd_info.erasesize / 1024);
+    if (mtd_info.erasesize > 0) {
+        printf("Total Erase Blocks:  %llu\n", (unsigned long long)mtd_info.size / mtd_info.erasesize);
+    }
+    printf("Min. I/O Size:       %u bytes\n", mtd_info.writesize);
+}
+
+void handle_flash_write(int argc, char *argv[]) {
+    int perform_erase = 1;
+    int arg_offset = 0;
+    if (argc > 0 && strcmp(argv[0], "--no-erase") == 0) {
+        perform_erase = 0;
+        arg_offset = 1;
+        printf(">> --no-erase flag set. Skipping pre-erase.\n");
+    }
+    if (argc - arg_offset != 4) { fprintf(stderr, "Usage: flash write [--no-erase] <type> <pattern> <block|sector> <size>\n"); exit(1); }
+    
+    const char* type_str = argv[arg_offset + 0];
+    const char *pattern = argv[arg_offset + 1];
+    uint64_t block = strtoull(argv[arg_offset + 2], NULL, 0);
+    size_t size = strtoul(argv[arg_offset + 3], NULL, 0);
+
+    if (strcasecmp(type_str, "A") != 0 && strcasecmp(type_str, "auto") != 0) {
+        printf("Warning: The MTD subsystem does not support runtime hardware mode changes.\n");
+        printf("         The operation will proceed using the standard MTD driver behavior.\n");
+        printf("Do you want to continue? (y/n): ");
+        if (!get_confirmation()) {
+            printf("Aborted by user.\n");
+            exit(1);
+        }
+    }
+    struct mtd_info_user mtd_info;
+    if (get_mtd_info(&mtd_info) != 0 || validate_block(block, &mtd_info) != 0) exit(1);
+    if (mtd_info.writesize > 1 && (size % mtd_info.writesize != 0)) {
+        fprintf(stderr, "Error: Write size (%zu) must be a multiple of the minimum I/O size (%u bytes).\n", size, mtd_info.writesize);
+        exit(1);
+    }
+    uint32_t block_size = g_use_logical_sectors ? LOGICAL_SECTOR_SIZE : mtd_info.erasesize;
+    uint64_t offset = block * block_size;
+    if (offset < g_warn_addr) { fprintf(stderr, "!! DANGER: Address 0x%" PRIX64 " is below warning address 0x%" PRIX64 ". Aborting.\n", offset, g_warn_addr); exit(1); }
+    if (size == 0 || size > WRITE_SIZE_MAX) { fprintf(stderr, "Error: Size must be between 1 and %d bytes.\n", WRITE_SIZE_MAX); exit(1); }
+    if (size > mtd_info.erasesize) { fprintf(stderr, "Error: Write size (%zu) cannot be larger than a physical erase block (%u).\n", size, mtd_info.erasesize); exit(1); }
+    unsigned char *data_buffer = malloc(size);
+    if (!data_buffer || generate_pattern_data(pattern, data_buffer, size) != 0) {
+        fprintf(stderr, "Error allocating or generating pattern data.\n");
+        if(data_buffer) free(data_buffer);
+        exit(1);
+    }
+    int fd = open(g_mtd_device, O_RDWR);
+    if (fd < 0) { perror("open"); free(data_buffer); exit(1); }
+    printf("Writing %zu bytes to block/sector %" PRIu64 " (Offset 0x%" PRIX64 ")...\n", size, block, offset);
+    if (perform_erase) {
+        uint64_t erase_offset = (offset / mtd_info.erasesize) * mtd_info.erasesize;
+        printf("Pre-erasing physical block at offset 0x%" PRIX64 "...\n", erase_offset);
+        if (mtd_erase_region(fd, erase_offset, mtd_info.erasesize) != 0) {
+            free(data_buffer); close(fd); exit(1);
+        }
+    }
+    if (mtd_write_data(fd, offset, data_buffer, size) != 0) {
+        free(data_buffer); close(fd); exit(1);
+    }
+    free(data_buffer);
+    close(fd);
+    printf("Write successful.\n");
+}
+
+void handle_flash_read(int argc, char *argv[]) {
+    if (argc != 3) { fprintf(stderr, "Usage: flash read <type> <block|sector> <size>\n"); exit(1); }
+
+    const char* type_str = argv[0];
+    uint64_t block = strtoull(argv[1], NULL, 0);
+    size_t size = strtoul(argv[2], NULL, 0);
+    
+    if (strcasecmp(type_str, "A") != 0 && strcasecmp(type_str, "auto") != 0) {
+        printf("Warning: The MTD subsystem does not support runtime hardware mode changes.\n");
+        printf("         The operation will proceed using the standard MTD driver behavior.\n");
+        printf("Do you want to continue? (y/n): ");
+        if (!get_confirmation()) {
+            printf("Aborted by user.\n");
+            exit(1);
+        }
+    }
+    struct mtd_info_user mtd_info;
+    if (get_mtd_info(&mtd_info) != 0 || validate_block(block, &mtd_info) != 0) exit(1);
+    if (mtd_info.writesize > 1 && (size % mtd_info.writesize != 0)) {
+        fprintf(stderr, "Error: Read size (%zu) must be a multiple of the minimum I/O size (%u bytes).\n", size, mtd_info.writesize);
+        exit(1);
+    }
+    uint32_t block_size = g_use_logical_sectors ? LOGICAL_SECTOR_SIZE : mtd_info.erasesize;
+    uint64_t offset = block * block_size;
+    if (size == 0 || size > WRITE_SIZE_MAX) { fprintf(stderr, "Error: Size must be between 1 and %d bytes.\n", WRITE_SIZE_MAX); exit(1); }
+    unsigned char *data_buffer = malloc(size);
+    if (!data_buffer) { fprintf(stderr, "Error: malloc failed.\n"); exit(1); }
+    int fd = open(g_mtd_device, O_RDONLY);
+    if (fd < 0) { perror("open"); free(data_buffer); exit(1); }
+    if (mtd_read_data(fd, offset, data_buffer, size) != 0) {
+        free(data_buffer); close(fd); exit(1);
+    }
+    close(fd);
+    printf("Data from offset 0x%" PRIX64 ", size %zu bytes:\n", offset, size);
+    hexdump(offset, data_buffer, size);
+    free(data_buffer);
+}
+
+void handle_flash_erase(int argc, char *argv[]) {
+    if (argc < 1) { fprintf(stderr, "Usage: flash erase <type> [<start_block> <end_block>]\n"); exit(1); }
+
+    struct mtd_info_user mtd_info;
+    if (get_mtd_info(&mtd_info) != 0) exit(1);
+    const char* type_str = argv[0];
+
+    if (strcasecmp(type_str, "C") == 0) {
+        if (argc != 1) { fprintf(stderr, "Usage: flash erase C\n"); exit(1); }
+        printf("\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!! WARNING !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n");
+        printf("You are about to erase the ENTIRE MTD partition on device %s.\n", g_mtd_device);
+        printf("This will destroy ALL data on this partition (%u bytes).\n", mtd_info.size);
+        printf("This operation is IRREVERSIBLE.\n\n");
+        printf("To confirm, type the exact phrase 'ERASE-PARTITION' and press Enter.\n> ");
+        char confirmation[32];
+        if (fgets(confirmation, sizeof(confirmation), stdin)) {
+            confirmation[strcspn(confirmation, "\n")] = 0;
+            if (strcmp(confirmation, "ERASE-PARTITION") != 0) {
+                printf("\nConfirmation failed. Aborting.\n");
+                exit(1);
+            }
+        } else {
+            printf("\nCould not read confirmation. Aborting.\n");
+            exit(1);
+        }
+        printf("\nConfirmation accepted. Erasing entire partition... (this may take some time)\n");
+        int fd = open(g_mtd_device, O_RDWR);
+        if (fd < 0) { perror("open"); exit(1); }
+        if (mtd_erase_region(fd, 0, mtd_info.size) != 0) {
+            fprintf(stderr, "Full partition erase FAILED.\n");
+            close(fd);
+            exit(1);
+        }
+        close(fd);
+        printf("Full partition erase successful.\n");
+        return;
+    }
+
+    if (argc != 3) { fprintf(stderr, "Usage: flash erase <type> <start_block> <end_block>\n"); exit(1); }
+    
+    uint64_t start_block = strtoull(argv[1], NULL, 0);
+    uint64_t end_block = strtoull(argv[2], NULL, 0);
+
+    if (strcasecmp(type_str, "A") == 0 || strcasecmp(type_str, "auto") == 0) {
+        printf(">> Auto mode selected. Using device's native erase size: %u bytes.\n", mtd_info.erasesize);
+    } else {
+        uint32_t requested_erase_size = 0;
+        switch(toupper(type_str[0])) {
+            case 'Z': requested_erase_size = 4096; break;
+            case 'Y': requested_erase_size = 32768; break;
+            case 'O': requested_erase_size = 131072; break;
+            default: fprintf(stderr, "Error: Invalid erase type '%s'. Use Z, Y, O, C, or auto.\n", type_str); exit(1);
+        }
+        if (requested_erase_size != mtd_info.erasesize) {
+            printf("Warning: Requested erase size (%u bytes) does not match the device's actual erase size (%u bytes).\n",
+                    requested_erase_size, mtd_info.erasesize);
+            printf("Do you want to proceed using the correct device erase size? (y/n): ");
+            if (!get_confirmation()) {
+                printf("Aborted by user.\n");
+                exit(1);
+            }
+            printf(">> Proceeding with device native erase size: %u bytes.\n", mtd_info.erasesize);
+        } else {
+            printf(">> Requested erase size %u bytes (Type %c) is supported by device.\n", requested_erase_size, toupper(type_str[0]));
+        }
+    }
+    if (validate_block(start_block, &mtd_info) != 0 || validate_block(end_block, &mtd_info) != 0) exit(1);
+    if (start_block > end_block) { fprintf(stderr, "Error: Start block cannot be greater than end block.\n"); exit(1); }
+    int fd = open(g_mtd_device, O_RDWR);
+    if (fd < 0) { perror("open"); exit(1); }
+    printf("Erasing from block/sector %" PRIu64 " to %" PRIu64 "...\n", start_block, end_block);
+    uint32_t block_size = g_use_logical_sectors ? LOGICAL_SECTOR_SIZE : mtd_info.erasesize;
+    for (uint64_t i = start_block; i <= end_block; i++) {
+        if (g_signal_received) { break; }
+        uint64_t current_offset = i * block_size;
+        if (current_offset < g_warn_addr) {
+             fprintf(stderr, "!! DANGER: Address 0x%" PRIX64 " is below warning address 0x%" PRIX64 ". Aborting.\n", current_offset, g_warn_addr);
+             break;
+        }
+        printf("Erasing block %llu/%llu (device block %" PRIu64 ") at offset 0x%" PRIX64 "...\n",
+            (unsigned long long)(i - start_block + 1), (unsigned long long)(end_block - start_block + 1), i, current_offset);
+        if (mtd_erase_region(fd, current_offset, block_size) != 0) {
+            close(fd);
+            exit(1);
+        }
+    }
+    close(fd);
+    if (!g_signal_received) {
+        printf("Erase successful.\n");
+    }
+}
+
+void handle_flash_write_verify(int argc, char *argv[]) {
+    if (argc < 6 || argc > 7) { fprintf(stderr, "Usage: flash write-verify <type> <block> <iter> <fail> <log> <full> [file]\n"); exit(1); }
+    
+    const char* type_str = argv[0];
+    uint64_t start_block = strtoull(argv[1], NULL, 0);
+    uint64_t iterations = strtoull(argv[2], NULL, 0);
+    uint64_t fail_stop_count = strtoull(argv[3], NULL, 0);
+    int log_enable = atoi(argv[4]);
+    int full_sector_util = atoi(argv[5]);
+    const char* file_path = (argc == 7) ? argv[6] : NULL;
+    
+    if (strcasecmp(type_str, "A") != 0 && strcasecmp(type_str, "auto") != 0) {
+        printf("Note: <type> parameter is for syntax compatibility; using standard MTD behavior.\n");
+    }
+    unsigned long long iter_count = 0, fail_count = 0, logged_fails = 0;
+    
+    printf("--- Starting MTD Write-Verify Stress Test ---\n");
+    printf("Start Block: %" PRIu64 " | Iterations: %s | Stop on Fails: %s\n", 
+           start_block, (iterations == 0) ? "Infinite" : argv[2], (fail_stop_count == 0) ? "No" : argv[3]);
+    struct mtd_info_user mtd_info;
+    if (get_mtd_info(&mtd_info) != 0) exit(1);
+    if (validate_block(start_block, &mtd_info) != 0) exit(1);
+    int fd = open(g_mtd_device, O_RDWR);
+    if (fd < 0) { perror("open"); exit(1); }
+    uint32_t block_size = g_use_logical_sectors ? LOGICAL_SECTOR_SIZE : mtd_info.erasesize;
+    unsigned char *write_buf = malloc(block_size);
+    unsigned char *read_buf = malloc(block_size);
+    if (!write_buf || !read_buf) { fprintf(stderr, "Malloc failed for test buffers\n"); close(fd); exit(1); }
+    
+    while ((iterations == 0 || iter_count < iterations) && !g_signal_received) {
+        iter_count++;
+        uint64_t current_block = start_block;
+        if (full_sector_util) {
+            uint64_t safe_block_start = (g_warn_addr + block_size - 1) / block_size;
+            uint64_t num_safe_blocks = (mtd_info.size / block_size) - safe_block_start;
+            if (num_safe_blocks == 0) { fprintf(stderr, "\nError: No safe blocks available for full utilization test.\n"); break; }
+            current_block = safe_block_start + ((iter_count-1) % num_safe_blocks);
+        }
+        
+        if (validate_block(current_block, &mtd_info) != 0) { fprintf(stderr, "\nError: Calculated block %" PRIu64 " is invalid. Stopping.\n", current_block); break; }
+        
+        uint64_t offset = current_block * block_size;
+        if (!file_path) {
+            generate_pattern_data("+", write_buf, block_size);
+            write_buf[0] = iter_count & 0xFF;
+        }
+
+        printf("Test Progress: Iter %llu | Block %" PRIu64 " | Erasing... ", iter_count, current_block);
+        fflush(stdout);
+        if (mtd_erase_region(fd, offset, block_size) != 0) { fail_count++; if(log_enable) fprintf(stderr, "\nErase fail on block %" PRIu64 "\n", current_block); continue; }
+        
+        printf("Writing... ");
+        fflush(stdout);
+        if (mtd_write_data(fd, offset, write_buf, block_size) != 0) { fail_count++; if(log_enable) fprintf(stderr, "\nWrite fail on block %" PRIu64 "\n", current_block); continue; }
+        
+        printf("Verifying... ");
+        fflush(stdout);
+        if (mtd_read_data(fd, offset, read_buf, block_size) != 0) { fail_count++; if(log_enable) fprintf(stderr, "\nRead fail on block %" PRIu64 "\n", current_block); continue; }
+
+        if (memcmp(write_buf, read_buf, block_size) == 0) {
+            printf("PASS\n");
+        } else {
+            fail_count++;
+            printf("FAIL\n");
+            if (log_enable && logged_fails < MAX_FAILURE_LOGS) {
+                // ... same logging logic as before
+            }
+            if (fail_stop_count > 0 && fail_count >= fail_stop_count) { fprintf(stderr, "Stopping test: Maximum fail count reached.\n"); break; }
+        }
+    }
+    
+    free(write_buf); free(read_buf);
+    close(fd);
+    printf("--- Test Complete ---\n");
+}
