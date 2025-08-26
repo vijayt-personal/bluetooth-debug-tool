@@ -1,4 +1,4 @@
-// --- flash_backend_mtd-user.c (UPDATED to match mtd-utils logic) ---
+// --- flash_backend_mtd-user.c (UPDATED with mtd-utils block-looping logic) ---
 // This file is compiled only if USE_LIBMTD is NOT defined.
 #ifndef USE_LIBMTD
 
@@ -15,8 +15,7 @@
 #define FD_FROM_HANDLE(h) ((int)(intptr_t)(h))
 
 FlashHandle flash_open(const char *device_path) {
-    // mtd-utils itself doesn't always use O_SYNC, relying on the blocking ioctl.
-    // We will keep it as it's good practice for ensuring data hits the device.
+    // Open with O_SYNC to request cached I/O to be written to the underlying device.
     int fd = open(device_path, O_RDWR | O_SYNC);
     if (fd < 0) {
         LOG_ERROR("Failed to open MTD device '%s': %s", device_path, strerror(errno));
@@ -41,40 +40,50 @@ int flash_get_info(FlashHandle handle, mtd_info_t *mtd_info) {
 
 int flash_erase(FlashHandle handle, uint32_t offset, uint32_t len) {
     int fd = FD_FROM_HANDLE(handle);
-    int ret = 0;
+    mtd_info_t mtd_info;
+    if (flash_get_info(handle, &mtd_info) != 0) {
+        return -1;
+    }
 
-    // 1. Unlock the region
+    // 1. Unlock the entire region first.
     erase_info_t unlock_info = { .start = offset, .length = len };
-    LOG_INFO("Unlocking region at 0x%08X (length %u)...", offset, len);
+    LOG_INFO("Unlocking region from 0x%08X to 0x%08X...", offset, offset + len - 1);
     if (ioctl(fd, MEMUNLOCK, &unlock_info) != 0) {
-        LOG_WARN("MEMUNLOCK failed: %s. Proceeding anyway.", strerror(errno));
+        LOG_WARN("MEMUNLOCK failed: %s. This may be acceptable if locking is not supported.", strerror(errno));
     }
 
-    // 2. Erase the region
-    erase_info_t erase_info = { .start = offset, .length = len };
-    LOG_INFO("Erasing %u bytes at 0x%08X...", len, offset);
-    if (ioctl(fd, MEMERASE, &erase_info) != 0) {
-        LOG_ERROR("MEMERASE ioctl failed for offset 0x%08X: %s", offset, strerror(errno));
-        ret = -1; // Mark as failed, but still try to re-lock.
+    // 2. *** CRITICAL CHANGE: Loop and erase ONE BLOCK AT A TIME. ***
+    // This is the core logic of the official `flash_erase` utility. It avoids
+    // driver limitations on erasing large, contiguous chunks.
+    uint32_t current_offset = offset;
+    uint32_t end_offset = offset + len;
+    while (current_offset < end_offset) {
+        LOG_INFO("Erasing block at 0x%08X (size 0x%X)...", current_offset, mtd_info.erasesize);
+        
+        erase_info_t erase_block_info = {
+            .start = current_offset,
+            .length = mtd_info.erasesize
+        };
+
+        // The MEMERASE ioctl is blocking.
+        if (ioctl(fd, MEMERASE, &erase_block_info) != 0) {
+            LOG_ERROR("MEMERASE ioctl failed for block at 0x%08X: %s", current_offset, strerror(errno));
+            // We do not attempt to re-lock, just report failure.
+            return -1;
+        }
+
+        current_offset += mtd_info.erasesize;
     }
 
-    // 3. Re-lock the region for safety, even if erase failed.
-    // This is the standard practice in mtd-utils.
-    erase_info_t lock_info = { .start = offset, .length = len };
-    LOG_INFO("Re-locking region at 0x%08X (length %u)...", offset, len);
-    if (ioctl(fd, MEMLOCK, &lock_info) != 0) {
-        LOG_WARN("MEMLOCK failed: %s. This may be normal.", strerror(errno));
-    }
-
-    return ret;
+    LOG_INFO("Finished erasing range.");
+    return 0;
 }
 
 int flash_write(FlashHandle handle, uint32_t offset, const uint8_t *data, size_t size) {
     int fd = FD_FROM_HANDLE(handle);
 
-    // Use pwrite() instead of lseek() + write().
-    // pwrite is atomic and doesn't move the file offset, which is more robust.
-    // This is the method used by nandwrite in mtd-utils.
+    // Use pwrite() for an atomic write to a specific offset.
+    // This avoids a separate lseek() and is the method used by `nandwrite`.
     ssize_t written_bytes = pwrite(fd, data, size, offset);
     
     if (written_bytes < 0) {
@@ -91,7 +100,7 @@ int flash_write(FlashHandle handle, uint32_t offset, const uint8_t *data, size_t
 int flash_read(FlashHandle handle, uint32_t offset, uint8_t *buffer, size_t size) {
     int fd = FD_FROM_HANDLE(handle);
 
-    // Use pread() for consistency with pwrite().
+    // Use pread() for an atomic read from a specific offset.
     ssize_t read_bytes = pread(fd, buffer, size, offset);
 
     if (read_bytes < 0) {
