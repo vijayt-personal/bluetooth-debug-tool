@@ -4080,3 +4080,118 @@ void handle_flash_write_verify(int argc, char *argv[]) {
     close(fd);
     printf("--- Test Complete ---\n");
 }
+
+// --- flash_backend_mtd-user.c (UPDATED with MEMUNLOCK) ---
+// This file is compiled only if USE_LIBMTD is NOT defined.
+#ifndef USE_LIBMTD
+
+#include "flash_backend.h"
+#include "logger.h"
+#include <fcntl.h>
+#include <unistd.h>
+#include <string.h>
+#include <sys/ioctl.h>
+#include <errno.h>
+#include <stdint.h>
+
+// For this backend, the FlashHandle is just an int file descriptor.
+// We cast it back and forth for type safety.
+#define FD_FROM_HANDLE(h) ((int)(intptr_t)(h))
+
+FlashHandle flash_open(const char *device_path) {
+    // O_SYNC is crucial for NOR flash to ensure operations are not just cached.
+    int fd = open(device_path, O_RDWR | O_SYNC);
+    if (fd < 0) {
+        LOG_ERROR("Failed to open MTD device '%s': %s", device_path, strerror(errno));
+        return NULL;
+    }
+    // Return the fd cast to a handle
+    return (FlashHandle)(intptr_t)fd;
+}
+
+void flash_close(FlashHandle handle) {
+    if (handle) {
+        close(FD_FROM_HANDLE(handle));
+    }
+}
+
+int flash_get_info(FlashHandle handle, mtd_info_t *mtd_info) {
+    if (ioctl(FD_FROM_HANDLE(handle), MEMGETINFO, mtd_info) != 0) {
+        LOG_ERROR("Failed to get MTD device info: %s", strerror(errno));
+        return -1;
+    }
+    return 0;
+}
+
+int flash_erase(FlashHandle handle, uint32_t offset, uint32_t len) {
+    int fd = FD_FROM_HANDLE(handle);
+    
+    // *** NEW: Unlock the region before erasing. ***
+    // This is the standard practice used by the official mtd-utils.
+    // If a region is locked, the erase ioctl may return success
+    // but the hardware will silently ignore the command.
+    erase_info_t unlock_info = { .start = offset, .length = len };
+    LOG_INFO("Attempting to unlock region at 0x%08X (length %u)...", offset, len);
+    if (ioctl(fd, MEMUNLOCK, &unlock_info) != 0) {
+        // This is not always a fatal error. The device may not support locking,
+        // or the region may already be unlocked. We log a warning and proceed.
+        LOG_WARN("MEMUNLOCK failed: %s. This may be normal if locking is not supported.", strerror(errno));
+    } else {
+        LOG_INFO("Region unlocked successfully.");
+    }
+
+    // Now, perform the erase operation.
+    erase_info_t erase_info = { .start = offset, .length = len };
+    LOG_INFO("Erasing %u bytes at 0x%08X...", len, offset);
+    if (ioctl(fd, MEMERASE, &erase_info) != 0) {
+        LOG_ERROR("MEMERASE ioctl failed for offset 0x%08X: %s", offset, strerror(errno));
+        return -1;
+    }
+
+    // Force synchronization to ensure the operation completes.
+    if (fsync(fd) != 0) {
+        LOG_WARN("fsync after erase failed: %s. Erase may not be complete.", strerror(errno));
+    }
+    usleep(1000); // Small delay for hardware to settle.
+
+    return 0;
+}
+
+int flash_write(FlashHandle handle, uint32_t offset, const uint8_t *data, size_t size) {
+    int fd = FD_FROM_HANDLE(handle);
+    if (lseek(fd, offset, SEEK_SET) < 0) {
+        LOG_ERROR("lseek failed for write at offset 0x%08X: %s", offset, strerror(errno));
+        return -1;
+    }
+    ssize_t written_bytes = write(fd, data, size);
+    if (written_bytes < 0) {
+        LOG_ERROR("write failed at offset 0x%08X: %s", offset, strerror(errno));
+        return -1;
+    }
+    if ((size_t)written_bytes != size) {
+        LOG_WARN("Incomplete write. Wrote %zd of %zu bytes.", written_bytes, size);
+        return -1;
+    }
+    return 0;
+}
+
+int flash_read(FlashHandle handle, uint32_t offset, uint8_t *buffer, size_t size) {
+    int fd = FD_FROM_HANDLE(handle);
+    if (lseek(fd, offset, SEEK_SET) < 0) {
+        LOG_ERROR("lseek failed for read at offset 0x%08X: %s", offset, strerror(errno));
+        return -1;
+    }
+    ssize_t read_bytes = read(fd, buffer, size);
+    if (read_bytes < 0) {
+        LOG_ERROR("read failed at offset 0x%08X: %s", offset, strerror(errno));
+        return -1;
+    }
+    if ((size_t)read_bytes != size) {
+        LOG_WARN("Incomplete read. Read %zd of %zu bytes.", read_bytes, size);
+        return -1;
+    }
+    return 0;
+}
+
+#endif // !USE_LIBMTD
+
