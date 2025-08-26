@@ -1,0 +1,948 @@
+#
+# Makefile for the flash-tool application
+#
+
+# Cross-compiler prefix (e.g., aarch64-linux-gnu-)
+CROSS_COMPILE ?=
+
+CC := $(CROSS_COMPILE)gcc
+
+# CFLAGS: Warning flags, optimization, and standard C version
+CFLAGS := -Wall -Wextra -O2 -g -std=c99
+
+# LDFLAGS: Linker flags
+LDFLAGS :=
+
+# Target executable name
+TARGET := flash-tool
+
+# --- Backend Selection ---
+# Set USE_LIBMTD=1 to build with the libmtd backend.
+# The default is 0, which uses the mtd-user (ioctl) backend.
+# Example usage:
+#   make                  (builds with ioctl)
+#   make USE_LIBMTD=1     (builds with libmtd)
+USE_LIBMTD ?= 0
+
+# Common source files
+SRCS := main.c logger.c utils.c
+
+# Add backend-specific sources and flags
+ifeq ($(USE_LIBMTD), 1)
+    CFLAGS += -DUSE_LIBMTD
+    SRCS += flash_backend_libmtd.c
+    LDFLAGS += -lmtd
+    # Use a different message for clarity
+    MESSAGE = "Building with libmtd backend..."
+else
+    SRCS += flash_backend_mtd-user.c
+    MESSAGE = "Building with mtd-user (ioctl) backend..."
+endif
+
+# Object files derived from source files
+OBJS := $(SRCS:.c=.o)
+
+.PHONY: all clean
+
+all: $(TARGET)
+
+$(TARGET): $(OBJS)
+	@echo $(MESSAGE)
+	$(CC) $(LDFLAGS) -o $@ $^
+	@echo "Build complete: $(TARGET)"
+
+%.o: %.c
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+clean:
+	rm -f $(OBJS) $(TARGET)
+
+# --- logger.h ---
+#ifndef LOGGER_H
+#define LOGGER_H
+
+#include <stdio.h>
+#include <stdarg.h>
+#include <strings.h> // For strcasecmp
+
+// Log levels
+typedef enum {
+    LOG_DEBUG,
+    LOG_INFO,
+    LOG_WARN,
+    LOG_ERROR
+} LogLevel;
+
+// Set the minimum level to be logged
+void logger_set_level(LogLevel level);
+
+// Get a log level enum from a string
+LogLevel logger_get_level_from_string(const char* level_str);
+
+// The main logging function
+void logger_log(LogLevel level, const char *file, int line, const char *fmt, ...);
+
+// Macros to make logging easier
+#define LOG_DEBUG(...) logger_log(LOG_DEBUG, __FILE__, __LINE__, __VA_ARGS__)
+#define LOG_INFO(...)  logger_log(LOG_INFO,  __FILE__, __LINE__, __VA_ARGS__)
+#define LOG_WARN(...)  logger_log(LOG_WARN,  __FILE__, __LINE__, __VA_ARGS__)
+#define LOG_ERROR(...) logger_log(LOG_ERROR, __FILE__, __LINE__, __VA_ARGS__)
+
+// Regular printf-style info for uncontrolled logs (always prints)
+#define PRINT_INFO(...) do { printf(__VA_ARGS__); fflush(stdout); } while(0)
+
+#endif // LOGGER_H
+
+# --- logger.c ---
+#include "logger.h"
+#include <time.h>
+#include <string.h>
+
+// Default log level is ERROR, only showing critical failures and regular output.
+static LogLevel current_level = LOG_ERROR;
+
+void logger_set_level(LogLevel level) {
+    current_level = level;
+}
+
+LogLevel logger_get_level_from_string(const char* level_str) {
+    if (strcasecmp(level_str, "debug") == 0) return LOG_DEBUG;
+    if (strcasecmp(level_str, "info") == 0) return LOG_INFO;
+    if (strcasecmp(level_str, "warn") == 0) return LOG_WARN;
+    if (strcasecmp(level_str, "error") == 0) return LOG_ERROR;
+    // Default to ERROR if the string is unrecognized
+    fprintf(stderr, "Unrecognized log level '%s', defaulting to 'error'.\n", level_str);
+    return LOG_ERROR;
+}
+
+void logger_log(LogLevel level, const char *file, int line, const char *fmt, ...) {
+    if (level < current_level) {
+        return;
+    }
+
+    // Get current time for timestamp
+    time_t timer;
+    char time_buf[26];
+    struct tm* tm_info;
+    time(&timer);
+    tm_info = localtime(&timer);
+    strftime(time_buf, 26, "%Y-%m-%d %H:%M:%S", tm_info);
+
+    // Print level-specific, colored header to stderr
+    switch (level) {
+        case LOG_DEBUG: fprintf(stderr, "%s [\x1b[36mDEBUG\x1b[0m] ", time_buf); break;
+        case LOG_INFO:  fprintf(stderr, "%s [\x1b[32mINFO\x1b[0m]  ", time_buf); break;
+        case LOG_WARN:  fprintf(stderr, "%s [\x1b[33mWARN\x1b[0m]  ", time_buf); break;
+        case LOG_ERROR: fprintf(stderr, "%s [\x1b[31mERROR\x1b[0m] ", time_buf); break;
+    }
+
+    // Print the actual log message
+    va_list args;
+    va_start(args, fmt);
+    vfprintf(stderr, fmt, args);
+    va_end(args);
+
+    // Append file and line info for debug and error messages for easier troubleshooting
+    if (level == LOG_DEBUG || level == LOG_ERROR) {
+        fprintf(stderr, " (\x1b[90m%s:%d\x1b[0m)", file, line);
+    }
+
+    fprintf(stderr, "\n");
+    fflush(stderr);
+}
+
+# --- utils.h ---
+#ifndef UTILS_H
+#define UTILS_H
+
+#include <stdint.h>
+#include <stddef.h>
+
+// Dumps a block of memory in a classic hex format to stdout.
+void hex_dump(const char *desc, const void *addr, int len);
+
+// Generates a data pattern in the provided buffer based on a string.
+// Supports "+", "-", or a hex value like "A5".
+// Returns 0 on success, -1 on failure.
+int generate_pattern(uint8_t *buffer, size_t size, const char *pattern_str);
+
+#endif // UTILS_H
+
+# --- utils.c ---
+#include "utils.h"
+#include "logger.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <ctype.h>
+
+void hex_dump(const char *desc, const void *addr, int len) {
+    int i;
+    unsigned char buff[17];
+    const unsigned char *pc = (const unsigned char *)addr;
+
+    if (desc != NULL) {
+        PRINT_INFO("%s:\n", desc);
+    }
+
+    if (len <= 0) {
+        PRINT_INFO("  (empty)\n");
+        return;
+    }
+
+    // Process every byte in the data.
+    for (i = 0; i < len; i++) {
+        // At the beginning of each 16-byte line, print the offset.
+        if ((i % 16) == 0) {
+            if (i != 0)
+                PRINT_INFO("  %s\n", buff);
+            PRINT_INFO("  %04x ", i);
+        }
+
+        // Print the hex code for the current byte.
+        PRINT_INFO(" %02x", pc[i]);
+
+        // And store a printable ASCII character for later.
+        if ((pc[i] < 0x20) || (pc[i] > 0x7e))
+            buff[i % 16] = '.';
+        else
+            buff[i % 16] = pc[i];
+        buff[(i % 16) + 1] = '\0';
+    }
+
+    // Pad out the last line if it's not 16 bytes long.
+    while ((i % 16) != 0) {
+        PRINT_INFO("   ");
+        i++;
+    }
+
+    // And print the final ASCII buffer.
+    PRINT_INFO("  %s\n", buff);
+}
+
+int generate_pattern(uint8_t *buffer, size_t size, const char *pattern_str) {
+    if (strcmp(pattern_str, "+") == 0) {
+        LOG_INFO("Generating ascending pattern...");
+        for (size_t i = 0; i < size; i++) {
+            buffer[i] = i & 0xFF;
+        }
+    } else if (strcmp(pattern_str, "-") == 0) {
+        LOG_INFO("Generating descending pattern...");
+        for (size_t i = 0; i < size; i++) {
+            buffer[i] = 0xFF - (i & 0xFF);
+        }
+    } else {
+        LOG_INFO("Generating user-defined hex pattern '0x%s'...", pattern_str);
+        char *endptr;
+        long val = strtol(pattern_str, &endptr, 16);
+        if (*endptr != '\0' || val < 0 || val > 0xFF) {
+            LOG_ERROR("Invalid hex pattern value: %s. Must be a hex value between 00 and FF.", pattern_str);
+            return -1;
+        }
+        memset(buffer, (uint8_t)val, size);
+    }
+    return 0;
+}
+
+# --- flash_backend.h ---
+#ifndef FLASH_BACKEND_H
+#define FLASH_BACKEND_H
+
+#include <mtd/mtd-user.h>
+#include <stdint.h>
+#include <stdbool.h>
+
+// Opaque handle for the backend to hide implementation details (fd vs libmtd_desc).
+typedef void* FlashHandle;
+
+// Opens the MTD device. Returns a handle on success, NULL on failure.
+FlashHandle flash_open(const char *device_path);
+
+// Closes the MTD device.
+void flash_close(FlashHandle handle);
+
+// Gets MTD device information.
+int flash_get_info(FlashHandle handle, mtd_info_t *mtd_info);
+
+// Erases a region of the flash.
+int flash_erase(FlashHandle handle, uint32_t offset, uint32_t len);
+
+// Writes data to the flash.
+int flash_write(FlashHandle handle, uint32_t offset, const uint8_t *data, size_t size);
+
+// Reads data from the flash.
+int flash_read(FlashHandle handle, uint32_t offset, uint8_t *buffer, size_t size);
+
+#endif // FLASH_BACKEND_H
+
+# --- flash_backend_mtd-user.c ---
+// This file is compiled only if USE_LIBMTD is NOT defined.
+#ifndef USE_LIBMTD
+
+#include "flash_backend.h"
+#include "logger.h"
+#include <fcntl.h>
+#include <unistd.h>
+#include <string.h>
+#include <sys/ioctl.h>
+#include <errno.h>
+#include <stdint.h>
+
+// For this backend, the FlashHandle is just an int file descriptor.
+// We cast it back and forth for type safety.
+#define FD_FROM_HANDLE(h) ((int)(intptr_t)(h))
+
+FlashHandle flash_open(const char *device_path) {
+    // O_SYNC is crucial for NOR flash to ensure operations are not just cached.
+    int fd = open(device_path, O_RDWR | O_SYNC);
+    if (fd < 0) {
+        LOG_ERROR("Failed to open MTD device '%s': %s", device_path, strerror(errno));
+        return NULL;
+    }
+    // Return the fd cast to a handle
+    return (FlashHandle)(intptr_t)fd;
+}
+
+void flash_close(FlashHandle handle) {
+    if (handle) {
+        close(FD_FROM_HANDLE(handle));
+    }
+}
+
+int flash_get_info(FlashHandle handle, mtd_info_t *mtd_info) {
+    if (ioctl(FD_FROM_HANDLE(handle), MEMGETINFO, mtd_info) != 0) {
+        LOG_ERROR("Failed to get MTD device info: %s", strerror(errno));
+        return -1;
+    }
+    return 0;
+}
+
+int flash_erase(FlashHandle handle, uint32_t offset, uint32_t len) {
+    erase_info_t erase_info = { .start = offset, .length = len };
+    LOG_INFO("Erasing %u bytes at 0x%08X for erase operation...", len, offset);
+    if (ioctl(FD_FROM_HANDLE(handle), MEMERASE, &erase_info) != 0) {
+        LOG_ERROR("MEMERASE failed for offset 0x%08X: %s", offset, strerror(errno));
+        return -1;
+    }
+    return 0;
+}
+
+int flash_write(FlashHandle handle, uint32_t offset, const uint8_t *data, size_t size) {
+    int fd = FD_FROM_HANDLE(handle);
+    if (lseek(fd, offset, SEEK_SET) < 0) {
+        LOG_ERROR("lseek failed for write at offset 0x%08X: %s", offset, strerror(errno));
+        return -1;
+    }
+    ssize_t written_bytes = write(fd, data, size);
+    if (written_bytes < 0) {
+        LOG_ERROR("write failed at offset 0x%08X: %s", offset, strerror(errno));
+        return -1;
+    }
+    if ((size_t)written_bytes != size) {
+        LOG_WARN("Incomplete write. Wrote %zd of %zu bytes.", written_bytes, size);
+        return -1;
+    }
+    return 0;
+}
+
+int flash_read(FlashHandle handle, uint32_t offset, uint8_t *buffer, size_t size) {
+    int fd = FD_FROM_HANDLE(handle);
+    if (lseek(fd, offset, SEEK_SET) < 0) {
+        LOG_ERROR("lseek failed for read at offset 0x%08X: %s", offset, strerror(errno));
+        return -1;
+    }
+    ssize_t read_bytes = read(fd, buffer, size);
+    if (read_bytes < 0) {
+        LOG_ERROR("read failed at offset 0x%08X: %s", offset, strerror(errno));
+        return -1;
+    }
+    if ((size_t)read_bytes != size) {
+        LOG_WARN("Incomplete read. Read %zd of %zu bytes.", read_bytes, size);
+        return -1;
+    }
+    return 0;
+}
+
+#endif // !USE_LIBMTD
+
+# --- flash_backend_libmtd.c ---
+// This file is compiled only if USE_LIBMTD is defined.
+#ifdef USE_LIBMTD
+
+#include "flash_backend.h"
+#include "logger.h"
+#include <libmtd.h>
+#include <string.h>
+#include <errno.h>
+
+// For this backend, the FlashHandle is a pointer to a libmtd_desc struct.
+#define DESC_FROM_HANDLE(h) ((libmtd_desc*)(h))
+
+FlashHandle flash_open(const char *device_path) {
+    libmtd_desc *desc = NULL;
+    // The '1' means open in read-write mode.
+    if (libmtd_open(device_path, &desc, 1) < 0) {
+        LOG_ERROR("Failed to open MTD device '%s' with libmtd: %s", device_path, strerror(errno));
+        return NULL;
+    }
+    return (FlashHandle)desc;
+}
+
+void flash_close(FlashHandle handle) {
+    if (handle) {
+        libmtd_close(DESC_FROM_HANDLE(handle));
+    }
+}
+
+int flash_get_info(FlashHandle handle, mtd_info_t *mtd_info) {
+    const struct mtd_info *info = mtd_get_info(DESC_FROM_HANDLE(handle));
+    if (!info) {
+        LOG_ERROR("libmtd: Failed to get MTD device info.");
+        return -1;
+    }
+    // Copy info to the user's struct.
+    memcpy(mtd_info, info, sizeof(mtd_info_t));
+    return 0;
+}
+
+int flash_erase(FlashHandle handle, uint32_t offset, uint32_t len) {
+    struct mtd_info info;
+    if (flash_get_info(handle, &info) != 0) return -1;
+
+    // libmtd erases in whole blocks.
+    int start_block = offset / info.erasesize;
+    int num_blocks = len / info.erasesize;
+
+    LOG_INFO("Erasing %d block(s) starting from block %d...", num_blocks, start_block);
+
+    for (int i = 0; i < num_blocks; ++i) {
+        if (mtd_erase_block(DESC_FROM_HANDLE(handle), start_block + i) != 0) {
+            LOG_ERROR("libmtd: mtd_erase_block failed for block %d: %s", start_block + i, strerror(errno));
+            return -1;
+        }
+    }
+    return 0;
+}
+
+int flash_write(FlashHandle handle, uint32_t offset, const uint8_t *data, size_t size) {
+    // libmtd handles unaligned writes correctly.
+    if (mtd_write(DESC_FROM_HANDLE(handle), offset, data, size) != 0) {
+        LOG_ERROR("libmtd: mtd_write failed at offset 0x%08X: %s", offset, strerror(errno));
+        return -1;
+    }
+    return 0;
+}
+
+int flash_read(FlashHandle handle, uint32_t offset, uint8_t *buffer, size_t size) {
+    if (mtd_read(DESC_FROM_HANDLE(handle), offset, buffer, size) != 0) {
+        LOG_ERROR("libmtd: mtd_read failed at offset 0x%08X: %s", offset, strerror(errno));
+        return -1;
+    }
+    return 0;
+}
+
+#endif // USE_LIBMTD
+
+# --- main.c ---
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <getopt.h>
+#include <stdbool.h>
+
+#include "logger.h"
+#include "utils.h"
+#include "flash_backend.h"
+
+#define MAX_DATA_BUFFER_SIZE 256
+#define LOGICAL_SECTOR_SIZE (128 * 1024)
+
+// --- Global Options Struct ---
+typedef struct {
+    const char *mtd_dev;
+    uint32_t warn_addr;
+    bool use_logical_sectors;
+} global_opts_t;
+
+// --- Global State ---
+static global_opts_t g_opts = {
+    .mtd_dev = "/dev/mtd0",
+    .warn_addr = 0x200000,
+    .use_logical_sectors = false,
+};
+static mtd_info_t g_mtd_info;
+static uint8_t g_write_buffer[MAX_DATA_BUFFER_SIZE];
+static uint8_t g_read_buffer[MAX_DATA_BUFFER_SIZE];
+
+// --- Helper Functions ---
+
+// Checks if an operation crosses the user-defined warning address.
+void check_warn_addr(uint32_t offset, size_t size) {
+    uint32_t end_offset = offset + size;
+    if (offset < g_opts.warn_addr && end_offset > g_opts.warn_addr) {
+        LOG_WARN("Operation at 0x%X (size %zu) crosses the safety warning address 0x%X!", offset, size, g_opts.warn_addr);
+    }
+}
+
+// Returns the size of a 'block' based on the current addressing mode.
+uint32_t get_block_size() {
+    return g_opts.use_logical_sectors ? LOGICAL_SECTOR_SIZE : g_mtd_info.erasesize;
+}
+
+// Returns the name of a 'block' for printing.
+const char* get_block_term() {
+    return g_opts.use_logical_sectors ? "sector" : "block";
+}
+
+// --- Command Handlers ---
+
+int handle_info(FlashHandle handle) {
+    PRINT_INFO("MTD Device: %s\n", g_opts.mtd_dev);
+    PRINT_INFO("Addressing Mode: %s (%u bytes)\n", get_block_term(), get_block_size());
+    PRINT_INFO("----------------------------------\n");
+    PRINT_INFO("Type:         %s\n", (g_mtd_info.type == MTD_NORFLASH) ? "NOR" : "NAND/Other");
+    PRINT_INFO("Total Size:   %u bytes (%.2f MiB)\n", g_mtd_info.size, (double)g_mtd_info.size / (1024*1024));
+    PRINT_INFO("Erase Size:   %u bytes (%u KiB)\n", g_mtd_info.erasesize, g_mtd_info.erasesize / 1024);
+    PRINT_INFO("Write Size:   %u bytes\n", g_mtd_info.writesize);
+    return 0;
+}
+
+int handle_flash_write(FlashHandle handle, int argc, char *argv[]) {
+    bool do_erase = true;
+    int opt_idx = 2; // Start parsing after "flash write"
+
+    if (argc > 2 && strcmp(argv[opt_idx], "--no-erase") == 0) {
+        do_erase = false;
+        opt_idx++;
+    }
+
+    if ((argc - opt_idx) < 4) {
+        LOG_ERROR("Usage: flash write [--no-erase] <type> <pattern> <block> <size>");
+        return 1;
+    }
+
+    const char *pattern = argv[opt_idx + 1];
+    long block = strtol(argv[opt_idx + 2], NULL, 10);
+    long size = strtol(argv[opt_idx + 3], NULL, 10);
+
+    if (size <= 0 || size > MAX_DATA_BUFFER_SIZE) {
+        LOG_ERROR("Invalid size. Must be between 1 and %d.", MAX_DATA_BUFFER_SIZE);
+        return 1;
+    }
+
+    uint32_t offset = block * get_block_size();
+    check_warn_addr(offset, size);
+
+    if ((offset + size) > g_mtd_info.size) {
+        LOG_ERROR("Write operation exceeds flash boundary.");
+        return 1;
+    }
+
+    if (generate_pattern(g_write_buffer, size, pattern) != 0) return 1;
+
+    if (do_erase) {
+        // Align the erase operation to the physical erase block boundaries.
+        uint32_t erase_start = (offset / g_mtd_info.erasesize) * g_mtd_info.erasesize;
+        uint32_t erase_end_addr = offset + size;
+        uint32_t erase_len = ((erase_end_addr - 1) / g_mtd_info.erasesize + 1) * g_mtd_info.erasesize - erase_start;
+
+        LOG_INFO("Erasing %u bytes at 0x%X for write operation...", erase_len, erase_start);
+        if (flash_erase(handle, erase_start, erase_len) != 0) {
+            LOG_ERROR("Pre-write erase failed.");
+            return 1;
+        }
+    }
+
+    LOG_INFO("Writing %ld bytes to %s %ld (offset 0x%08X)...", size, get_block_term(), block, offset);
+    if (flash_write(handle, offset, g_write_buffer, size) == 0) {
+        PRINT_INFO("Write successful.\n");
+        return 0;
+    }
+    LOG_ERROR("Write failed.");
+    return 1;
+}
+
+int handle_flash_read(FlashHandle handle, int argc, char *argv[]) {
+    if (argc != 5) {
+        LOG_ERROR("Usage: flash read <type> <block> <size>");
+        return 1;
+    }
+
+    long block = strtol(argv[3], NULL, 10);
+    long size = strtol(argv[4], NULL, 10);
+
+    if (size <= 0 || size > MAX_DATA_BUFFER_SIZE) {
+        LOG_ERROR("Invalid size. Must be between 1 and %d.", MAX_DATA_BUFFER_SIZE);
+        return 1;
+    }
+
+    uint32_t offset = block * get_block_size();
+    check_warn_addr(offset, size);
+
+    if ((offset + size) > g_mtd_info.size) {
+        LOG_ERROR("Read operation exceeds flash boundary.");
+        return 1;
+    }
+
+    LOG_INFO("Reading %ld bytes from %s %ld (offset 0x%08X)...", size, get_block_term(), block, offset);
+    if (flash_read(handle, offset, g_read_buffer, size) == 0) {
+        PRINT_INFO("Read successful.\n");
+        hex_dump("Data Read", g_read_buffer, size);
+        return 0;
+    }
+    LOG_ERROR("Read failed.");
+    return 1;
+}
+
+int handle_flash_erase(FlashHandle handle, int argc, char *argv[]) {
+    if (argc < 3) {
+        LOG_ERROR("Usage: flash erase <type|chip> [<start_block> <end_block>]");
+        return 1;
+    }
+    const char* type = argv[2];
+
+    // Chip Erase
+    if (strcasecmp(type, "chip") == 0 || strcmp(type, "C") == 0) {
+        LOG_WARN("!!! Starting CHIP ERASE of %s !!!", g_opts.mtd_dev);
+        check_warn_addr(0, g_mtd_info.size);
+        if (flash_erase(handle, 0, g_mtd_info.size) == 0) {
+            PRINT_INFO("Chip erase successful.\n");
+            return 0;
+        }
+        LOG_ERROR("Chip erase failed.");
+        return 1;
+    }
+
+    if (argc != 5) {
+        LOG_ERROR("Usage: flash erase <type> <start_block> <end_block>");
+        return 1;
+    }
+
+    long start_block = strtol(argv[3], NULL, 10);
+    long end_block = strtol(argv[4], NULL, 10);
+
+    uint32_t start_offset = start_block * get_block_size();
+    uint32_t end_offset = (end_block + 1) * get_block_size();
+    uint32_t erase_len = end_offset - start_offset;
+
+    if (start_offset % g_mtd_info.erasesize != 0 || erase_len % g_mtd_info.erasesize != 0) {
+        LOG_ERROR("Erase region is not aligned to physical erase block size (%u bytes).", g_mtd_info.erasesize);
+        LOG_ERROR("Calculated Start Offset: 0x%X, Length: 0x%X", start_offset, erase_len);
+        return 1;
+    }
+
+    check_warn_addr(start_offset, erase_len);
+
+    LOG_INFO("Erasing %s from %ld to %ld (offsets 0x%X - 0x%X)...", get_block_term(), start_block, end_block, start_offset, end_offset - 1);
+    if (flash_erase(handle, start_offset, erase_len) == 0) {
+        PRINT_INFO("Sector erase successful.\n");
+        return 0;
+    }
+    LOG_ERROR("Sector erase failed.");
+    return 1;
+}
+
+void print_usage(const char *prog_name) {
+    PRINT_INFO("Usage: %s [GLOBAL OPTIONS] <COMMAND> [ARGS...]\n", prog_name);
+    PRINT_INFO("\nGLOBAL OPTIONS:\n");
+    PRINT_INFO("  --mtd-dev <path>       Specify MTD device (default: /dev/mtd0)\n");
+    PRINT_INFO("  --warn-addr <hex>      Set safety warning address (default: 0x200000)\n");
+    PRINT_INFO("  --use-logical-sectors  Use 128KB logical sectors instead of physical erase blocks\n");
+    PRINT_INFO("  --log-level <level>    Set log level: debug, info, warn, error (default: error)\n");
+    PRINT_INFO("  --help, -h             Show this help message\n");
+    PRINT_INFO("\nCOMMANDS:\n");
+    PRINT_INFO("  info\n");
+    PRINT_INFO("  flash write [--no-erase] <type> <pattern> <block> <size>\n");
+    PRINT_INFO("  flash read <type> <block> <size>\n");
+    PRINT_INFO("  flash erase <type|chip> [<start_block> <end_block>]\n");
+}
+
+int main(int argc, char *argv[]) {
+    int opt;
+    const struct option long_opts[] = {
+        {"mtd-dev", required_argument, NULL, 'd'},
+        {"warn-addr", required_argument, NULL, 'w'},
+        {"use-logical-sectors", no_argument, NULL, 'l'},
+        {"log-level", required_argument, NULL, 'g'},
+        {"help", no_argument, NULL, 'h'},
+        {NULL, 0, NULL, 0}
+    };
+
+    // Parse global options that come before the command
+    while ((opt = getopt_long(argc, argv, "d:w:lg:h", long_opts, NULL)) != -1) {
+        switch (opt) {
+            case 'd': g_opts.mtd_dev = optarg; break;
+            case 'w': g_opts.warn_addr = strtoul(optarg, NULL, 16); break;
+            case 'l': g_opts.use_logical_sectors = true; break;
+            case 'g': logger_set_level(logger_get_level_from_string(optarg)); break;
+            case 'h': print_usage(argv[0]); return 0;
+            default: print_usage(argv[0]); return 1;
+        }
+    }
+
+    // Remaining args are the command and its arguments
+    int cmd_argc = argc - optind;
+    char **cmd_argv = argv + optind;
+
+    if (cmd_argc == 0) {
+        LOG_ERROR("No command specified. Use --help for usage.");
+        return 1;
+    }
+
+    FlashHandle handle = flash_open(g_opts.mtd_dev);
+    if (!handle) {
+        return 1;
+    }
+    if (flash_get_info(handle, &g_mtd_info) != 0) {
+        flash_close(handle);
+        return 1;
+    }
+    LOG_INFO("Successfully opened MTD device: %s", g_opts.mtd_dev);
+
+    int ret = 0;
+    const char *command = cmd_argv[0];
+
+    if (strcmp(command, "info") == 0) {
+        ret = handle_info(handle);
+    } else if (strcmp(command, "flash") == 0) {
+        if (cmd_argc < 2) {
+            LOG_ERROR("Missing flash subcommand (read, write, erase).");
+            ret = 1;
+        } else {
+            const char *subcommand = cmd_argv[1];
+            if (strcmp(subcommand, "write") == 0) ret = handle_flash_write(handle, cmd_argc, cmd_argv);
+            else if (strcmp(subcommand, "read") == 0) ret = handle_flash_read(handle, cmd_argc, cmd_argv);
+            else if (strcmp(subcommand, "erase") == 0) ret = handle_flash_erase(handle, cmd_argc, cmd_argv);
+            else {
+                LOG_ERROR("Unknown flash subcommand: '%s'", subcommand);
+                ret = 1;
+            }
+        }
+    } else {
+        LOG_ERROR("Unknown command: '%s'", command);
+        ret = 1;
+    }
+
+    flash_close(handle);
+    return ret;
+}
+
+# --- flash-tool.bb ---
+# Location: meta-custom/recipes-utils/flash-tool/flash-tool.bb
+
+SUMMARY = "A command-line tool for interacting with MTD flash devices"
+DESCRIPTION = "Provides read, write, and erase functionality for NOR flash via the MTD subsystem. Supports multiple backends and addressing modes."
+LICENSE = "MIT"
+LIC_FILES_CHKSUM = "file://${COMMON_LICENSE_DIR}/MIT;md5=0835ade698e0bcf8506ecda2f7b4f302"
+
+# All source files are expected to be alongside this .bb file.
+SRC_URI = " \
+    file://main.c \
+    file://logger.c \
+    file://logger.h \
+    file://utils.c \
+    file://utils.h \
+    file://flash_backend.h \
+    file://flash_backend_mtd-user.c \
+    file://flash_backend_libmtd.c \
+    file://Makefile \
+"
+
+# The working directory for the build will be the source directory.
+S = "${WORKDIR}"
+
+# This recipe DEPENDS on mtd-utils. This ensures that libmtd and its headers
+# are available in the sysroot when this recipe is being compiled.
+# It does NOT mean you need to install anything on your host machine.
+DEPENDS = "mtd-utils"
+
+# By default, we build with the preferred libmtd backend.
+# This can be overridden in a .bbappend or local.conf by setting
+# FLASH_TOOL_BACKEND_pn-flash-tool = "mtd-user"
+FLASH_TOOL_BACKEND ?= "libmtd"
+
+# We pass the backend choice to the Makefile using EXTRA_OEMAKE.
+# The _append_... syntax is a conditional append based on the value of FLASH_TOOL_BACKEND.
+EXTRA_OEMAKE = ""
+EXTRA_OEMAKE_append_libmtd = "USE_LIBMTD=1"
+EXTRA_OEMAKE_append_mtd-user = "USE_LIBMTD=0"
+
+# This line dynamically selects the correct string to append based on the variable.
+EXTRA_OEMAKE += "${@d.getVar('EXTRA_OEMAKE_append_' + d.getVar('FLASH_TOOL_BACKEND'), True)}"
+
+# Inherit the 'make' class to handle the compilation using the provided Makefile.
+inherit make
+
+# The installation step.
+do_install() {
+    # Create the destination directory in the output image.
+    install -d ${D}${bindir}
+    # Install the compiled binary with execute permissions.
+    install -m 0755 ${B}/flash-tool ${D}${bindir}/
+}
+
+
+# --- flash-tool_%.bbappend ---
+# Location: meta-custom/recipes-utils/flash-tool/flash-tool_%.bbappend
+#
+# This file demonstrates how to override the default backend without
+# modifying the main .bb recipe. To use it, simply create this file
+# next to the original .bb file.
+
+# This line overrides the default '?=' assignment in the .bb file,
+# forcing the build to use the 'mtd-user' (ioctl) backend.
+FLASH_TOOL_BACKEND = "mtd-user"
+
+
+# MTD Flash Utility (flash-tool)
+
+A command-line utility for reading, writing, erasing, and testing MTD (Memory Technology Device) flash partitions on embedded Linux systems. It is designed to be scriptable and provides flexible addressing modes.
+
+## Features
+
+* **Multiple Backends**: Can be compiled to use either the standard `ioctl` interface (`mtd-user`) or the `libmtd` library from `mtd-utils`.
+* **Global Options**:
+    * Specify the target MTD device (`--mtd-dev`).
+    * Set a safety warning address to prevent accidental writes to critical areas (`--warn-addr`).
+    * Switch between physical erase block addressing and logical 128KB sector addressing (`--use-logical-sectors`).
+    * Control log verbosity (`--log-level`).
+* **Core Commands**:
+    * `info`: Display detailed information about the MTD partition.
+    * `flash write`: Write a data pattern to a block/sector, with an automatic pre-erase step.
+    * `flash read`: Read data from a block/sector and display a hex dump.
+    * `flash erase`: Erase a range of blocks/sectors or the entire chip.
+* **Safety**:
+    * Erase operations are checked for alignment with the physical erase block size.
+    * Writes automatically handle erasing the necessary blocks unless explicitly disabled (`--no-erase`).
+    * A warning is issued if an operation targets a sensitive, user-defined address.
+
+## Build Instructions
+
+### Standalone Compilation
+
+You must have the `mtd-utils` development libraries installed on your build system (e.g., `libmtd-dev` on Debian/Ubuntu).
+
+1.  **Clone/copy all source files** into a single directory.
+2.  **Choose a backend** and compile:
+
+    * **To build with the `libmtd` backend (Recommended):**
+        ```bash
+        make USE_LIBMTD=1
+        ```
+
+    * **To build with the `mtd-user` (ioctl) backend:**
+        ```bash
+        make
+        ```
+3.  The executable `flash-tool` will be created in the directory.
+
+### Yocto Project Integration
+
+1.  Place the `flash-tool.bb` recipe and all source files into a directory in your custom layer, for example:
+    `meta-custom/recipes-utils/flash-tool/`
+2.  Add the tool to your image by adding the following to your `local.conf` or a custom image recipe:
+    ```
+    IMAGE_INSTALL_append = " flash-tool"
+    ```
+3.  To change the backend from the default (`libmtd`), you can use a `.bbappend` file or set the variable in `local.conf`:
+    ```
+    # In local.conf, to switch to the ioctl backend
+    FLASH_TOOL_BACKEND_pn-flash-tool = "mtd-user"
+    ```
+4.  Build your image using BitBake:
+    ```bash
+    bitbake <your-image-name>
+    ```
+
+## Usage and Sample Output
+
+These examples assume the tool is on the target system's PATH.
+
+### 1. Displaying Partition Info
+
+This is the best first command to run to understand the device's geometry.
+
+**Command:**
+```bash
+flash-tool --mtd-dev /dev/mtd4 --log-level info info
+```
+
+**Sample Output:**
+```
+2025-08-26 13:15:01 [INFO]  Successfully opened MTD device: /dev/mtd4
+MTD Device: /dev/mtd4
+Addressing Mode: block (131072 bytes)
+----------------------------------
+Type:         NOR
+Total Size:   8388608 bytes (8.00 MiB)
+Erase Size:   131072 bytes (128 KiB)
+Write Size:   1 bytes
+```
+
+### 2. Erasing a Range of Physical Blocks
+
+**Command:**
+```bash
+flash-tool --mtd-dev /dev/mtd4 --log-level info flash erase Z 16 17
+```
+
+**Sample Output:**
+```
+2025-08-26 13:16:10 [INFO]  Successfully opened MTD device: /dev/mtd4
+2025-08-26 13:16:10 [INFO]  Erasing block from 16 to 17 (offsets 0x00200000 - 0x0023FFFF)...
+2025-08-26 13:16:10 [INFO]  Erasing 262144 bytes at 0x00200000 for erase operation...
+Sector erase successful.
+```
+
+### 3. Writing with Logical Sector Addressing
+
+This command writes an ascending pattern (`+`) to the 128KB logical sector #20. The tool automatically calculates the physical offset and performs the required pre-erase.
+
+**Command:**
+```bash
+flash-tool --mtd-dev /dev/mtd4 --log-level info --use-logical-sectors flash write P + 20 16
+```
+
+**Sample Output:**
+```
+2025-08-26 13:18:22 [INFO]  Successfully opened MTD device: /dev/mtd4
+2025-08-26 13:18:22 [INFO]  Erasing 131072 bytes at 0x00280000 for write operation...
+2025-08-26 13:18:22 [INFO]  Generating ascending pattern...
+2025-08-26 13:18:22 [INFO]  Writing 16 bytes to sector 20 (offset 0x00280000)...
+Write successful.
+```
+
+### 4. Reading Data
+
+This reads back the 16 bytes we just wrote.
+
+**Command:**
+```bash
+flash-tool --mtd-dev /dev/mtd4 --log-level info --use-logical-sectors flash read Y 20 16
+```
+
+**Sample Output:**
+```
+2025-08-26 13:19:05 [INFO]  Successfully opened MTD device: /dev/mtd4
+2025-08-26 13:19:05 [INFO]  Reading 16 bytes from sector 20 (offset 0x00280000)...
+Read successful.
+Data Read:
+  0000  00 01 02 03 04 05 06 07 08 09 0a 0b 0c 0d 0e 0f   ................
+```
+
+### 5. Chip Erase
+
+This command erases the entire MTD partition.
+
+**Command:**
+```bash
+flash-tool --mtd-dev /dev/mtd4 --log-level info flash erase chip
+```
+
+**Sample Output:**
+```
+2025-08-26 13:20:15 [INFO]  Successfully opened MTD device: /dev/mtd4
+2025-08-26 13:20:15 [WARN]  !!! Starting CHIP ERASE of /dev/mtd4 !!!
+2025-08-26 13:20:15 [INFO]  Erasing 8388608 bytes at 0x00000000 for erase operation...
+Chip erase successful.
