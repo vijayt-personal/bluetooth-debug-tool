@@ -1,0 +1,109 @@
+// --- flash_backend_mtd-user.c (UPDATED to match mtd-utils logic) ---
+// This file is compiled only if USE_LIBMTD is NOT defined.
+#ifndef USE_LIBMTD
+
+#include "flash_backend.h"
+#include "logger.h"
+#include <fcntl.h>
+#include <unistd.h>
+#include <string.h>
+#include <sys/ioctl.h>
+#include <errno.h>
+#include <stdint.h>
+
+// For this backend, the FlashHandle is just an int file descriptor.
+#define FD_FROM_HANDLE(h) ((int)(intptr_t)(h))
+
+FlashHandle flash_open(const char *device_path) {
+    // mtd-utils itself doesn't always use O_SYNC, relying on the blocking ioctl.
+    // We will keep it as it's good practice for ensuring data hits the device.
+    int fd = open(device_path, O_RDWR | O_SYNC);
+    if (fd < 0) {
+        LOG_ERROR("Failed to open MTD device '%s': %s", device_path, strerror(errno));
+        return NULL;
+    }
+    return (FlashHandle)(intptr_t)fd;
+}
+
+void flash_close(FlashHandle handle) {
+    if (handle) {
+        close(FD_FROM_HANDLE(handle));
+    }
+}
+
+int flash_get_info(FlashHandle handle, mtd_info_t *mtd_info) {
+    if (ioctl(FD_FROM_HANDLE(handle), MEMGETINFO, mtd_info) != 0) {
+        LOG_ERROR("Failed to get MTD device info: %s", strerror(errno));
+        return -1;
+    }
+    return 0;
+}
+
+int flash_erase(FlashHandle handle, uint32_t offset, uint32_t len) {
+    int fd = FD_FROM_HANDLE(handle);
+    int ret = 0;
+
+    // 1. Unlock the region
+    erase_info_t unlock_info = { .start = offset, .length = len };
+    LOG_INFO("Unlocking region at 0x%08X (length %u)...", offset, len);
+    if (ioctl(fd, MEMUNLOCK, &unlock_info) != 0) {
+        LOG_WARN("MEMUNLOCK failed: %s. Proceeding anyway.", strerror(errno));
+    }
+
+    // 2. Erase the region
+    erase_info_t erase_info = { .start = offset, .length = len };
+    LOG_INFO("Erasing %u bytes at 0x%08X...", len, offset);
+    if (ioctl(fd, MEMERASE, &erase_info) != 0) {
+        LOG_ERROR("MEMERASE ioctl failed for offset 0x%08X: %s", offset, strerror(errno));
+        ret = -1; // Mark as failed, but still try to re-lock.
+    }
+
+    // 3. Re-lock the region for safety, even if erase failed.
+    // This is the standard practice in mtd-utils.
+    erase_info_t lock_info = { .start = offset, .length = len };
+    LOG_INFO("Re-locking region at 0x%08X (length %u)...", offset, len);
+    if (ioctl(fd, MEMLOCK, &lock_info) != 0) {
+        LOG_WARN("MEMLOCK failed: %s. This may be normal.", strerror(errno));
+    }
+
+    return ret;
+}
+
+int flash_write(FlashHandle handle, uint32_t offset, const uint8_t *data, size_t size) {
+    int fd = FD_FROM_HANDLE(handle);
+
+    // Use pwrite() instead of lseek() + write().
+    // pwrite is atomic and doesn't move the file offset, which is more robust.
+    // This is the method used by nandwrite in mtd-utils.
+    ssize_t written_bytes = pwrite(fd, data, size, offset);
+    
+    if (written_bytes < 0) {
+        LOG_ERROR("pwrite failed at offset 0x%08X: %s", offset, strerror(errno));
+        return -1;
+    }
+    if ((size_t)written_bytes != size) {
+        LOG_WARN("Incomplete write. Wrote %zd of %zu bytes.", written_bytes, size);
+        return -1;
+    }
+    return 0;
+}
+
+int flash_read(FlashHandle handle, uint32_t offset, uint8_t *buffer, size_t size) {
+    int fd = FD_FROM_HANDLE(handle);
+
+    // Use pread() for consistency with pwrite().
+    ssize_t read_bytes = pread(fd, buffer, size, offset);
+
+    if (read_bytes < 0) {
+        LOG_ERROR("pread failed at offset 0x%08X: %s", offset, strerror(errno));
+        return -1;
+    }
+    if ((size_t)read_bytes != size) {
+        LOG_WARN("Incomplete read. Read %zd of %zu bytes.", read_bytes, size);
+        return -1;
+    }
+    return 0;
+}
+
+#endif // !USE_LIBMTD
+
