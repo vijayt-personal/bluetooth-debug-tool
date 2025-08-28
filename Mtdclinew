@@ -1400,3 +1400,1476 @@ int main(int argc, char *argv[])
 	return EXIT_SUCCESS;
 }
 
+/****************************************************************************
+ * FILE: src/include/config.h
+ ****************************************************************************/
+#ifndef CONFIG_H
+#define CONFIG_H
+
+/**
+ * @file config.h
+ * @brief Central configuration file for the flash tool.
+ * @details This header contains compile-time settings for the application,
+ * such as the default MTD device and backend selection.
+ */
+
+/**
+ * @brief Backend Selection
+ *
+ * Uncomment ONE of the following lines to select the backend at compile time.
+ * - BACKEND_LIBMDT: Uses the high-level libmtd library (recommended, default).
+ * - BACKEND_IOCTL:  Uses low-level direct ioctl calls.
+ */
+#define BACKEND_LIBMDT
+/* #define BACKEND_IOCTL */
+
+
+#define DEFAULT_MTD_DEVICE      "/dev/mtd0"     /**< @brief Default MTD device path if not specified via -d option. */
+#define MAX_CLI_INPUT_SIZE      1024            /**< @brief Maximum number of characters for a single line of CLI input. */
+#define MAX_CLI_ARGS            16              /**< @brief Maximum number of arguments (tokens) in a CLI command. */
+
+#endif /* CONFIG_H */
+
+
+/****************************************************************************
+ * FILE: src/include/logger.h
+ ****************************************************************************/
+#ifndef LOGGER_H
+#define LOGGER_H
+
+#include <stdio.h>
+
+/**
+ * @file logger.h
+ * @brief A dual-mode logging utility.
+ * @details Provides macros and functions for logging messages at different
+ * severity levels. The verbosity is controlled by a global variable that
+ * can be set at runtime.
+ */
+
+/**
+ * @enum log_level_t
+ * @brief Defines the different levels of logging severity.
+ */
+typedef enum {
+	LOG_LEVEL_DEBUG,    /**< Detailed debugging information. */
+	LOG_LEVEL_INFO,     /**< General informational messages. */
+	LOG_LEVEL_WARN,     /**< Warnings about potential issues. */
+	LOG_LEVEL_ERROR     /**< Error messages for failures. */
+} log_level_t;
+
+/**
+ * @brief Main logging macro.
+ * @details This macro checks the message's log level against the global
+ * log level variable before calling the logger function.
+ * @param level The log_level_t of the message.
+ * @param fmt The format string for the message.
+ * @param ... Variable arguments for the format string.
+ */
+#define LOG(level, fmt, ...) \
+	do { \
+		if (level >= logger_get_level()) { \
+			logger_log(level, __FILE__, __LINE__, fmt, ##__VA_ARGS__); \
+		} \
+	} while (0)
+
+/**
+ * @brief Logs a message to stderr.
+ * @param level The severity level of the message.
+ * @param file The source file where the log was generated.
+ * @param line The line number in the source file.
+ * @param fmt The format string.
+ * @param ... Variable arguments for the format string.
+ */
+void logger_log(log_level_t level, const char *file, int line,
+		const char *fmt, ...);
+
+/**
+ * @brief Sets the global logging level.
+ * @param new_level The new log_level_t to set.
+ */
+void logger_set_level(log_level_t new_level);
+
+/**
+ * @brief Gets the current global logging level.
+ * @return The current log_level_t.
+ */
+log_level_t logger_get_level(void);
+
+#endif /* LOGGER_H */
+
+
+/****************************************************************************
+ * FILE: src/include/utils.h
+ ****************************************************************************/
+#ifndef UTILS_H
+#define UTILS_H
+
+#include <stdint.h>
+#include <stddef.h>
+
+/**
+ * @file utils.h
+ * @brief Declaration of various helper functions.
+ */
+
+/**
+ * @brief Prints a block of memory in a hexadecimal and ASCII format.
+ * @param prefix A string to print at the beginning of each line.
+ * @param data Pointer to the data to be dumped.
+ * @param size The number of bytes to dump.
+ */
+void hexdump(const char *prefix, const void *data, size_t size);
+
+/**
+ * @brief Fills a buffer with a specified pattern.
+ * @param buffer The buffer to fill.
+ * @param size The size of the buffer.
+ * @param pattern The pattern to use ("+", "-", or a hex string like "0xAA").
+ * @return 0 on success, -1 on failure (e.g., invalid pattern).
+ */
+int generate_pattern(uint8_t *buffer, size_t size, const char *pattern);
+
+/**
+ * @brief Parses a string into a long integer.
+ * @details Supports decimal and hexadecimal (0x prefix) formats.
+ * @param str The string to parse.
+ * @param val Pointer to a long where the result will be stored.
+ * @return 0 on success, -1 on failure.
+ */
+int parse_number(const char *str, long *val);
+
+/**
+ * @brief Prompts the user for a yes/no confirmation.
+ * @param prompt The message to display to the user.
+ * @return 1 if the user confirms (y/Y), 0 otherwise.
+ */
+int get_user_confirmation(const char *prompt);
+
+#endif /* UTILS_H */
+
+
+/****************************************************************************
+ * FILE: src/include/flash_interface.h
+ ****************************************************************************/
+#ifndef FLASH_INTERFACE_H
+#define FLASH_INTERFACE_H
+
+#include <stdint.h>
+#include <stddef.h>
+
+/**
+ * @file flash_interface.h
+ * @brief Defines the abstract interface for flash backend operations.
+ * @details This file provides a generic structure (`flash_ops_t`) that defines
+ * the set of operations a flash backend must implement. This allows the core
+ * application logic to be independent of the underlying MTD access method
+ * (e.g., libmtd vs. ioctl).
+ */
+
+/**
+ * @struct flash_info
+ * @brief A simplified structure holding essential MTD device properties for the CLI.
+ * @details This abstracts the backend-specific info structures (like mtd_info_user)
+ * into a common format that the CLI can use without needing to know the
+ * backend implementation details.
+ */
+typedef struct flash_info {
+	uint64_t size;          /**< Total device size in bytes. */
+	uint32_t erasesize;     /**< Device erase block size in bytes. */
+} flash_info_t;
+
+/**
+ * @struct flash_ops
+ * @brief A structure of function pointers defining the flash backend interface.
+ */
+typedef struct flash_ops {
+	/**
+	 * @brief Initializes the flash backend and opens the MTD device.
+	 * @param device The path to the MTD device (e.g., "/dev/mtd0").
+	 * @return 0 on success, -1 on failure.
+	 */
+	int (*init)(const char *device);
+
+	/**
+	 * @brief De-initializes the backend and closes the MTD device.
+	 */
+	void (*deinit)(void);
+
+	/**
+	 * @brief Erases a region of the flash device.
+	 * @param offset The starting offset of the region to erase.
+	 * @param len The number of bytes to erase.
+	 * @return 0 on success, -1 on failure.
+	 */
+	int (*erase)(uint32_t offset, uint32_t len);
+
+	/**
+	 * @brief Writes data to the flash device.
+	 * @param offset The starting offset to write to.
+	 * @param data A pointer to the data buffer to write.
+	 * @param len The number of bytes to write.
+	 * @return 0 on success, -1 on failure.
+	 */
+	int (*write)(uint32_t offset, const void *data, size_t len);
+
+	/**
+	 * @brief Reads data from the flash device.
+	 * @param offset The starting offset to read from.
+	 * @param data A pointer to the buffer where read data will be stored.
+	 * @param len The number of bytes to read.
+	 * @return 0 on success, -1 on failure.
+	 */
+	int (*read)(uint32_t offset, void *data, size_t len);
+
+	/**
+	 * @brief Retrieves simplified information about the MTD device.
+	 * @param info A pointer to a `flash_info_t` struct to be filled.
+	 * @return 0 on success, -1 on failure.
+	 */
+	int (*get_info)(flash_info_t *info);
+} flash_ops_t;
+
+/**
+ * @brief A global pointer to the currently active flash backend implementation.
+ * @details This pointer is set by `backend_init()` based on the selection in `config.h`.
+ */
+extern const flash_ops_t *g_flash_backend;
+
+/**
+ * @brief Selects and initializes the global flash backend pointer.
+ */
+void backend_init(void);
+
+#endif /* FLASH_INTERFACE_H */
+
+
+/****************************************************************************
+ * FILE: src/include/cli.h
+ ****************************************************************************/
+#ifndef CLI_H
+#define CLI_H
+
+/**
+ * @file cli.h
+ * @brief Declarations for the command-line interface.
+ */
+
+/**
+ * @brief Parses and processes a command from the user.
+ * @param argc The number of arguments in the command.
+ * @param argv An array of strings containing the arguments.
+ */
+void cli_process_command(int argc, char *argv[]);
+
+/**
+ * @brief Prints the detailed help message to the console.
+ */
+void print_help(void);
+
+#endif /* CLI_H */
+
+
+/****************************************************************************
+ * FILE: src/backend/flash_libmtd.c
+ ****************************************************************************/
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <libmtd.h>
+#include <mtd/mtd-abi.h>
+#include "../include/flash_interface.h"
+#include "../include/logger.h"
+
+/**
+ * @file flash_libmtd.c
+ * @brief MTD backend implementation using the libmtd library.
+ * @details This backend is generally recommended as it uses the official,
+ * high-level library provided by the mtd-utils package. This implementation
+ * follows the modern libmtd API conventions.
+ */
+
+static libmtd_t mtd_desc;
+static struct mtd_dev_info mtd_dev_info;
+static int mtd_fd = -1;
+
+/**
+ * @brief Initializes the libmtd backend.
+ * @details This function initializes the libmtd library, opens the specified
+ * MTD device node to get a file descriptor, and then uses libmtd to query
+ * the device's properties.
+ * @see flash_ops_t::init
+ */
+static int mtd_backend_init(const char *device)
+{
+	if (mtd_desc) {
+		LOG(LOG_LEVEL_WARN, "libmtd backend already initialized.");
+		return 0;
+	}
+
+	// Step 1: Initialize the MTD library.
+	mtd_desc = libmtd_open();
+	if (!mtd_desc) {
+		LOG(LOG_LEVEL_ERROR, "Failed to open libmtd.");
+		return -1;
+	}
+
+	// Step 2: Open the device node to get a file descriptor for I/O.
+	mtd_fd = open(device, O_RDWR);
+	if (mtd_fd < 0) {
+		LOG(LOG_LEVEL_ERROR, "Failed to open MTD device node: %s", device);
+		libmtd_close(mtd_desc);
+		mtd_desc = NULL;
+		return -1;
+	}
+
+	// Step 3: Use libmtd to get detailed information about the device.
+	if (mtd_get_dev_info(mtd_desc, device, &mtd_dev_info) < 0) {
+		LOG(LOG_LEVEL_ERROR, "Failed to get MTD device info for %s.", device);
+		close(mtd_fd);
+		mtd_fd = -1;
+		libmtd_close(mtd_desc);
+		mtd_desc = NULL;
+		return -1;
+	}
+
+	printf("MTD device '%s' opened. Size: %llu MB, Erase size: %u KB\n",
+	       device, mtd_dev_info.size / (1024 * 1024),
+	       mtd_dev_info.eb_size / 1024);
+
+	return 0;
+}
+
+/**
+ * @brief Deinitializes the libmtd backend.
+ * @details Closes the MTD device file descriptor and the libmtd library instance.
+ * @see flash_ops_t::deinit
+ */
+static void mtd_backend_deinit(void)
+{
+	if (mtd_desc) {
+		libmtd_close(mtd_desc);
+		mtd_desc = NULL;
+	}
+	if (mtd_fd >= 0) {
+		close(mtd_fd);
+		mtd_fd = -1;
+	}
+	printf("MTD device closed.\n");
+}
+
+/**
+ * @brief Erases flash using libmtd.
+ * @details Calculates the start eraseblock and number of blocks from the
+ * byte offset and length, then iterates and erases each block.
+ * @see flash_ops_t::erase
+ */
+static int mtd_backend_erase(uint32_t offset, uint32_t len)
+{
+	int start_eb, num_ebs, i;
+	if (!mtd_desc || mtd_fd < 0) {
+		LOG(LOG_LEVEL_ERROR, "Backend not initialized.");
+		return -1;
+	}
+	if (offset % mtd_dev_info.eb_size != 0 || len % mtd_dev_info.eb_size != 0) {
+		LOG(LOG_LEVEL_ERROR, "Erase offset/length not aligned to eraseblock size (%u).", mtd_dev_info.eb_size);
+		return -1;
+	}
+	start_eb = offset / mtd_dev_info.eb_size;
+	num_ebs = len / mtd_dev_info.eb_size;
+
+	for (i = 0; i < num_ebs; i++) {
+		if (mtd_erase(mtd_desc, &mtd_dev_info, mtd_fd, start_eb + i) != 0) {
+			LOG(LOG_LEVEL_ERROR, "libmtd erase failed for eraseblock %d.", start_eb + i);
+			return -1;
+		}
+	}
+	return 0;
+}
+
+/**
+ * @brief Writes to flash using libmtd.
+ * @details Calculates the eraseblock and offset-within-block from the
+ * absolute byte offset to call the correct libmtd API. This function
+ * performs a data-only write, ignoring OOB.
+ * @see flash_ops_t::write
+ */
+static int mtd_backend_write(uint32_t offset, const void *data, size_t len)
+{
+	int eb, offs;
+	if (!mtd_desc || mtd_fd < 0) {
+		LOG(LOG_LEVEL_ERROR, "Backend not initialized.");
+		return -1;
+	}
+	eb = offset / mtd_dev_info.eb_size;
+	offs = offset % mtd_dev_info.eb_size;
+
+	// Perform a data-only write. OOB parameters are NULL and 0.
+	// MTD_OOB_PLACE is a safe mode for data-only operations.
+	if (mtd_write(mtd_desc, &mtd_dev_info, mtd_fd, eb, offs, (void *)data, len, NULL, 0, MTD_OOB_PLACE) < 0) {
+		LOG(LOG_LEVEL_ERROR, "libmtd write failed.");
+		return -1;
+	}
+	return 0;
+}
+
+/**
+ * @brief Reads from flash using libmtd.
+ * @details Calculates the eraseblock and offset-within-block from the
+ * absolute byte offset.
+ * @see flash_ops_t::read
+ */
+static int mtd_backend_read(uint32_t offset, void *data, size_t len)
+{
+	int eb, offs;
+	if (!mtd_desc || mtd_fd < 0) {
+		LOG(LOG_LEVEL_ERROR, "Backend not initialized.");
+		return -1;
+	}
+	eb = offset / mtd_dev_info.eb_size;
+	offs = offset % mtd_dev_info.eb_size;
+
+	if (mtd_read(&mtd_dev_info, mtd_fd, eb, offs, data, len) < 0) {
+		LOG(LOG_LEVEL_ERROR, "libmtd read failed.");
+		return -1;
+	}
+	return 0;
+}
+
+/**
+ * @brief Gets simplified device info.
+ * @details Populates the abstract flash_info_t struct from the detailed
+ * mtd_dev_info struct obtained during initialization.
+ * @see flash_ops_t::get_info
+ */
+static int mtd_backend_get_info(flash_info_t *info)
+{
+	if (!mtd_desc) {
+		LOG(LOG_LEVEL_ERROR, "Backend not initialized.");
+		return -1;
+	}
+	info->size = mtd_dev_info.size;
+	info->erasesize = mtd_dev_info.eb_size;
+	return 0;
+}
+
+/**
+ * @brief The flash_ops_t structure for the libmtd backend.
+ */
+const flash_ops_t libmtd_backend = {
+	.init = mtd_backend_init,
+	.deinit = mtd_backend_deinit,
+	.erase = mtd_backend_erase,
+	.write = mtd_backend_write,
+	.read = mtd_backend_read,
+	.get_info = mtd_backend_get_info,
+};
+
+
+/****************************************************************************
+ * FILE: src/backend/flash_ioctl.c
+ ****************************************************************************/
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/ioctl.h>
+#include <errno.h>
+#include <stdlib.h>
+#include <mtd/mtd-user.h>
+#include "../include/flash_interface.h"
+#include "../include/logger.h"
+
+/**
+ * @file flash_ioctl.c
+ * @brief MTD backend implementation using direct ioctl calls.
+ * @details This backend provides a lower-level alternative to libmtd,
+ * directly using ioctl system calls to interact with the MTD driver.
+ * It includes logic for unlocking blocks before erasing.
+ */
+
+static int mtd_fd = -1;
+static struct mtd_info_user mtd_info;
+static char *mtd_device_path;
+
+/**
+ * @brief Verifies that a region of flash contains only 0xFF bytes.
+ * @param offset The starting offset of the region to verify.
+ * @param len The number of bytes to verify.
+ * @return 0 on successful verification, -1 on failure.
+ */
+static int verify_erase(uint32_t offset, uint32_t len)
+{
+	uint8_t *buf;
+	size_t i;
+	int ret = -1;
+	buf = malloc(len);
+	if (!buf) {
+		LOG(LOG_LEVEL_ERROR, "Failed to allocate memory for erase verification.");
+		return -1;
+	}
+	if (lseek(mtd_fd, offset, SEEK_SET) < 0) {
+		LOG(LOG_LEVEL_ERROR, "lseek failed for erase verification.");
+		goto out_free;
+	}
+	if (read(mtd_fd, buf, len) != (ssize_t)len) {
+		LOG(LOG_LEVEL_ERROR, "read failed for erase verification.");
+		goto out_free;
+	}
+	for (i = 0; i < len; i++) {
+		if (buf[i] != 0xFF) {
+			LOG(LOG_LEVEL_ERROR,
+			    "Erase verification failed at offset 0x%x (is 0x%02x, should be 0xFF).",
+			    (unsigned int)(offset + i), buf[i]);
+			goto out_free;
+		}
+	}
+	LOG(LOG_LEVEL_DEBUG, "Erase verified successfully for 0x%x bytes at 0x%x.", len, offset);
+	ret = 0;
+out_free:
+	free(buf);
+	return ret;
+}
+
+/**
+ * @brief Initializes the ioctl backend.
+ * @see flash_ops_t::init
+ */
+static int ioctl_backend_init(const char *device)
+{
+	if (mtd_fd >= 0) {
+		LOG(LOG_LEVEL_WARN, "ioctl backend already initialized.");
+		return 0;
+	}
+	mtd_fd = open(device, O_RDWR);
+	if (mtd_fd < 0) {
+		LOG(LOG_LEVEL_ERROR, "Failed to open MTD device: %s", device);
+		return -1;
+	}
+	if (ioctl(mtd_fd, MEMGETINFO, &mtd_info) != 0) {
+		LOG(LOG_LEVEL_ERROR, "ioctl(MEMGETINFO) failed.");
+		close(mtd_fd);
+		mtd_fd = -1;
+		return -1;
+	}
+	mtd_device_path = strdup(device);
+	printf("MTD device '%s' opened. Size: %llu MB, Erase size: %u KB\n",
+	       device, (unsigned long long)mtd_info.size / (1024 * 1024),
+	       mtd_info.erasesize / 1024);
+	return 0;
+}
+
+/**
+ * @brief Deinitializes the ioctl backend.
+ * @see flash_ops_t::deinit
+ */
+static void ioctl_backend_deinit(void)
+{
+	if (mtd_fd >= 0) {
+		close(mtd_fd);
+		mtd_fd = -1;
+		free(mtd_device_path);
+		mtd_device_path = NULL;
+		printf("MTD device closed.\n");
+	}
+}
+
+/**
+ * @brief Erases flash using ioctl calls.
+ * @details This function includes logic to check if a block is locked and
+ * attempts to unlock it before erasing.
+ * @see flash_ops_t::erase
+ */
+static int ioctl_backend_erase(uint32_t offset, uint32_t len)
+{
+	struct erase_info_user einfo = { .start = offset, .length = len };
+	if (mtd_fd < 0) {
+		LOG(LOG_LEVEL_ERROR, "Backend not initialized.");
+		return -1;
+	}
+	LOG(LOG_LEVEL_DEBUG, "Checking lock status for offset 0x%x", offset);
+	if (ioctl(mtd_fd, MEMISLOCKED, &einfo) > 0) {
+		LOG(LOG_LEVEL_WARN, "Erase block at 0x%x is locked, attempting unlock.", offset);
+		if (ioctl(mtd_fd, MEMUNLOCK, &einfo) != 0) {
+			LOG(LOG_LEVEL_ERROR, "Failed to unlock erase block.");
+			return -1;
+		}
+	}
+	if (ioctl(mtd_fd, MEMERASE, &einfo) != 0) {
+		LOG(LOG_LEVEL_ERROR, "ioctl(MEMERASE) failed.");
+		return -1;
+	}
+	if (verify_erase(offset, len) != 0) {
+		LOG(LOG_LEVEL_ERROR, "Erase failed verification.");
+		return -1;
+	}
+	return 0;
+}
+
+/**
+ * @brief Writes to flash using standard file operations.
+ * @see flash_ops_t::write
+ */
+static int ioctl_backend_write(uint32_t offset, const void *data, size_t len)
+{
+	if (mtd_fd < 0) {
+		LOG(LOG_LEVEL_ERROR, "Backend not initialized.");
+		return -1;
+	}
+	if (lseek(mtd_fd, offset, SEEK_SET) < 0) {
+		LOG(LOG_LEVEL_ERROR, "lseek failed for write.");
+		return -1;
+	}
+	if (write(mtd_fd, data, len) != (ssize_t)len) {
+		LOG(LOG_LEVEL_ERROR, "write failed.");
+		return -1;
+	}
+	return 0;
+}
+
+/**
+ * @brief Reads from flash using standard file operations.
+ * @see flash_ops_t::read
+ */
+static int ioctl_backend_read(uint32_t offset, void *data, size_t len)
+{
+	if (mtd_fd < 0) {
+		LOG(LOG_LEVEL_ERROR, "Backend not initialized.");
+		return -1;
+	}
+	if (lseek(mtd_fd, offset, SEEK_SET) < 0) {
+		LOG(LOG_LEVEL_ERROR, "lseek failed for read.");
+		return -1;
+	}
+	if (read(mtd_fd, data, len) != (ssize_t)len) {
+		LOG(LOG_LEVEL_ERROR, "read failed.");
+		return -1;
+	}
+	return 0;
+}
+
+/**
+ * @brief Gets simplified device info.
+ * @details Populates the abstract flash_info_t struct from the mtd_info_user
+ * struct obtained during initialization.
+ * @see flash_ops_t::get_info
+ */
+static int ioctl_backend_get_info(flash_info_t *info)
+{
+	if (mtd_fd < 0) {
+		LOG(LOG_LEVEL_ERROR, "Backend not initialized.");
+		return -1;
+	}
+	info->size = mtd_info.size;
+	info->erasesize = mtd_info.erasesize;
+	return 0;
+}
+
+/**
+ * @brief The flash_ops_t structure for the ioctl backend.
+ */
+const flash_ops_t ioctl_backend = {
+	.init = ioctl_backend_init,
+	.deinit = ioctl_backend_deinit,
+	.erase = ioctl_backend_erase,
+	.write = ioctl_backend_write,
+	.read = ioctl_backend_read,
+	.get_info = ioctl_backend_get_info,
+};
+
+
+/****************************************************************************
+ * FILE: src/logger.c
+ ****************************************************************************/
+#include <stdio.h>
+#include <stdarg.h>
+#include <time.h>
+#include "include/logger.h"
+
+/**
+ * @file logger.c
+ * @brief Implementation of the controlled logging system.
+ */
+
+// Global variable to hold the current log level. Defaults to INFO.
+static log_level_t g_log_level = LOG_LEVEL_INFO;
+
+/**
+ * @brief Sets the global logging level.
+ */
+void logger_set_level(log_level_t new_level)
+{
+	g_log_level = new_level;
+}
+
+/**
+ * @brief Gets the current global logging level.
+ */
+log_level_t logger_get_level(void)
+{
+	return g_log_level;
+}
+
+/**
+ * @brief Formats and prints a log message to stderr.
+ * @details This is the core logging function called by the LOG macro. It
+ * prepends level and location information to the user's message.
+ * @see LOG
+ */
+void logger_log(log_level_t level, const char *file, int line,
+		const char *fmt, ...)
+{
+	switch (level) {
+	case LOG_LEVEL_DEBUG:
+		fprintf(stderr, "[DEBUG] ");
+		break;
+	case LOG_LEVEL_INFO:
+		fprintf(stderr, "[INFO]  ");
+		break;
+	case LOG_LEVEL_WARN:
+		fprintf(stderr, "[WARN]  ");
+		break;
+	case LOG_LEVEL_ERROR:
+		fprintf(stderr, "[ERROR] (%s:%d): ", file, line);
+		break;
+	}
+
+	va_list args;
+	va_start(args, fmt);
+	vfprintf(stderr, fmt, args);
+	va_end(args);
+	fprintf(stderr, "\n");
+}
+
+
+/****************************************************************************
+ * FILE: src/utils.c
+ ****************************************************************************/
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <ctype.h>
+#include "include/utils.h"
+#include "include/logger.h"
+
+/**
+ * @file utils.c
+ * @brief Implementation of helper functions.
+ */
+
+/**
+ * @brief Parses a string into a long integer.
+ * @see utils.h
+ */
+int parse_number(const char *str, long *val)
+{
+	char *endptr;
+	if (!str || !val) return -1;
+	*val = strtol(str, &endptr, 0);
+	if (*endptr != '\0') {
+		LOG(LOG_LEVEL_ERROR, "Invalid character in number: '%s'", str);
+		return -1;
+	}
+	return 0;
+}
+
+/**
+ * @brief Fills a buffer with a specified pattern.
+ * @see utils.h
+ */
+int generate_pattern(uint8_t *buffer, size_t size, const char *pattern)
+{
+	size_t i;
+	long val;
+	if (strcmp(pattern, "+") == 0) {
+		LOG(LOG_LEVEL_DEBUG, "Generating ascending pattern");
+		for (i = 0; i < size; i++) buffer[i] = i & 0xFF;
+	} else if (strcmp(pattern, "-") == 0) {
+		LOG(LOG_LEVEL_DEBUG, "Generating descending pattern");
+		for (i = 0; i < size; i++) buffer[i] = 0xFF - (i & 0xFF);
+	} else {
+		LOG(LOG_LEVEL_DEBUG, "Generating user-defined hex pattern: %s", pattern);
+		if (parse_number(pattern, &val) != 0 || val < 0 || val > 0xFF) {
+			LOG(LOG_LEVEL_ERROR, "Invalid hex pattern '%s'. Must be 0x00-0xFF.", pattern);
+			return -1;
+		}
+		memset(buffer, (int)val, size);
+	}
+	return 0;
+}
+
+/**
+ * @brief Prints a block of memory in a hexdump format.
+ * @see utils.h
+ */
+void hexdump(const char *prefix, const void *data, size_t size)
+{
+	const unsigned char *p = data;
+	size_t i, j;
+	for (i = 0; i < size; i += 16) {
+		if (prefix) printf("%s", prefix);
+		printf("0x%08zX: ", i);
+		for (j = 0; j < 16; j++) {
+			if (i + j < size) printf("%02X ", p[i + j]);
+			else printf("   ");
+		}
+		printf(" |");
+		for (j = 0; j < 16; j++) {
+			if (i + j < size) printf("%c", isprint(p[i + j]) ? p[i + j] : '.');
+		}
+		printf("|\n");
+	}
+}
+
+/**
+ * @brief Gets a yes/no confirmation from the user.
+ * @see utils.h
+ */
+int get_user_confirmation(const char *prompt)
+{
+	int c;
+	printf("%s", prompt);
+	fflush(stdout);
+	c = getchar();
+	if (c == 'y' || c == 'Y') {
+		// Consume rest of the line
+		while (getchar() != '\n');
+		return 1;
+	}
+	// Consume rest of the line if it wasn't just a newline
+	if (c != '\n') {
+		while (getchar() != '\n');
+	}
+	return 0;
+}
+
+
+/****************************************************************************
+ * FILE: src/cli.c
+ ****************************************************************************/
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <signal.h>
+#include "include/cli.h"
+#include "include/config.h"
+#include "include/flash_interface.h"
+#include "include/logger.h"
+#include "include/utils.h"
+
+/**
+ * @file cli.c
+ * @brief Implementation of the command-line interface logic.
+ * @details This file contains the functions for parsing user input and
+ * dispatching commands to the appropriate handlers.
+ */
+
+// Declare the external global flag from main.c
+extern volatile sig_atomic_t g_shutdown_flag;
+
+static void handle_flash_write(int argc, char *argv[]);
+static void handle_flash_read(int argc, char *argv[]);
+static void handle_flash_write_verify(int argc, char *argv[]);
+static void handle_flash_erase(int argc, char *argv[]);
+static void handle_log_level(int argc, char *argv[]);
+
+/**
+ * @brief Prints the detailed help message to the console.
+ */
+void print_help(void)
+{
+	printf("Flash Tool CLI\n");
+	printf("------------------------\n");
+	printf("Usage: ./flash_tool [-d /dev/mtdX] [-v|--verbose]\n\n");
+	printf("General Commands:\n");
+	printf("  help                       : Show this help message.\n");
+	printf("  clr                        : Clear the terminal screen.\n");
+	printf("  exit                       : Exit the application.\n\n");
+
+	printf("Logging Command:\n");
+	printf("  log level <level>          : Set log verbosity.\n");
+	printf("    <level> : debug, info, warn, error\n\n");
+
+	printf("Flash Write Command:\n");
+	printf("  flash write <type> <pattern> <sector> <size>\n");
+	printf("    <type>    : P, Z, Y (Note: Ignored, for compatibility).\n");
+	printf("    <pattern> : +, -, or a hex value (e.g., 0xAA).\n");
+	printf("    <sector>  : Start sector number (based on device erase block size).\n");
+	printf("    <size>    : Number of bytes to write (max is sector size, must be even).\n\n");
+
+	printf("Flash Read Command:\n");
+	printf("  flash read <type> <sector> <size>\n");
+	printf("    <type>    : Z, Y, O, etc. (Note: Ignored).\n");
+	printf("    <sector>  : Start sector number.\n");
+	printf("    <size>    : Number of bytes to read (must be even).\n\n");
+
+	printf("Flash Write-Verify Command:\n");
+	printf("  flash write-verify <type> <pattern> <sector> <iter> <fail_cnt> <log> <full_util>\n");
+	printf("    <pattern>   : +, -, 0x.. (or a placeholder if using a file).\n");
+    printf("    <sector>    : Start sector number.\n");
+    printf("    <iter>      : Iteration count (0 for infinite).\n");
+    printf("    <fail_cnt>  : Stop after this many failures (0 for infinite).\n");
+    printf("    <log>       : 0=Disable failure details, 1=Enable failure details.\n");
+    printf("    <full_util> : 0=Use one sector, 1=Use all available sectors.\n\n");
+
+	printf("Flash Erase Command:\n");
+	printf("  flash erase <type> <start_sector> [end_sector]\n");
+	printf("    <type>         : A (Auto-detect), O (128k), Y (32k), Z (4k), C (Chip Erase).\n");
+	printf("    <start_sector> : Sector number based on <type> size.\n");
+	printf("    [end_sector]   : Optional last sector to erase.\n");
+}
+
+/**
+ * @brief Main command dispatcher.
+ * @see cli.h
+ */
+void cli_process_command(int argc, char *argv[])
+{
+	if (argc == 0) return;
+	if (strcmp(argv[0], "help") == 0) {
+		print_help();
+	} else if (strcmp(argv[0], "clr") == 0) {
+		printf("\033[H\033[J");
+	} else if (strcmp(argv[0], "log") == 0) {
+		if (argc > 1 && strcmp(argv[1], "level") == 0) {
+			handle_log_level(argc, argv);
+		} else {
+			printf("Error: 'log' requires 'level' subcommand.\n");
+		}
+	} else if (strcmp(argv[0], "flash") == 0) {
+		if (argc < 2) {
+			printf("Error: 'flash' requires a subcommand.\n");
+			return;
+		}
+		if (strcmp(argv[1], "write") == 0) handle_flash_write(argc, argv);
+		else if (strcmp(argv[1], "read") == 0) handle_flash_read(argc, argv);
+		else if (strcmp(argv[1], "write-verify") == 0) handle_flash_write_verify(argc, argv);
+		else if (strcmp(argv[1], "erase") == 0) handle_flash_erase(argc, argv);
+		else printf("Error: Unknown flash command '%s'.\n", argv[1]);
+	} else {
+		printf("Error: Unknown command '%s'.\n", argv[0]);
+	}
+}
+
+/**
+ * @brief Handles the 'log level' command.
+ * @param argc Argument count.
+ * @param argv Argument vector.
+ */
+static void handle_log_level(int argc, char *argv[])
+{
+	if (argc != 3) {
+		printf("Usage: log level <debug|info|warn|error>\n");
+		return;
+	}
+	if (strcmp(argv[2], "debug") == 0) {
+		logger_set_level(LOG_LEVEL_DEBUG);
+	} else if (strcmp(argv[2], "info") == 0) {
+		logger_set_level(LOG_LEVEL_INFO);
+	} else if (strcmp(argv[2], "warn") == 0) {
+		logger_set_level(LOG_LEVEL_WARN);
+	} else if (strcmp(argv[2], "error") == 0) {
+		logger_set_level(LOG_LEVEL_ERROR);
+	} else {
+		printf("Error: Invalid log level '%s'.\n", argv[2]);
+		return;
+	}
+	printf("Log level set to %s.\n", argv[2]);
+}
+
+/**
+ * @brief Handles the 'flash write' command.
+ * @param argc Argument count.
+ * @param argv Argument vector.
+ */
+static void handle_flash_write(int argc, char *argv[])
+{
+	long sector_num, write_size;
+	uint64_t offset;
+	uint8_t *write_buf;
+	flash_info_t info;
+	if (argc != 6) {
+		printf("Usage: flash write <type> <pattern> <sector> <size>\n");
+		return;
+	}
+	if (parse_number(argv[4], &sector_num) != 0 || parse_number(argv[5], &write_size) != 0) {
+		printf("Error: Invalid number for sector or size.\n");
+		return;
+	}
+	if (write_size > 0 && write_size % 2 != 0) {
+		printf("Error: Write size must be an even number.\n");
+		return;
+	}
+	g_flash_backend->get_info(&info);
+	if (sector_num < 0 || write_size <= 0 || (uint32_t)write_size > info.erasesize) {
+		printf("Error: Size must be > 0 and <= erase block size (%u).\n", info.erasesize);
+		return;
+	}
+	offset = (uint64_t)sector_num * info.erasesize;
+	if (offset + (uint64_t)write_size > info.size) {
+		printf("Error: Write operation exceeds flash size.\n");
+		return;
+	}
+	write_buf = malloc(write_size);
+	if (!write_buf) {
+		LOG(LOG_LEVEL_ERROR, "Failed to allocate write buffer.");
+		return;
+	}
+	if (generate_pattern(write_buf, write_size, argv[3]) != 0) {
+		free(write_buf);
+		return;
+	}
+	printf("Preparing to write %ld bytes to sector %ld (offset 0x%08llx).\n", write_size, sector_num, (unsigned long long)offset);
+	if (g_flash_backend->write(offset, write_buf, write_size) == 0)
+		printf("Write successful.\n");
+	else
+		printf("Write failed.\n");
+	free(write_buf);
+}
+
+/**
+ * @brief Handles the 'flash read' command.
+ * @param argc Argument count.
+ * @param argv Argument vector.
+ */
+static void handle_flash_read(int argc, char *argv[])
+{
+	long sector_num, read_size;
+	uint64_t offset;
+	uint8_t *read_buf;
+	flash_info_t info;
+	if (argc != 5) {
+		printf("Usage: flash read <type> <sector> <size>\n");
+		return;
+	}
+	if (parse_number(argv[3], &sector_num) != 0 || parse_number(argv[4], &read_size) != 0) {
+		printf("Error: Invalid number for sector or size.\n");
+		return;
+	}
+	if (read_size > 0 && read_size % 2 != 0) {
+		printf("Error: Read size must be an even number.\n");
+		return;
+	}
+	g_flash_backend->get_info(&info);
+	if (sector_num < 0 || read_size <= 0) {
+		printf("Error: Invalid sector or size.\n");
+		return;
+	}
+	offset = (uint64_t)sector_num * info.erasesize;
+	if (offset + (uint64_t)read_size > info.size) {
+		printf("Error: Read operation exceeds flash size.\n");
+		return;
+	}
+	read_buf = malloc(read_size);
+	if (!read_buf) {
+		LOG(LOG_LEVEL_ERROR, "Failed to allocate read buffer.");
+		return;
+	}
+	printf("Reading %ld bytes from sector %ld (offset 0x%08llx).\n", read_size, sector_num, (unsigned long long)offset);
+	if (g_flash_backend->read(offset, read_buf, read_size) == 0) {
+		printf("Read successful. Hexdump:\n");
+		hexdump("  ", read_buf, read_size);
+	} else {
+		printf("Read failed.\n");
+	}
+	free(read_buf);
+}
+
+/**
+ * @brief Handles the 'flash write-verify' command.
+ * @details This is the most complex command, implementing a multi-cycle
+ * erase-write-verify test loop. It can be stopped by Ctrl+C.
+ * @param argc Argument count.
+ * @param argv Argument vector.
+ */
+static void handle_flash_write_verify(int argc, char *argv[])
+{
+	long start_sector, end_sector, iter_count, max_fails, enable_log, full_util;
+	uint8_t *source_buf = NULL, *verify_buf = NULL;
+	size_t data_size = 0;
+	flash_info_t info;
+	unsigned long current_iter = 0, total_fail_count = 0;
+	long s;
+	int stop_flag = 0;
+	if (argc != 9) {
+		printf("Usage: flash write-verify <type> <pattern> <sector> <iter> <fail_cnt> <log> <full_util>\n");
+		return;
+	}
+	if (parse_number(argv[4], &start_sector) != 0 || parse_number(argv[5], &iter_count) != 0 ||
+	    parse_number(argv[6], &max_fails) != 0 || parse_number(argv[7], &enable_log) != 0 ||
+	    parse_number(argv[8], &full_util) != 0) {
+		printf("Error: Invalid number in arguments.\n");
+		return;
+	}
+	g_flash_backend->get_info(&info);
+	long total_sectors = info.size / info.erasesize;
+	if (start_sector < 0 || start_sector >= total_sectors) {
+		printf("Error: Invalid start sector %ld. Must be 0-%ld.\n", start_sector, total_sectors - 1);
+		return;
+	}
+	if (full_util) {
+		end_sector = total_sectors - 1;
+	} else {
+		end_sector = start_sector;
+	}
+	printf("Test range: Sector %ld to %ld.\n", start_sector, end_sector);
+	if (get_user_confirmation("Use a file for the data source instead of a pattern? (y/N): ")) {
+		char filename[256];
+		FILE *fp;
+		printf("Enter filename: ");
+		if (fgets(filename, sizeof(filename), stdin) == NULL) {
+			printf("Error reading filename.\n");
+			return;
+		}
+		filename[strcspn(filename, "\n")] = 0;
+		fp = fopen(filename, "rb");
+		if (!fp) {
+			printf("Error: Cannot open file '%s'.\n", filename);
+			return;
+		}
+		fseek(fp, 0, SEEK_END);
+		data_size = ftell(fp);
+		fseek(fp, 0, SEEK_SET);
+		if (data_size > info.erasesize) {
+			printf("Error: File size (%zu) > erase size (%u).\n", data_size, info.erasesize);
+			fclose(fp);
+			return;
+		}
+		source_buf = malloc(data_size);
+		if (!source_buf || fread(source_buf, 1, data_size, fp) != data_size) {
+			printf("Error: Failed to read file into memory.\n");
+			fclose(fp);
+			free(source_buf);
+			return;
+		}
+		fclose(fp);
+		printf("Using data from '%s' (%zu bytes).\n", filename, data_size);
+	} else {
+		data_size = info.erasesize;
+		source_buf = malloc(data_size);
+		if (!source_buf) {
+			printf("Error: Failed to allocate memory for pattern.\n");
+			return;
+		}
+		if (generate_pattern(source_buf, data_size, argv[3]) != 0) {
+			free(source_buf);
+			return;
+		}
+		printf("Using generated pattern '%s' (%zu bytes).\n", argv[3], data_size);
+	}
+	verify_buf = malloc(data_size);
+	if (!verify_buf) {
+		printf("Error: Failed to allocate verify buffer.\n");
+		free(source_buf);
+		return;
+	}
+	printf("Starting write-verify. Press Ctrl+C to stop.\n");
+	while (!stop_flag && !g_shutdown_flag) {
+		current_iter++;
+		printf("\n--- Cycle %lu ---\n", current_iter);
+		if (iter_count > 0 && current_iter > (unsigned long)iter_count) {
+			printf("Target iteration count reached.\n");
+			current_iter--;
+			break;
+		}
+		printf("Phase 1: Erasing all sectors in range...\n");
+		for (s = start_sector; s <= end_sector && !stop_flag && !g_shutdown_flag; s++) {
+			uint32_t offset = s * info.erasesize;
+			printf("  Erasing sector %ld...\n", s);
+			if (g_flash_backend->erase(offset, info.erasesize) != 0) {
+				printf("    ERASE FAILED!\n");
+				total_fail_count++;
+				if (max_fails > 0 && total_fail_count >= (unsigned long)max_fails) stop_flag = 1;
+			}
+		}
+		printf("Phase 2: Writing all sectors in range...\n");
+		for (s = start_sector; s <= end_sector && !stop_flag && !g_shutdown_flag; s++) {
+			uint32_t offset = s * info.erasesize;
+			printf("  Writing sector %ld...\n", s);
+			if (g_flash_backend->write(offset, source_buf, data_size) != 0) {
+				printf("    WRITE FAILED!\n");
+				total_fail_count++;
+				if (max_fails > 0 && total_fail_count >= (unsigned long)max_fails) stop_flag = 1;
+			}
+		}
+		printf("Phase 3: Verifying all sectors in range...\n");
+		for (s = start_sector; s <= end_sector && !stop_flag && !g_shutdown_flag; s++) {
+			uint32_t offset = s * info.erasesize;
+			printf("  Verifying sector %ld...", s);
+			fflush(stdout);
+			if (g_flash_backend->read(offset, verify_buf, data_size) != 0) {
+				printf(" READ FAILED!\n");
+				total_fail_count++;
+				if (max_fails > 0 && total_fail_count >= (unsigned long)max_fails) stop_flag = 1;
+				continue;
+			}
+			if (memcmp(source_buf, verify_buf, data_size) != 0) {
+				printf(" VERIFY FAILED!\n");
+				total_fail_count++;
+				if (enable_log) {
+					size_t i;
+					for (i = 0; i < data_size; i++) {
+						if (source_buf[i] != verify_buf[i]) {
+							printf("    FAIL: Iter=%lu, FailCount=%lu, Sector=%ld, Index=0x%zX, Expected=0x%02X, Actual=0x%02X\n",
+							       current_iter, total_fail_count, s, i, source_buf[i], verify_buf[i]);
+							break;
+						}
+					}
+				}
+				if (max_fails > 0 && total_fail_count >= (unsigned long)max_fails) stop_flag = 1;
+			} else {
+				printf(" OK\n");
+			}
+		}
+	}
+	if (g_shutdown_flag) {
+		printf("\nOperation interrupted by user.\n");
+	} else if (stop_flag) {
+		printf("\nMaximum failure count reached.\n");
+	}
+	printf("\n--- Write-Verify Summary ---\n");
+	printf("Cycles Completed: %lu\n", current_iter > 0 ? current_iter - 1 : 0);
+	printf("Total Failures (all types): %lu\n", total_fail_count);
+	printf("--------------------------\n");
+	free(source_buf);
+	free(verify_buf);
+}
+
+/**
+ * @brief Handles the 'flash erase' command.
+ * @param argc Argument count.
+ * @param argv Argument vector.
+ */
+static void handle_flash_erase(int argc, char *argv[])
+{
+	long start_sector, end_sector;
+	char type;
+	uint32_t erase_unit_size = 0;
+    uint64_t start_offset, total_len;
+	flash_info_t info;
+	if (argc < 4 && (argc != 3 || (argv[2][0] != 'C' && argv[2][0] != 'c'))) {
+		printf("Usage: flash erase <type> <start_sector> [end_sector]\n");
+		return;
+	}
+	type = argv[2][0];
+	g_flash_backend->get_info(&info);
+	if (type == 'C' || type == 'c') {
+		if (argc != 3) {
+			printf("Usage: flash erase C\n");
+			return;
+		}
+		if (get_user_confirmation("Performing CHIP ERASE. This will erase the ENTIRE flash. Are you sure? (y/N): ")) {
+			printf("Erasing entire device (%llu bytes)...\n", (unsigned long long)info.size);
+			if (g_flash_backend->erase(0, info.size) == 0)
+				printf("Chip erase successful.\n");
+			else
+				printf("Chip erase failed.\n");
+		} else {
+			printf("Chip erase aborted.\n");
+		}
+		return;
+	}
+	if (argc < 4 || argc > 5) {
+		printf("Usage: flash erase <type> <start_sector> [end_sector]\n");
+		return;
+	}
+	if (parse_number(argv[3], &start_sector) != 0) {
+		printf("Error: Invalid start sector.\n");
+		return;
+	}
+    if (argc == 5) {
+        if (parse_number(argv[4], &end_sector) != 0) {
+            printf("Error: Invalid end sector.\n");
+            return;
+        }
+    } else {
+        end_sector = start_sector;
+    }
+	if (start_sector < 0 || end_sector < start_sector) {
+		printf("Error: Invalid sector range.\n");
+		return;
+	}
+	switch (type) {
+	case 'A': case 'a': erase_unit_size = info.erasesize;
+		printf("Auto-detected erase size: %u bytes.\n", erase_unit_size);
+		break;
+	case 'O': case 'o': erase_unit_size = 131072; break;
+	case 'Y': case 'y': erase_unit_size = 32768; break;
+	case 'Z': case 'z': erase_unit_size = 4096; break;
+	default: printf("Error: Invalid erase type '%c'.\n", type); return;
+	}
+	start_offset = (uint64_t)start_sector * erase_unit_size;
+	total_len = (uint64_t)(end_sector - start_sector + 1) * erase_unit_size;
+	if (start_offset + total_len > info.size) {
+		printf("Error: Erase range exceeds flash size.\n");
+		return;
+	}
+	if (start_offset % info.erasesize != 0 || total_len % info.erasesize != 0) {
+		printf("Warning: Requested erase geometry does not align with device's native erase size (%u).\n", info.erasesize);
+	}
+	printf("Erasing %ld block(s) from offset 0x%08llx...\n", (end_sector - start_sector + 1), (unsigned long long)start_offset);
+	if (g_flash_backend->erase(start_offset, total_len) == 0)
+		printf("Erase successful.\n");
+	else
+		printf("Erase failed.\n");
+}
+
+
+/****************************************************************************
+ * FILE: src/main.c
+ ****************************************************************************/
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <signal.h>
+#include "include/config.h"
+#include "include/cli.h"
+#include "include/flash_interface.h"
+#include "include/logger.h"
+
+/**
+ * @file main.c
+ * @brief The main entry point for the flash tool application.
+ * @details This file contains the main function, signal handling, command-line
+ * argument parsing, and the main input loop.
+ */
+
+// Declare the external backend structs from the implementation files
+extern const flash_ops_t libmtd_backend;
+extern const flash_ops_t ioctl_backend;
+
+// Global pointer to the active backend, to be assigned in backend_init()
+const flash_ops_t *g_flash_backend;
+
+/**
+ * @brief Global flag to indicate a shutdown signal has been received.
+ * @details This flag is set by the signal handler and checked in the main
+ * loop and long-running operations to allow for a graceful exit.
+ */
+volatile sig_atomic_t g_shutdown_flag = 0;
+
+/**
+ * @brief Initializes the global g_flash_backend pointer based on config.h
+ * @details This function must be called before any flash operations are
+ * attempted. It inspects the preprocessor definitions from `config.h` to
+ * select the appropriate backend implementation.
+ */
+void backend_init(void)
+{
+#if defined(BACKEND_LIBMDT)
+	g_flash_backend = &libmtd_backend;
+	LOG(LOG_LEVEL_INFO, "libmtd backend selected.");
+#elif defined(BACKEND_IOCTL)
+	g_flash_backend = &ioctl_backend;
+	LOG(LOG_LEVEL_INFO, "ioctl backend selected.");
+#else
+#error "No MTD backend specified in config.h! Define BACKEND_LIBMDT or BACKEND_IOCTL."
+#endif
+}
+
+/**
+ * @brief Signal handler to gracefully shut down the application.
+ * @details Sets the global `g_shutdown_flag` to 1, which will be detected
+ * by the main processing loop to terminate cleanly.
+ * @param signum The signal number received (unused).
+ */
+static void signal_handler(int signum)
+{
+	(void)signum;
+	g_shutdown_flag = 1;
+}
+
+/**
+ * @brief The main function.
+ * @param argc Number of command-line arguments.
+ * @param argv Array of command-line argument strings.
+ * @return EXIT_SUCCESS on success, EXIT_FAILURE on error.
+ */
+int main(int argc, char *argv[])
+{
+	char input[MAX_CLI_INPUT_SIZE];
+	char *args[MAX_CLI_ARGS];
+	int arg_count;
+	char *token;
+	char *device_path = DEFAULT_MTD_DEVICE;
+	int i;
+
+	// Register signal handlers for graceful shutdown (Ctrl+C, etc.)
+	signal(SIGINT, signal_handler);
+	signal(SIGTERM, signal_handler);
+
+	// Parse command-line options
+	for (i = 1; i < argc; i++) {
+		if (strcmp(argv[i], "-d") == 0) {
+			if (i + 1 < argc) {
+				device_path = argv[i + 1];
+				i++; // Skip the path argument
+			} else {
+				fprintf(stderr, "Error: -d option requires a device path.\n");
+				return EXIT_FAILURE;
+			}
+		} else if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--verbose") == 0) {
+			logger_set_level(LOG_LEVEL_DEBUG);
+		} else {
+			fprintf(stderr, "Error: Unknown option '%s'.\n", argv[i]);
+			print_help();
+			return EXIT_FAILURE;
+		}
+	}
+
+	printf("Flash Tool Initializing...\n");
+	backend_init();
+
+	if (g_flash_backend->init(device_path) != 0) {
+		fprintf(stderr, "FATAL: Could not initialize flash backend for device %s. Exiting.\n", device_path);
+		return EXIT_FAILURE;
+	}
+
+	printf("Initialization complete. Type 'help' for commands.\n");
+	if (logger_get_level() == LOG_LEVEL_DEBUG) {
+		printf("Verbose logging is enabled.\n");
+	}
+
+	// Main command loop
+	while (!g_shutdown_flag) {
+		printf("> ");
+		fflush(stdout);
+
+		if (fgets(input, sizeof(input), stdin) == NULL)
+			break; // End of file (e.g., Ctrl+D)
+
+		if (g_shutdown_flag) break; // Check again after blocking fgets call
+
+		// Remove trailing newline
+		input[strcspn(input, "\n")] = 0;
+
+		if (strlen(input) == 0)
+			continue;
+
+		if (strcmp(input, "exit") == 0)
+			break;
+
+		// Tokenize input into arguments
+		arg_count = 0;
+		token = strtok(input, " \t");
+		while (token != NULL && arg_count < MAX_CLI_ARGS) {
+			args[arg_count++] = token;
+			token = strtok(NULL, " \t");
+		}
+
+		if (arg_count > 0)
+			cli_process_command(arg_count, args);
+	}
+    
+    if (g_shutdown_flag) {
+        printf("\nShutdown signal received. Exiting gracefully.\n");
+    }
+
+	printf("Exiting. Cleaning up...\n");
+	g_flash_backend->deinit();
+
+	return EXIT_SUCCESS;
+}
+
