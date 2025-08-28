@@ -1138,15 +1138,17 @@ int main(int argc, char *argv[])
 	return EXIT_SUCCESS;
 }
 
-This document outlines the project's folder structure and provides the necessary build files.
+This document outlines the project's folder structure and provides the necessary build files, following a self-contained Yocto recipe format.
 
 ### 1. Folder Structure
 
-Create the following directory layout for your project.
+Create the following directory layout for your Yocto recipe.
 
-flash-tool/├── bsp/│   └── recipes-utils/│       └── flash-tool/│           └── flash-tool_0.1.bb├── src/│   ├── include/│   │   ├── cli.h│   │   ├── config.h│   │   ├── flash_interface.h│   │   ├── logger.h│   │   └── utils.h│   ├── backend/│   │   ├── flash_libmtd.c│   │   └── flash_ioctl.c│   ├── cli.c│   ├── main.c│   ├── logger.c│   └── utils.c├── Makefile└── README.txt
+recipes-flash-cli/├── files/│   ├── src/│   │   ├── include/│   │   │   ├── cli.h│   │   │   ├── config.h│   │   │   ├── flash_interface.h│   │   │   ├── logger.h│   │   │   └── utils.h│   │   ├── backend/│   │   │   ├── flash_libmtd.c│   │   │   └── flash_ioctl.c│   │   ├── cli.c│   │   ├── main.c│   │   ├── logger.c│   │   └── utils.c│   ├── Makefile│   └── README.txt└── flash-tool_0.1.bb
 ---
-### 2. Makefile
+### 2. Makefile (Unchanged)
+
+The `Makefile` itself does not need any changes. Place it inside the `recipes-flash-cli/files/` directory.
 
 ```makefile
 #
@@ -1181,24 +1183,24 @@ obj/%.o: src/%.c
 clean:
 	@echo "  CLEAN"
 	@rm -rf $(TARGET) obj/
-3. Yocto Recipe (flash-tool_0.1.bb)SUMMARY = "Command-line utility for MTD flash operations"
+3. Yocto Recipe (flash-tool_0.1.bb) (Updated)Place this file inside the recipes-flash-cli/ directory. Note the change in SRC_URI and S.SUMMARY = "Command-line utility for MTD flash operations"
 DESCRIPTION = "A tool to read, write, and erase MTD flash devices, \
 with support for both libmtd and direct ioctl backends. \
 Backend is selected via the config.h header."
 LICENSE = "GPL-2.0-only"
 LIC_FILES_CHKSUM = "file://${COMMON_LICENSE_DIR}/GPL-2.0-only;md5=801f80980d17102532565de542a6cc66"
 
-# This recipe assumes the source code is placed next to it in a 'flash-tool' subdir
-SRC_URI = "file://flash-tool/"
+# All source files are in the 'files' subdirectory next to this recipe
+SRC_URI = "file://files/"
 
-S = "${WORKDIR}/flash-tool"
+# The source directory 'S' is where BitBake will copy the files to
+S = "${WORKDIR}/files"
 
 # The tool depends on mtd-utils for the libmtd library
 DEPENDS = "mtd-utils"
 
-# The Makefile now builds both backends, and the C code selects
-# which one to use based on config.h. No EXTRA_OEMAKE is needed.
-
+# The Makefile builds both backends, and the C code selects
+# which one to use based on config.h.
 do_compile() {
 	oe_runmake
 }
@@ -1206,4 +1208,6 @@ do_compile() {
 do_install() {
 	install -d ${D}${bindir}
 	install -m 0755 ${S}/flash_tool ${D}${bindir}
+}
+
 }
