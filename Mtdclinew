@@ -3740,3 +3740,508 @@ static void handle_flash_erase(int argc, char *argv[])
 		printf("Erase failed.\n");
 }
 
+
+/****************************************************************************
+ * FILE: src/cli.c
+ ****************************************************************************/
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <signal.h>
+#include <stdbool.h> // Added for bool type
+#include <readline/readline.h>
+#include "include/cli.h"
+#include "include/config.h"
+#include "include/flash_interface.h"
+#include "include/logger.h"
+#include "include/utils.h"
+
+/**
+ * @file cli.c
+ * @brief Implementation of the command-line interface logic.
+ * @details This file contains the functions for parsing user input and
+ * dispatching commands to the appropriate handlers.
+ */
+
+// Declare the external global flag from main.c
+extern volatile sig_atomic_t g_shutdown_flag;
+
+static void handle_flash_write(int argc, char *argv[]);
+static void handle_flash_read(int argc, char *argv[]);
+static void handle_flash_write_verify(int argc, char *argv[]);
+static void handle_flash_erase(int argc, char *argv[]);
+
+/**
+ * @brief Prints the detailed help message to the console.
+ */
+void print_help(void)
+{
+	printf("Flash Tool CLI\n");
+	printf("------------------------\n");
+	printf("Usage: ./flash_tool [-d /dev/mtdX]\n\n");
+	printf("General Commands:\n");
+	printf("  help                       : Show this help message.\n");
+	printf("  clr                        : Clear the terminal screen.\n");
+	printf("  exit                       : Exit the application.\n\n");
+
+	printf("Flash Write Command:\n");
+	printf("  flash write <type> <pattern> <sector> <size> [--no-erase] [--allow-odd]\n");
+	printf("    <type>      : P, Z, Y (Note: Ignored, for compatibility).\n");
+	printf("    <pattern>   : +, -, or a hex value (e.g., 0xAA).\n");
+	printf("    <sector>    : Start sector number (based on device erase block size).\n");
+	printf("    <size>      : Number of bytes to write (max is sector size).\n");
+	printf("    [--no-erase]: Optional. Skips the default pre-write erase of the sector.\n");
+	printf("    [--allow-odd]: Optional. Allows size to be an odd number.\n\n");
+
+	printf("Flash Read Command:\n");
+	printf("  flash read <type> <sector> <size> [--allow-odd]\n");
+	printf("    <type>       : Z, Y, O, etc. (Note: Ignored).\n");
+	printf("    <sector>     : Start sector number.\n");
+	printf("    <size>       : Number of bytes to read.\n");
+	printf("    [--allow-odd]: Optional. Allows size to be an odd number.\n\n");
+
+	printf("Flash Write-Verify Command:\n");
+	printf("  flash write-verify <type> <sector> <iter> <fail_cnt> <log> <full_util>\n");
+	printf("    (After entering command, you will be prompted for a data source: file or pattern)\n");
+    printf("    <sector>    : Start sector number.\n");
+    printf("    <iter>      : Iteration count (0 for infinite).\n");
+    printf("    <fail_cnt>  : Stop after this many failures (0 for infinite).\n");
+    printf("    <log>       : 0=Disable failure details, 1=Enable failure details.\n");
+    printf("    <full_util> : 0=Use one sector, 1=Use all available sectors.\n\n");
+
+
+	printf("Flash Erase Command:\n");
+	printf("  flash erase <type> <start_sector> [end_sector]\n");
+	printf("    <type>         : A (Auto-detect), O (128k), Y (32k), Z (4k), C (Chip Erase).\n");
+	printf("    <start_sector> : Sector number based on <type> size.\n");
+	printf("    [end_sector]   : Optional last sector to erase.\n");
+}
+
+/**
+ * @brief Main command dispatcher.
+ * @see cli.h
+ */
+void cli_process_command(int argc, char *argv[])
+{
+	if (argc == 0) return;
+	if (strcmp(argv[0], "help") == 0) {
+		print_help();
+	} else if (strcmp(argv[0], "clr") == 0) {
+		printf("\033[H\033[J");
+	} else if (strcmp(argv[0], "flash") == 0) {
+		if (argc < 2) {
+			printf("Error: 'flash' requires a subcommand.\n");
+			return;
+		}
+		if (strcmp(argv[1], "write") == 0) handle_flash_write(argc, argv);
+		else if (strcmp(argv[1], "read") == 0) handle_flash_read(argc, argv);
+		else if (strcmp(argv[1], "write-verify") == 0) handle_flash_write_verify(argc, argv);
+		else if (strcmp(argv[1], "erase") == 0) handle_flash_erase(argc, argv);
+		else printf("Error: Unknown flash command '%s'.\n", argv[1]);
+	} else {
+		printf("Error: Unknown command '%s'.\n", argv[0]);
+	}
+}
+
+/**
+ * @brief Handles the 'flash write' command with optional flags.
+ */
+static void handle_flash_write(int argc, char *argv[])
+{
+	long sector_num, write_size;
+	uint32_t offset;
+	uint8_t *write_buf;
+	flash_info_t info;
+	
+	bool no_erase = false;
+	bool allow_odd = false;
+	char *pos_args[4]; // type, pattern, sector, size
+	int pos_argc = 0;
+
+	// Parse arguments, separating positional from optional flags
+	for (int i = 2; i < argc; i++) {
+		if (strcmp(argv[i], "--no-erase") == 0) {
+			no_erase = true;
+		} else if (strcmp(argv[i], "--allow-odd") == 0) {
+			allow_odd = true;
+		} else if (pos_argc < 4) {
+			pos_args[pos_argc++] = argv[i];
+		} else {
+			printf("Error: Too many arguments for 'flash write'.\n");
+			return;
+		}
+	}
+
+	if (pos_argc != 4) {
+		printf("Usage: flash write <type> <pattern> <sector> <size> [--no-erase] [--allow-odd]\n");
+		return;
+	}
+
+	if (parse_number(pos_args[2], &sector_num) != 0 || parse_number(pos_args[3], &write_size) != 0) {
+		printf("Error: Invalid number for sector or size.\n");
+		return;
+	}
+
+	if (!allow_odd && write_size > 0 && write_size % 2 != 0) {
+		printf("Error: Write size must be an even number. Use --allow-odd to override.\n");
+		return;
+	}
+
+	g_flash_backend->get_info(&info);
+	if (sector_num < 0 || write_size <= 0 || (uint32_t)write_size > info.erasesize) {
+		printf("Error: Size must be > 0 and <= erase block size (%u).\n", info.erasesize);
+		return;
+	}
+	offset = sector_num * info.erasesize;
+	if (offset + write_size > info.size) {
+		printf("Error: Write operation exceeds flash size.\n");
+		return;
+	}
+
+	// Pre-erase the sector unless --no-erase is specified
+	if (!no_erase) {
+		printf("Auto-erasing sector %ld (offset 0x%08x)...\n", sector_num, offset);
+		if (g_flash_backend->erase(offset, info.erasesize) != 0) {
+			printf("Auto-erase failed. Aborting write.\n");
+			return;
+		}
+	}
+
+	write_buf = malloc(write_size);
+	if (!write_buf) {
+		LOG(LOG_LEVEL_ERROR, "Failed to allocate write buffer.");
+		return;
+	}
+	if (generate_pattern(write_buf, write_size, pos_args[1]) != 0) {
+		free(write_buf);
+		return;
+	}
+	printf("Preparing to write %ld bytes to sector %ld (offset 0x%08x).\n", write_size, sector_num, offset);
+	if (g_flash_backend->write(offset, write_buf, write_size) == 0)
+		printf("Write successful.\n");
+	else
+		printf("Write failed.\n");
+	free(write_buf);
+}
+
+/**
+ * @brief Handles the 'flash read' command with optional flags.
+ */
+static void handle_flash_read(int argc, char *argv[])
+{
+	long sector_num, read_size;
+	uint32_t offset;
+	uint8_t *read_buf;
+	flash_info_t info;
+
+	bool allow_odd = false;
+	char *pos_args[3]; // type, sector, size
+	int pos_argc = 0;
+
+	for (int i = 2; i < argc; i++) {
+		if (strcmp(argv[i], "--allow-odd") == 0) {
+			allow_odd = true;
+		} else if (pos_argc < 3) {
+			pos_args[pos_argc++] = argv[i];
+		} else {
+			printf("Error: Too many arguments for 'flash read'.\n");
+			return;
+		}
+	}
+
+	if (pos_argc != 3) {
+		printf("Usage: flash read <type> <sector> <size> [--allow-odd]\n");
+		return;
+	}
+
+	if (parse_number(pos_args[1], &sector_num) != 0 || parse_number(pos_args[2], &read_size) != 0) {
+		printf("Error: Invalid number for sector or size.\n");
+		return;
+	}
+
+	if (!allow_odd && read_size > 0 && read_size % 2 != 0) {
+		printf("Error: Read size must be an even number. Use --allow-odd to override.\n");
+		return;
+	}
+
+	g_flash_backend->get_info(&info);
+	if (sector_num < 0 || read_size <= 0) {
+		printf("Error: Invalid sector or size.\n");
+		return;
+	}
+	offset = sector_num * info.erasesize;
+	if (offset + read_size > info.size) {
+		printf("Error: Read operation exceeds flash size.\n");
+		return;
+	}
+	read_buf = malloc(read_size);
+	if (!read_buf) {
+		LOG(LOG_LEVEL_ERROR, "Failed to allocate read buffer.");
+		return;
+	}
+	printf("Reading %ld bytes from sector %ld (offset 0x%08x).\n", read_size, sector_num, offset);
+	if (g_flash_backend->read(offset, read_buf, read_size) == 0) {
+		printf("Read successful. Hexdump:\n");
+		hexdump("  ", read_buf, read_size);
+	} else {
+		printf("Read failed.\n");
+	}
+	free(read_buf);
+}
+
+/**
+ * @brief Handles the 'flash write-verify' command with interactive data source selection.
+ */
+static void handle_flash_write_verify(int argc, char *argv[])
+{
+	long start_sector, end_sector, iter_count, max_fails, enable_log, full_util;
+	uint8_t *source_buf = NULL, *verify_buf = NULL;
+	size_t data_size = 0;
+	flash_info_t info;
+	unsigned long current_iter = 0, total_fail_count = 0;
+	long s;
+	int stop_flag = 0;
+
+	if (argc != 8) {
+		printf("Usage: flash write-verify <type> <sector> <iter> <fail_cnt> <log> <full_util>\n");
+		return;
+	}
+	if (parse_number(argv[3], &start_sector) != 0 || parse_number(argv[4], &iter_count) != 0 ||
+	    parse_number(argv[5], &max_fails) != 0 || parse_number(argv[6], &enable_log) != 0 ||
+	    parse_number(argv[7], &full_util) != 0) {
+		printf("Error: Invalid number in arguments.\n");
+		return;
+	}
+
+	g_flash_backend->get_info(&info);
+	long total_sectors = info.size / info.erasesize;
+	if (start_sector < 0 || start_sector >= total_sectors) {
+		printf("Error: Invalid start sector %ld. Must be 0-%ld.\n", start_sector, total_sectors - 1);
+		return;
+	}
+	if (full_util) {
+		end_sector = total_sectors - 1;
+	} else {
+		end_sector = start_sector;
+	}
+	printf("Test range: Sector %ld to %ld.\n", start_sector, end_sector);
+
+	// --- New Interactive Data Source Selection ---
+	char *source_type = readline("Select data source (file/pattern): ");
+	if (!source_type) {
+		printf("Error reading input.\n"); return;
+	}
+
+	if (strcmp(source_type, "file") == 0) {
+		char filename[256];
+		char *filename_line = readline("Enter filename: ");
+		if (!filename_line) {
+			printf("Error reading filename.\n"); free(source_type); return;
+		}
+		if (filename_line[0] == '\0') {
+			printf("No filename entered. Aborting.\n"); free(source_type); free(filename_line); return;
+		}
+		strncpy(filename, filename_line, sizeof(filename) - 1);
+		filename[sizeof(filename) - 1] = '\0';
+		free(filename_line);
+
+		FILE *fp = fopen(filename, "rb");
+		if (!fp) {
+			printf("Error: Cannot open file '%s'.\n", filename); free(source_type); return;
+		}
+		fseek(fp, 0, SEEK_END);
+		data_size = ftell(fp);
+		fseek(fp, 0, SEEK_SET);
+		if (data_size > info.erasesize) {
+			printf("Error: File size (%zu) > erase size (%u).\n", data_size, info.erasesize);
+			fclose(fp); free(source_type); return;
+		}
+		source_buf = malloc(data_size);
+		if (!source_buf || fread(source_buf, 1, data_size, fp) != data_size) {
+			printf("Error: Failed to read file into memory.\n");
+			fclose(fp); free(source_buf); free(source_type); return;
+		}
+		fclose(fp);
+		printf("Using data from '%s' (%zu bytes).\n", filename, data_size);
+
+	} else if (strcmp(source_type, "pattern") == 0) {
+		char *pattern_str = readline("Enter pattern (+, -, or hex value like 0xAA): ");
+		if (!pattern_str) {
+			printf("Error reading pattern.\n"); free(source_type); return;
+		}
+		if (pattern_str[0] == '\0') {
+            printf("No pattern entered. Aborting.\n"); free(source_type); free(pattern_str); return;
+        }
+		data_size = info.erasesize;
+		source_buf = malloc(data_size);
+		if (!source_buf) {
+			printf("Error: Failed to allocate memory for pattern.\n");
+			free(source_type); free(pattern_str); return;
+		}
+		if (generate_pattern(source_buf, data_size, pattern_str) != 0) {
+			free(source_buf); free(source_type); free(pattern_str); return;
+		}
+		printf("Using generated pattern '%s' (%zu bytes).\n", pattern_str, data_size);
+		free(pattern_str);
+	} else {
+		printf("Invalid data source '%s'. Aborting.\n", source_type);
+		free(source_type);
+		return;
+	}
+	free(source_type);
+	// --- End of New Logic ---
+
+	verify_buf = malloc(data_size);
+	if (!verify_buf) {
+		printf("Error: Failed to allocate verify buffer.\n");
+		free(source_buf);
+		return;
+	}
+	printf("Starting write-verify. Press Ctrl+C to stop.\n");
+	while (!stop_flag && !g_shutdown_flag) {
+		current_iter++;
+		printf("\n--- Cycle %lu ---\n", current_iter);
+		if (iter_count > 0 && current_iter > (unsigned long)iter_count) {
+			printf("Target iteration count reached.\n");
+			current_iter--;
+			break;
+		}
+		printf("Phase 1: Erasing all sectors in range...\n");
+		for (s = start_sector; s <= end_sector && !stop_flag && !g_shutdown_flag; s++) {
+			uint32_t offset = s * info.erasesize;
+			printf("  Erasing sector %ld...\n", s);
+			if (g_flash_backend->erase(offset, info.erasesize) != 0) {
+				printf("    ERASE FAILED!\n");
+				total_fail_count++;
+				if (max_fails > 0 && total_fail_count >= (unsigned long)max_fails) stop_flag = 1;
+			}
+		}
+		printf("Phase 2: Writing all sectors in range...\n");
+		for (s = start_sector; s <= end_sector && !stop_flag && !g_shutdown_flag; s++) {
+			uint32_t offset = s * info.erasesize;
+			printf("  Writing sector %ld...\n", s);
+			if (g_flash_backend->write(offset, source_buf, data_size) != 0) {
+				printf("    WRITE FAILED!\n");
+				total_fail_count++;
+				if (max_fails > 0 && total_fail_count >= (unsigned long)max_fails) stop_flag = 1;
+			}
+		}
+		printf("Phase 3: Verifying all sectors in range...\n");
+		for (s = start_sector; s <= end_sector && !stop_flag && !g_shutdown_flag; s++) {
+			uint32_t offset = s * info.erasesize;
+			printf("  Verifying sector %ld...", s);
+			fflush(stdout);
+			if (g_flash_backend->read(offset, verify_buf, data_size) != 0) {
+				printf(" READ FAILED!\n");
+				total_fail_count++;
+				if (max_fails > 0 && total_fail_count >= (unsigned long)max_fails) stop_flag = 1;
+				continue;
+			}
+			if (memcmp(source_buf, verify_buf, data_size) != 0) {
+				printf(" VERIFY FAILED!\n");
+				total_fail_count++;
+				if (enable_log) {
+					size_t i;
+					for (i = 0; i < data_size; i++) {
+						if (source_buf[i] != verify_buf[i]) {
+							printf("    FAIL: Iter=%lu, FailCount=%lu, Sector=%ld, Index=0x%zX, Expected=0x%02X, Actual=0x%02X\n",
+							       current_iter, total_fail_count, s, i, source_buf[i], verify_buf[i]);
+							break;
+						}
+					}
+				}
+				if (max_fails > 0 && total_fail_count >= (unsigned long)max_fails) stop_flag = 1;
+			} else {
+				printf(" OK\n");
+			}
+		}
+	}
+	if (g_shutdown_flag) {
+		printf("\nOperation interrupted by user.\n");
+	} else if (stop_flag) {
+		printf("\nMaximum failure count reached.\n");
+	}
+	printf("\n--- Write-Verify Summary ---\n");
+	printf("Cycles Completed: %lu\n", current_iter > 0 ? current_iter - 1 : 0);
+	printf("Total Failures (all types): %lu\n", total_fail_count);
+	printf("--------------------------\n");
+	free(source_buf);
+	free(verify_buf);
+}
+
+/**
+ * @brief Handles the 'flash erase' command.
+ */
+static void handle_flash_erase(int argc, char *argv[])
+{
+	long start_sector, end_sector;
+	char type;
+	uint32_t erase_unit_size = 0, start_offset, total_len;
+	flash_info_t info;
+	if (argc < 4 && (argc != 3 || (argv[2][0] != 'C' && argv[2][0] != 'c'))) {
+		printf("Usage: flash erase <type> <start_sector> [end_sector]\n");
+		return;
+	}
+	type = argv[2][0];
+	g_flash_backend->get_info(&info);
+	if (type == 'C' || type == 'c') {
+		if (argc != 3) {
+			printf("Usage: flash erase C\n");
+			return;
+		}
+		if (get_user_confirmation("Performing CHIP ERASE. This will erase the ENTIRE flash. Are you sure? (y/N): ")) {
+			printf("Erasing entire device (%llu bytes)...\n", (unsigned long long)info.size);
+			if (g_flash_backend->erase(0, info.size) == 0)
+				printf("Chip erase successful.\n");
+			else
+				printf("Chip erase failed.\n");
+		} else {
+			printf("Chip erase aborted.\n");
+		}
+		return;
+	}
+	if (argc < 4 || argc > 5) {
+		printf("Usage: flash erase <type> <start_sector> [end_sector]\n");
+		return;
+	}
+	if (parse_number(argv[3], &start_sector) != 0) {
+		printf("Error: Invalid start sector.\n");
+		return;
+	}
+    if (argc == 5) {
+        if (parse_number(argv[4], &end_sector) != 0) {
+            printf("Error: Invalid end sector.\n");
+            return;
+        }
+    } else {
+        end_sector = start_sector;
+    }
+	if (start_sector < 0 || end_sector < start_sector) {
+		printf("Error: Invalid sector range.\n");
+		return;
+	}
+	switch (type) {
+	case 'A': case 'a': erase_unit_size = info.erasesize;
+		printf("Auto-detected erase size: %u bytes.\n", erase_unit_size);
+		break;
+	case 'O': case 'o': erase_unit_size = 131072; break;
+	case 'Y': case 'y': erase_unit_size = 32768; break;
+	case 'Z': case 'z': erase_unit_size = 4096; break;
+	default: printf("Error: Invalid erase type '%c'.\n", type); return;
+	}
+	start_offset = start_sector * erase_unit_size;
+	total_len = (end_sector - start_sector + 1) * erase_unit_size;
+	if (start_offset + total_len > info.size) {
+		printf("Error: Erase range exceeds flash size.\n");
+		return;
+	}
+	if (start_offset % info.erasesize != 0 || total_len % info.erasesize != 0) {
+		printf("Warning: Requested erase geometry does not align with device's native erase size (%u).\n", info.erasesize);
+	}
+	printf("Erasing %ld block(s) from offset 0x%08x...\n", (end_sector - start_sector + 1), start_offset);
+	if (g_flash_backend->erase(start_offset, total_len) == 0)
+		printf("Erase successful.\n");
+	else
+		printf("Erase failed.\n");
+}
