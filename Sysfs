@@ -1,0 +1,294 @@
+/****************************************************************************
+ * FILE: src/include/config.h
+ ****************************************************************************/
+#ifndef CONFIG_H
+#define CONFIG_H
+
+#include "logger.h"
+
+/**
+ * @file config.h
+ * @brief Central configuration file for the flash tool.
+ */
+
+/**
+ * @brief Backend Selection
+ *
+ * Uncomment ONE of the following lines to select the backend at compile time.
+ * - BACKEND_LIBMDT: Uses the high-level libmtd library (recommended).
+ * - BACKEND_IOCTL:  Uses low-level direct ioctl calls.
+ * - BACKEND_SYSFS:  Uses a custom sysfs interface for a specific driver.
+ */
+#define BACKEND_SYSFS
+/* #define BACKEND_LIBMDT */
+/* #define BACKEND_IOCTL */
+
+/**
+ * @brief Sysfs Mode Selection (if BACKEND_SYSFS is active)
+ *
+ * Uncomment ONE of the following to select the sysfs command set.
+ */
+#define SYSFS_MODE_EXTENDED
+/* #define SYSFS_MODE_OCTAL */
+
+
+#define DEFAULT_MTD_DEVICE      "/dev/mtd0"     /**< @brief Default MTD device path if not specified via -d option. */
+#define MAX_CLI_INPUT_SIZE      1024            /**< @brief Maximum number of characters for a single line of CLI input. */
+#define MAX_CLI_ARGS            16              /**< @brief Maximum number of arguments (tokens) in a CLI command. */
+#define LOG_LEVEL               LOG_LEVEL_INFO  /**< @brief Default logging verbosity level. */
+
+#endif /* CONFIG_H */
+
+/****************************************************************************
+ * FILE: src/main.c
+ ****************************************************************************/
+// ... (includes are the same) ...
+
+// Declare the external backend structs from the implementation files
+extern const flash_ops_t libmtd_backend;
+extern const flash_ops_t ioctl_backend;
+extern const flash_ops_t sysfs_backend; // <-- ADD THIS LINE
+
+// ... (global variables are the same) ...
+
+/**
+ * @brief Initializes the global g_flash_backend pointer based on config.h
+ */
+void backend_init(void)
+{
+#if defined(BACKEND_LIBMDT)
+	g_flash_backend = &libmtd_backend;
+	LOG(LOG_LEVEL_INFO, "libmtd backend selected.");
+#elif defined(BACKEND_IOCTL)
+	g_flash_backend = &ioctl_backend;
+	LOG(LOG_LEVEL_INFO, "ioctl backend selected.");
+#elif defined(BACKEND_SYSFS) // <-- ADD THIS BLOCK
+	g_flash_backend = &sysfs_backend;
+	LOG(LOG_LEVEL_INFO, "sysfs backend selected.");
+#else
+#error "No MTD backend specified in config.h! Define BACKEND_LIBMDT, BACKEND_IOCTL, or BACKEND_SYSFS."
+#endif
+}
+
+// ... (The rest of main.c remains unchanged) ...
+
+/****************************************************************************
+ * FILE: src/backend/flash_sysfs.c
+ ****************************************************************************/
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <errno.h>
+#include <sys/ioctl.h>
+#include <mtd/mtd-user.h>
+#include "../include/config.h"
+#include "../include/flash_interface.h"
+#include "../include/logger.h"
+
+/**
+ * @file flash_sysfs.c
+ * @brief MTD backend implementation using a custom sysfs interface.
+ * @details This backend communicates with a custom kernel driver via sysfs nodes
+ * to trigger special flash commands (e.g., for ISSI Octal/Extended modes).
+ * It uses ioctl for generic device info queries.
+ */
+
+// Enum to give meaningful names to sysfs path array indices
+typedef enum {
+    SYSFS_INIT,
+    SYSFS_READ_ID,
+    SYSFS_WRITE_REG,
+    SYSFS_READ_REG,
+    SYSFS_ERASE_SECTOR,
+    SYSFS_READ_SECTOR,
+    SYSFS_WRITE_SECTOR,
+    SYSFS_READ2_SECTOR,
+    SYSFS_SFDP_READ,
+    SYSFS_PATH_COUNT
+} sysfs_path_index_t;
+
+// The sysfs paths are selected at compile-time based on config.h
+#if defined(SYSFS_MODE_EXTENDED)
+static const char sysfs_paths[SYSFS_PATH_COUNT][45] = {
+    "/sys/class/mtd/mtd0/ISSI_EXTENDED_INIT",
+    "/sys/class/mtd/mtd0/ISSI_EXT_READ_ID",
+    "/sys/class/mtd/mtd0/ISSI_EXT_WRITE_REG",
+    "/sys/class/mtd/mtd0/ISSI_EXT_READ_REG",
+    "/sys/class/mtd/mtd0/ISSI_EXT_ERASE_SECTOR",
+    "/sys/class/mtd/mtd0/ISSI_EXT_READ_SECTOR",
+    "/sys/class/mtd/mtd0/ISSI_EXT_WRITE_SECTOR",
+    "/sys/class/mtd/mtd0/ISSI_EXT_READ2_SECTOR",
+    "/sys/class/mtd/mtd0/ISSI_EXT_SFDP_READ"
+};
+#elif defined(SYSFS_MODE_OCTAL)
+static const char sysfs_paths[SYSFS_PATH_COUNT][45] = {
+    "/sys/class/mtd/mtd0/ISSI_OCTAL_FLASH_INIT",
+    "/sys/class/mtd/mtd0/ISSI_OCTAL_READ_ID",
+    "/sys/class/mtd/mtd0/ISSI_OCTAL_WRITE_REG",
+    "/sys/class/mtd/mtd0/ISSI_OCTAL_READ_REG",
+    "/sys/class/mtd/mtd0/ISSI_OCTAL_ERASE_SECTOR",
+    "/sys/class/mtd/mtd0/ISSI_OCTAL_READ_SECTOR",
+    "/sys/class/mtd/mtd0/ISSI_OCTAL_WRITE_SECTOR",
+    "/sys/class/mtd/mtd0/ISSI_OCTAL_READ2_SECTOR",
+    "/sys/class/mtd/mtd0/ISSI_OCTAL_SFDP_READ"
+};
+#else
+#error "No SYSFS mode specified in config.h! Define SYSFS_MODE_EXTENDED or SYSFS_MODE_OCTAL."
+#endif
+
+static int mtd_fd = -1;
+
+/**
+ * @brief Helper to write a command string to a sysfs node.
+ * @return 0 on success, -1 on failure.
+ */
+static int write_sysfs_command(sysfs_path_index_t index, const char *cmd)
+{
+    int fd = open(sysfs_paths[index], O_WRONLY);
+    if (fd < 0) {
+        LOG(LOG_LEVEL_ERROR, "sysfs: Failed to open '%s': %s", sysfs_paths[index], strerror(errno));
+        return -1;
+    }
+
+    if (write(fd, cmd, strlen(cmd)) < 0) {
+        LOG(LOG_LEVEL_ERROR, "sysfs: Failed to write to '%s': %s", sysfs_paths[index], strerror(errno));
+        close(fd);
+        return -1;
+    }
+    LOG(LOG_LEVEL_DEBUG, "sysfs: Wrote '%s' to '%s'", cmd, sysfs_paths[index]);
+    close(fd);
+    return 0;
+}
+
+
+static int sysfs_backend_init(const char *device)
+{
+    if (mtd_fd >= 0) {
+        LOG(LOG_LEVEL_WARN, "sysfs backend already initialized.");
+        return 0;
+    }
+
+    // Open the MTD character device for I/O (read/write) and ioctl (get_info).
+    mtd_fd = open(device, O_RDWR);
+    if (mtd_fd < 0) {
+        LOG(LOG_LEVEL_ERROR, "Failed to open MTD device: %s", device);
+        return -1;
+    }
+
+    // The user paths are hardcoded for mtd0. A more advanced version might
+    // dynamically generate paths based on the `device` argument.
+    if (strstr(sysfs_paths[0], device) == NULL) {
+        LOG(LOG_LEVEL_WARN, "Sysfs paths are hardcoded but device is '%s'. Ensure this is correct.", device);
+    }
+
+    // Optionally, perform a driver-level initialization.
+    // This assumes the INIT node takes a simple "1" to initialize.
+    if (write_sysfs_command(SYSFS_INIT, "1") != 0) {
+        LOG(LOG_LEVEL_ERROR, "Sysfs backend failed to send INIT command.");
+        close(mtd_fd);
+        mtd_fd = -1;
+        return -1;
+    }
+
+    return 0;
+}
+
+static void sysfs_backend_deinit(void)
+{
+    if (mtd_fd >= 0) {
+        close(mtd_fd);
+        mtd_fd = -1;
+        printf("MTD device closed.\n");
+    }
+}
+
+static int sysfs_backend_erase(uint32_t offset, uint32_t len)
+{
+    char cmd[64];
+    snprintf(cmd, sizeof(cmd), "%u %u", offset, len);
+    return write_sysfs_command(SYSFS_ERASE_SECTOR, cmd);
+}
+
+static int sysfs_backend_write(uint32_t offset, const void *data, size_t len)
+{
+    char cmd[64];
+
+    if (mtd_fd < 0) {
+        LOG(LOG_LEVEL_ERROR, "Backend not initialized.");
+        return -1;
+    }
+
+    // Step 1: Tell the driver where and how much we want to write via sysfs.
+    snprintf(cmd, sizeof(cmd), "%u %zu", offset, len);
+    if (write_sysfs_command(SYSFS_WRITE_SECTOR, cmd) != 0) {
+        return -1;
+    }
+
+    // Step 2: Perform the actual data write on the device node.
+    // Using pwrite is thread-safe and doesn't move the file cursor.
+    if (pwrite(mtd_fd, data, len, offset) != (ssize_t)len) {
+        LOG(LOG_LEVEL_ERROR, "pwrite failed: %s", strerror(errno));
+        return -1;
+    }
+    
+    return 0;
+}
+
+static int sysfs_backend_read(uint32_t offset, void *data, size_t len)
+{
+    char cmd[64];
+
+    if (mtd_fd < 0) {
+        LOG(LOG_LEVEL_ERROR, "Backend not initialized.");
+        return -1;
+    }
+
+    // Step 1: Tell the driver where and how much we want to read via sysfs.
+    snprintf(cmd, sizeof(cmd), "%u %zu", offset, len);
+    if (write_sysfs_command(SYSFS_READ_SECTOR, cmd) != 0) {
+        return -1;
+    }
+
+    // Step 2: Perform the actual data read from the device node.
+    if (pread(mtd_fd, data, len, offset) != (ssize_t)len) {
+        LOG(LOG_LEVEL_ERROR, "pread failed: %s", strerror(errno));
+        return -1;
+    }
+
+    return 0;
+}
+
+/**
+ * @brief Gets device info using the ioctl method as requested.
+ */
+static int sysfs_backend_get_info(flash_info_t *info)
+{
+    struct mtd_info_user mtd_info;
+
+    if (mtd_fd < 0) {
+        LOG(LOG_LEVEL_ERROR, "Backend not initialized.");
+        return -1;
+    }
+    if (ioctl(mtd_fd, MEMGETINFO, &mtd_info) != 0) {
+        LOG(LOG_LEVEL_ERROR, "ioctl(MEMGETINFO) failed.");
+        return -1;
+    }
+
+    info->size = mtd_info.size;
+    info->erasesize = mtd_info.erasesize;
+    return 0;
+}
+
+/**
+ * @brief The flash_ops_t structure for the sysfs backend.
+ */
+const flash_ops_t sysfs_backend = {
+	.init = sysfs_backend_init,
+	.deinit = sysfs_backend_deinit,
+	.erase = sysfs_backend_erase,
+	.write = sysfs_backend_write,
+	.read = sysfs_backend_read,
+	.get_info = sysfs_backend_get_info,
+};
+
