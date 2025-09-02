@@ -1,0 +1,130 @@
+#!/bin/bash
+
+# Exit immediately if a command exits with a non-zero status.
+set -e
+
+################################################################################
+# Configuration - !!! PLEASE EDIT THESE PATHS !!!
+################################################################################
+# Base directory where all your project folders are located
+PROJECT_BASE_DIR=~/imx_bsp
+
+# Paths to the source/binary directories (filenames are derived from these)
+# Make sure the version numbers in the folder names match your downloaded files.
+UBOOT_DIR="${PROJECT_BASE_DIR}/u-boot-imx"
+ATF_DIR="${PROJECT_BASE_DIR}/imx-atf"
+SCFW_DIR="${PROJECT_BASE_DIR}/scfw_porting_kit_1.7.5"
+SECO_FW_DIR="${PROJECT_BASE_DIR}/imx-seco-firmware-4.4.1"
+IMX_MKIMAGE_DIR="${PROJECT_BASE_DIR}/imx-mkimage"
+
+# Optional path for OP-TEE binary
+TEE_DIR="${PROJECT_BASE_DIR}/optee_os/out/arm-plat-imx/core"
+
+# Target SoC and Revision
+SOC="iMX8QX"
+REV="C0" # Target is Rev C0 as requested
+
+################################################################################
+# Script Logic - Do not edit below this line
+################################################################################
+
+# --- Helper Functions ---
+function print_info() {
+    echo -e "\e[34m[INFO]\e[0m $1"
+}
+
+function print_success() {
+    echo -e "\e[32m[SUCCESS]\e[0m $1"
+}
+
+function print_error() {
+    echo -e "\e[31m[ERROR]\e[0m $1" >&2
+    exit 1
+}
+
+function check_file() {
+    if [ ! -f "$1" ]; then
+        print_error "Required file not found: $1"
+    fi
+}
+
+# --- Argument Parsing for OP-TEE ---
+USE_OPTEE=false
+if [[ "$1" == "--optee" ]]; then
+    USE_OPTEE=true
+    print_info "OP-TEE build enabled."
+fi
+
+# --- Define Source File Paths ---
+UBOOT_BIN="${UBOOT_DIR}/u-boot.bin"
+BL31_BIN="${ATF_DIR}/build/${SOC,,}/release/bl31.bin" # ${SOC,,} converts to lowercase
+SCFW_TCM_BIN="${SCFW_DIR}/scfw_export_mx8qx_b0/scfw_tcm.bin"
+SECO_CONTAINER_IMG="${SECO_FW_DIR}/mx8qxpc0-ahab-container.img" # Specific for Rev C0
+
+# OP-TEE specific files
+TEE_BIN="${TEE_DIR}/tee.bin"
+UBOOT_SPL_BIN="${UBOOT_DIR}/spl/u-boot-spl.bin"
+
+# Define destination directory
+DEST_DIR="${IMX_MKIMAGE_DIR}/iMX8QX"
+
+# --- Main Execution ---
+print_info "Starting imx-boot image creation for SOC=${SOC} REV=${REV}"
+
+# 1. Verify that all source files and directories exist
+print_info "Checking for required files and directories..."
+check_file "${UBOOT_BIN}"
+check_file "${BL31_BIN}"
+check_file "${SCFW_TCM_BIN}"
+check_file "${SECO_CONTAINER_IMG}"
+
+if [ ! -d "${DEST_DIR}" ]; then
+    print_error "Destination directory does not exist: ${DEST_DIR}"
+fi
+
+# 2. Copy the binaries to the imx-mkimage directory
+print_info "Copying binaries to ${DEST_DIR}..."
+
+cp -v "${UBOOT_BIN}" "${DEST_DIR}/"
+cp -v "${BL31_BIN}" "${DEST_DIR}/"
+cp -v "${SCFW_TCM_BIN}" "${DEST_DIR}/"
+
+# NOTE: The official user guide sometimes contains a typo suggesting iMX8QM as the destination
+# for the SECO firmware. For an iMX8QX build, it must be in the iMX8QX directory.
+print_info "Copying SECO container (Correcting path from iMX8QM to iMX8QX)..."
+cp -v "${SECO_CONTAINER_IMG}" "${DEST_DIR}/"
+
+# 3. Handle OP-TEE specific steps if enabled
+if [ "$USE_OPTEE" = true ]; then
+    print_info "Performing additional steps for OP-TEE build..."
+    check_file "${TEE_BIN}"
+    check_file "${UBOOT_SPL_BIN}"
+    cp -v "${TEE_BIN}" "${DEST_DIR}/"
+    cp -v "${UBOOT_SPL_BIN}" "${DEST_DIR}/"
+fi
+
+# 4. Navigate to the imx-mkimage directory and build
+print_info "Navigating to ${IMX_MKIMAGE_DIR} to run make..."
+cd "${IMX_MKIMAGE_DIR}"
+
+# Clean previous builds to be safe
+make SOC=${SOC} clean
+
+if [ "$USE_OPTEE" = true ]; then
+    print_info "Running: make SOC=${SOC} flash_spl"
+    make SOC=${SOC} flash_spl
+else
+    print_info "Running: make SOC=${SOC} REV=${REV} flash"
+    make SOC=${SOC} REV=${REV} flash
+fi
+
+# 5. Final verification
+print_info "Verifying build output..."
+if [ -f "iMX8QX/flash.bin" ]; then
+    print_success "Build complete!"
+    print_success "The imx-boot image is located at: $(pwd)/iMX8QX/flash.bin"
+else
+    print_error "Build failed. flash.bin was not created."
+fi
+
+exit 0
